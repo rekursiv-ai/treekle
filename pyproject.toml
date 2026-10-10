@@ -249,26 +249,6 @@ extend-include = ["*.ipynb"]
 
 select = ["ALL"]
 
-extend-safe-fixes = [
-    "C4",     # Collection and comprehension rewrites.
-    "E711",   # Compare to None with identity.
-    "E712",   # Compare booleans by truthiness.
-    "E731",   # Do not assign a `lambda` expression, use a `def`.
-    "F401",   # Remove unused imports.
-    "F601",   # Remove overwritten dictionary entries.
-    "F841",   # Remove unused local bindings.
-    "PT006",  # Use tuple for pytest.mark.parametrize names.
-    "PT007",  # Use tuple/list consistently for pytest values.
-    "PT018",  # Split composite assertions.
-    "PYI034", # Annotate __enter__/__new__/__iadd__ returns as Self.
-    "RET504", # Remove unnecessary local assignment directly before return.
-    "RUF007", # Prefer `itertools.pairwise()` over `zip()` when iterating over successive pairs.
-    "SIM102", # Collapse nested if statements.
-    "SIM105", # Use contextlib.suppress instead of try-except-pass.
-    "TC",     # Type-checking import and annotation rewrites.
-    "UP",     # Python syntax upgrades.
-]
-
 ignore = [
     # COM812 is deliberately ignored here and re-enabled only by the
     # pre-commit `ruff-check` hook (`--extend-select COM812`). Selecting it in
@@ -324,6 +304,28 @@ ignore = [
     "TRY003",  # Raise vanilla args.
     "TRY300",  # Try consider else.
     # NEVER ADD MORE SUPPRESSIONS! SUPPRESS IN FILE!
+]
+
+extend-safe-fixes = [
+    "C4",     # Collection and comprehension rewrites.
+    "D301",   # Use `r"""` if any backslashes in a docstring.
+    "E711",   # Compare to None with identity.
+    "E712",   # Compare booleans by truthiness.
+    "E731",   # Do not assign a `lambda` expression, use a `def`.
+    "F401",   # Remove unused imports.
+    "F601",   # Remove overwritten dictionary entries.
+    "F841",   # Remove unused local bindings.
+    "ISC004", # Unparenthesized implicit string concatenation in collection.
+    "PT006",  # Use tuple for pytest.mark.parametrize names.
+    "PT007",  # Use tuple/list consistently for pytest values.
+    "PT018",  # Split composite assertions.
+    "PYI034", # Annotate __enter__/__new__/__iadd__ returns as Self.
+    "RET504", # Remove unnecessary local assignment directly before return.
+    "RUF007", # Prefer `itertools.pairwise()` over `zip()` when iterating over successive pairs.
+    "SIM102", # Collapse nested if statements.
+    "SIM105", # Use contextlib.suppress instead of try-except-pass.
+    "TC",     # Type-checking import and annotation rewrites.
+    "UP",     # Python syntax upgrades.
 ]
 
 [tool.ruff.lint.per-file-ignores]
