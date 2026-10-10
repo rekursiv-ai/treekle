@@ -57,4 +57,4 @@ assert pair.a is pair.b
 
 ## Why not another serializer
 
-See the comparison in the `treekle.codec` module docstring.
+See the comparison in the `treekle` package docstring.

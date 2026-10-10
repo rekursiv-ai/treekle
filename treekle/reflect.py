@@ -1,0 +1,107 @@
+"""Import paths and object state, shared by ``serialize`` and ``deserialize``."""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Final, cast
+
+import importlib
+import sys
+import weakref
+
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
+
+
+__all__ = [
+    "PENDING",
+    "SKIPPED_ATTRIBUTES",
+    "resolve_import",
+    "slot_names",
+]
+
+
+SKIPPED_ATTRIBUTES: Final = frozenset(("__weakref__", "__dict__"))
+"""Slot names that hold no object state."""
+
+
+PENDING: Final = object()
+"""Marks a value not built yet, or an attribute a walk did not find."""
+
+
+def resolve_import(path: str) -> object:
+    """Walk ``path`` from its longest loaded prefix, else its longest importable one.
+
+    Args:
+      path: A dotted ``module.attr`` path, e.g. ``pkg.mod.Cls.Config``.
+
+    Returns:
+      resolved: The object ``path`` names.
+
+    Raises:
+      AttributeError: An importable prefix lacks the named attribute.
+      ImportError: No prefix of ``path`` imports.
+
+    """
+    parts = path.split(".")
+    # A nested class such as ``pkg.mod.Cls.Config`` names no module at
+    # ``pkg.mod.Cls``; trying to import it first costs a failed finder search
+    # per class, so a loaded ancestor is walked before anything is imported.
+    for split in range(len(parts) - 1, 0, -1):
+        module = sys.modules.get(".".join(parts[:split]))
+        if module is not None:
+            resolved = _walk(module, parts[split:])
+            if resolved is not PENDING:
+                return resolved
+            break
+    for split in range(len(parts) - 1, 0, -1):
+        try:
+            module = importlib.import_module(".".join(parts[:split]))
+        except ImportError:
+            continue
+        resolved = _walk(module, parts[split:])
+        if resolved is PENDING:
+            raise AttributeError(f"{path!r} names no attribute of {module.__name__!r}")
+        return resolved
+    raise ImportError(f"Cannot resolve path: {path!r}")
+
+
+def slot_names(kind: type) -> tuple[str, ...]:
+    """Return ``kind``'s state slots in MRO order, cached.
+
+    Args:
+      kind: The class to inspect.
+
+    Returns:
+      names: Each slot once, ``__dict__`` and ``__weakref__`` excluded.
+
+    """
+    cached = _SLOT_NAMES.get(kind)
+    if cached is not None:
+        return cached
+    names: dict[str, None] = {}
+    for base in kind.__mro__:
+        slots: object = getattr(base, "__slots__", ())
+        for slot in (
+            (slots,) if isinstance(slots, str) else cast("Iterable[str]", slots)
+        ):
+            if slot not in SKIPPED_ATTRIBUTES:
+                names.setdefault(slot)
+    result = tuple(names)
+    _SLOT_NAMES[kind] = result
+    return result
+
+
+def _walk(start: object, parts: Iterable[str]) -> object:
+    """Return the attribute chain ``parts`` names from ``start``, else ``PENDING``."""
+    resolved = start
+    for part in parts:
+        resolved = getattr(resolved, part, PENDING)
+        if resolved is PENDING:
+            break
+    return resolved
+
+
+_SLOT_NAMES: Final[weakref.WeakKeyDictionary[type, tuple[str, ...]]] = (
+    weakref.WeakKeyDictionary()
+)

@@ -1,14 +1,11 @@
-"""Tests for ``treekle.codec``."""
+"""Tests for ``treekle.deserialize``."""
 
 from __future__ import annotations
 
 from collections import OrderedDict
 from dataclasses import dataclass, field, make_dataclass
 from decimal import Decimal
-from email import mime
-from email.mime import text as mime_text
 from enum import Enum
-from functools import partial
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import (
@@ -25,30 +22,24 @@ from typing import (
     override,
 )
 from uuid import UUID
-from zoneinfo import ZoneInfo
 
 import datetime as dt
 import gc
-import importlib
-import json
 import math
-import sys
-import threading
 import weakref
 
 import pytest
 
-from treekle import codec
-from treekle.codec import (
+from treekle import deserialize
+from treekle.deserialize import from_plain
+from treekle.serialize import to_plain
+from treekle.types import (
+    Hooks,
     Invalid,
+    MutablePlainTree,
+    Plain,
     PlainTree,
     ReadError,
-    from_plain,
-    immutable,
-    loads,
-    mutable,
-    parse,
-    to_plain,
 )
 
 
@@ -59,8 +50,8 @@ def _round_trip(value: object) -> object:
     return from_plain(to_plain(value), object, allow_imports=True)
 
 
-def _decoding() -> codec._Decoding:
-    return codec._Decoding(hooks={}, allow_imports=False)
+def _decoding() -> deserialize._Decoding:
+    return deserialize._Decoding(hooks={}, allow_imports=False)
 
 
 class Color(Enum):
@@ -68,7 +59,7 @@ class Color(Enum):
     BLUE = "blue"
 
 
-class Plain:
+class Bare:
     """A class with no reduce hooks of its own."""
 
     def __init__(self, x: int) -> None:
@@ -83,20 +74,6 @@ class Slotted:
     def __init__(self, a: int, b: int) -> None:
         self.a = a
         self.b = b
-
-
-class Stateful:
-    """Owns its pickled state through ``__setstate__``."""
-
-    def __init__(self, value: int) -> None:
-        self.value = value
-
-    @override
-    def __reduce__(self) -> tuple[object, tuple[int], dict[str, int]]:
-        return (Stateful, (0,), {"value": self.value})
-
-    def __setstate__(self, state: dict[str, int]) -> None:
-        self.value = state["value"] * 10
 
 
 @dataclass(frozen=True, kw_only=True, slots=True)
@@ -121,11 +98,6 @@ class Square:
 
     def area(self) -> float:
         return self.side**2
-
-
-@dataclass(frozen=True, kw_only=True, slots=True)
-class Holder:
-    shape: Shape
 
 
 @dataclass(kw_only=True, slots=True)
@@ -157,262 +129,76 @@ def _tensor_values(tensor: Tensor) -> list[float]:
 type Ints = list[int]
 
 
-_HOOKS: codec.Hooks = MappingProxyType({Tensor: (_tensor_values, Tensor)})
+_HOOKS: Hooks = MappingProxyType({Tensor: (_tensor_values, Tensor)})
 
 
-class TestImmutableMutable:
-    def test_immutable_freezes_every_level(self) -> None:
-        frozen = immutable({"a": [1, {"b": [2]}]})
+class LocalReduce:
+    """Reduces through a local callable, so state encoding takes over."""
 
-        assert isinstance(frozen, MappingProxyType)
-        inner = frozen["a"]
-        assert isinstance(inner, tuple)
-        assert isinstance(inner[1], MappingProxyType)
-        assert inner[1]["b"] == (2,)
+    __slots__ = ("__dict__", "a")
 
-    def test_mutable_thaws_every_level(self) -> None:
-        thawed = mutable(MappingProxyType({"a": (1, MappingProxyType({"b": (2,)}))}))
+    def __init__(self, a: int, b: int) -> None:
+        self.a = a
+        self.b = b
 
-        assert thawed == {"a": [1, {"b": [2]}]}
-
-    def test_both_always_copy(self) -> None:
-        source = {"a": [1]}
-
-        thawed = mutable(source)
-
-        assert thawed == source
-        assert thawed is not source
-        assert thawed["a"] is not source["a"]
-
-    @pytest.mark.parametrize("leaf", [None, True, 1, 1.5, "s"])
-    def test_leaves_pass_through(self, leaf: codec.Plain) -> None:
-        assert immutable(leaf) is leaf
-        assert mutable(leaf) is leaf
-
-
-class TestToPlain:
-    def test_tags_name_python_types(self) -> None:
-        tree = to_plain(
-            {
-                "t": (1, 2),
-                "s": {2, 1},
-                "f": frozenset({3}),
-                "b": b"\x00",
-                "p": Path("/a"),
-                "u": UUID(int=1),
-                "c": 1 + 2j,
-            },
-        )
-
-        assert tree == {
-            "t": {"py/tuple": [1, 2]},
-            "s": {"py/set": [1, 2]},
-            "f": {"py/frozenset": [3]},
-            "b": {"py/b64": "AA=="},
-            "p": {"py/path": "/a"},
-            "u": {"py/uuid": "00000000-0000-0000-0000-000000000001"},
-            "c": {"py/complex": [1.0, 2.0]},
-        }
-
-    def test_json_dialect_tags_non_finite_floats(self) -> None:
-        assert to_plain([math.inf, 1.5]) == [{"py/float": "inf"}, 1.5]
-
-    def test_python_dialect_keeps_non_finite_floats(self) -> None:
-        tree = to_plain([math.inf], dialect="python")
-
-        assert tree == [math.inf]
-
-    def test_immutable_output_is_read_only(self) -> None:
-        tree = to_plain({"a": [(1,)]}, mutable=False)
-
-        assert isinstance(tree, MappingProxyType)
-        assert tree["a"] == (MappingProxyType({"py/tuple": (1,)}),)
-
-    def test_shared_objects_become_references(self) -> None:
-        shared = [1]
-
-        assert to_plain([shared, shared]) == [[1], {"py/ref": [0]}]
-
-    def test_a_reference_names_the_path_of_the_first_occurrence(self) -> None:
-        shared = {"k": 1}
-
-        tree = to_plain({"a": {"b": (shared,)}, "c": shared})
-
-        assert tree == {
-            "a": {"b": {"py/tuple": [{"k": 1}]}},
-            "c": {"py/ref": ["a", "b", 0]},
-        }
-
-    def test_cycles_terminate(self) -> None:
-        cycle: list[object] = []
-        cycle.append(cycle)
-
-        assert to_plain(cycle) == [{"py/ref": []}]
-
-    def test_tag_lookalike_and_non_str_keys_are_escaped(self) -> None:
-        tree = to_plain({"py/x": 1, 2: 3, "json://y": 4})
-
-        assert tree == {'json://"py/x"': 1, "json://2": 3, 'json://"json://y"': 4}
-
-    def test_dataclass_names_its_class(self) -> None:
-        assert to_plain(Point(x=1)) == {
-            "py/object": f"{__name__}.Point",
-            "x": 1,
-            "y": 0.0,
-        }
-
-    def test_enum_encodes_by_reduce(self) -> None:
-        assert to_plain(Color.RED) == {
-            "py/reduce": [{"py/type": f"{__name__}.Color"}, {"py/tuple": ["red"]}],
-        }
-
-    def test_a_partial_encodes_the_same_once_its_dict_was_read(self) -> None:
-        # CPython creates a partial's ``__dict__``, empty, the first time it is read.
-        bound = partial(max, 0)
-        before = to_plain(bound)
-        _ = bound.__dict__
-
-        assert to_plain(bound) == before
-
-    def test_set_order_is_deterministic(self) -> None:
-        assert to_plain({"b", "a", "c"}) == {"py/set": ["a", "b", "c"]}
-
-    def test_named_zone_is_kept(self) -> None:
-        moment = dt.datetime(2026, 1, 2, 3, tzinfo=ZoneInfo("America/Chicago"))
-
-        assert to_plain(moment) == {
-            "py/datetime": "2026-01-02T03:00:00-06:00[America/Chicago]",
-        }
-
-    def test_a_local_class_cannot_be_named(self) -> None:
-        class Local:
+    @override
+    def __reduce_ex__(self, protocol: SupportsIndex) -> str | tuple[object, ...]:
+        def rebuild() -> None:
             pass
 
-        with pytest.raises(TypeError, match="<locals>"):
-            to_plain(Local)
-
-    def test_an_unknown_leaf_names_the_hook_to_add(self) -> None:
-        with pytest.raises(TypeError, match=r"hooks=\{lock:"):
-            to_plain(threading.Lock())
+        return (rebuild, ())
 
 
-class TestRoundTrip:
-    @pytest.mark.parametrize(
-        "value",
-        [
-            1.5,
-            math.inf,
-            -math.inf,
-            pytest.param(b"\x00\xffbytes", id="bytes"),
-            PurePosixPath("/a/b"),
-            Path("/a/b"),
-            UUID(int=7),
-            dt.datetime(2026, 9, 26, 12, tzinfo=dt.UTC),
-            dt.datetime(2026, 1, 2, 3, tzinfo=ZoneInfo("Europe/Paris")),
-            (1, (2, 3)),
-            {1, 2},
-            frozenset({1, 2}),
-            {"k": [1, {"j": 2}]},
-            {(1, 2): "tuple key", 3: "int key", "py/x": "tag key"},
-            MappingProxyType({"a": 1}),
-            1 + 2j,
-            Color.BLUE,
-            Point(x=3, y=4.5),
-            max,
-            Path,
-        ],
-        ids=repr,
-    )
-    def test_values_survive(self, value: object) -> None:
-        restored = _round_trip(value)
+class Unbuildable:
+    """Refuses construction, so a reduce replay fails."""
 
-        assert restored == value
-        assert type(restored) is type(value)
+    def __init__(self, x: int) -> None:
+        if x < 0:
+            raise ValueError("negative")
+        self.x = x
 
-    def test_nan_survives(self) -> None:
-        restored = _round_trip(math.nan)
 
-        assert isinstance(restored, float)
-        assert math.isnan(restored)
+@dataclass(frozen=True, kw_only=True, slots=True)
+class Positive:
+    n: int
 
-    def test_an_ordered_mapping_keeps_its_order(self) -> None:
-        restored = _round_trip(OrderedDict([("b", 1), ("a", 2)]))
+    def __post_init__(self) -> None:
+        if self.n <= 0:
+            raise ValueError("n must be positive")
 
-        assert isinstance(restored, OrderedDict)
-        items = cast("OrderedDict[str, int]", restored).items()
-        assert list(items) == [("b", 1), ("a", 2)]
 
-    def test_a_plain_object_restores_its_attributes(self) -> None:
-        restored = _round_trip(Plain(3))
+class Level(Enum):
+    LOW = 1
+    HIGH = 2
 
-        assert isinstance(restored, Plain)
-        assert restored.x == 3
 
-    def test_slots_and_dict_members_both_restore(self) -> None:
-        restored = _round_trip(Slotted(1, 2))
+def _reduce(*parts: MutablePlainTree) -> MutablePlainTree:
+    return {"py/reduce": list(parts)}
 
-        assert isinstance(restored, Slotted)
-        assert (restored.a, restored.b) == (1, 2)
 
-    def test_setstate_owns_the_restored_state(self) -> None:
-        restored = _round_trip(Stateful(4))
+@dataclass(frozen=True, kw_only=True, slots=True)
+class Tagged:
+    pair: tuple[int, int] = (0, 0)
 
-        assert isinstance(restored, Stateful)
-        assert restored.value == 40
 
-    def test_shared_objects_stay_shared(self) -> None:
-        shared = {"a": 1}
+@dataclass(frozen=True, kw_only=True, slots=True)
+class OtherTagged:
+    name: str = ""
 
-        restored = _round_trip([shared, (shared,), Node(name="n")])
 
-        assert isinstance(restored, list)
-        assert restored[1][0] is restored[0]
+@dataclass(frozen=True, kw_only=True, slots=True)
+class Pair1:
+    x: int = 0
 
-    def test_a_dataclass_cycle_survives(self) -> None:
-        parent = Node(name="p")
-        parent.children.append(parent)
 
-        restored = _round_trip(parent)
+@dataclass(frozen=True, kw_only=True, slots=True)
+class Pair2:
+    x: int = 0
 
-        assert isinstance(restored, Node)
-        assert restored.children[0] is restored
 
-    def test_a_non_init_slot_is_state_too(self) -> None:
-        value = Flagged(name="n")
-        value._done = True
-
-        tree = to_plain(value)
-        restored = _round_trip(value)
-
-        assert tree == {"py/object": f"{__name__}.Flagged", "name": "n", "_done": True}
-        assert isinstance(restored, Flagged)
-        assert restored._done is True
-
-    def test_hooks_encode_and_decode_leaves(self) -> None:
-        tree = to_plain([Tensor([1.0, math.inf])], hooks=_HOOKS)
-
-        restored = from_plain(tree, object, hooks=_HOOKS, allow_imports=True)
-
-        assert tree == [
-            {"py/hook": [f"{__name__}.Tensor", [1.0, {"py/float": "inf"}]]},
-        ]
-        assert isinstance(restored, list)
-        assert isinstance(restored[0], Tensor)
-        assert restored[0].values == [1.0, math.inf]
-
-    def test_immutable_trees_decode_alike(self) -> None:
-        value = {"a": (1, {2}), "b": Point(x=1)}
-
-        tree = to_plain(value, mutable=False)
-
-        assert from_plain(tree, object, allow_imports=True) == value
-
-    def test_a_protocol_field_reads_by_tag(self) -> None:
-        tree = to_plain(Holder(shape=Square(side=2.0)))
-
-        restored = from_plain(tree, Holder, allow_imports=True)
-
-        assert restored == Holder(shape=Square(side=2.0))
+class Meta(TypedDict):
+    size: int
+    name: NotRequired[str]
 
 
 class TestTypedDecode:
@@ -512,7 +298,7 @@ class TestTypedDecode:
     )
     def test_mismatches_raise(
         self,
-        data: codec.PlainTree,
+        data: PlainTree,
         target: object,
     ) -> None:
         with pytest.raises(ReadError):
@@ -543,7 +329,7 @@ class TestTypedDecode:
 
 class TestCapabilities:
     def test_imports_need_allow_imports(self) -> None:
-        tree = to_plain(Plain(1))
+        tree = to_plain(Bare(1))
 
         with pytest.raises(ReadError, match="allow_imports"):
             from_plain(tree, object)
@@ -557,7 +343,7 @@ class TestCapabilities:
         ],
         ids=repr,
     )
-    def test_every_executable_tag_is_gated(self, tree: codec.MutablePlainTree) -> None:
+    def test_every_executable_tag_is_gated(self, tree: MutablePlainTree) -> None:
         with pytest.raises(ReadError, match="allow_imports"):
             from_plain(tree, object)
 
@@ -596,7 +382,7 @@ class TestReferences:
         assert restored["c"] is restored["a"]["b"][0]
 
     def test_a_path_reference_closes_a_cycle(self) -> None:
-        tree: codec.MutablePlainTree = [{"py/ref": []}]
+        tree: MutablePlainTree = [{"py/ref": []}]
 
         restored = from_plain(tree, object)
 
@@ -650,7 +436,7 @@ class TestReferences:
         assert next(iter(cast("set[object]", first))) is second
 
     def test_a_reference_into_an_unbuilt_dataclass_is_invalid(self) -> None:
-        tree: codec.MutablePlainTree = {"name": "n", "children": [{"py/ref": []}]}
+        tree: MutablePlainTree = {"name": "n", "children": [{"py/ref": []}]}
 
         with pytest.raises(ReadError) as raised:
             from_plain(tree, Node)
@@ -672,7 +458,7 @@ class TestReferences:
     )
     def test_a_bad_path_reference_is_rejected(
         self,
-        ref: codec.MutablePlainTree,
+        ref: MutablePlainTree,
     ) -> None:
         with pytest.raises(ReadError, match="py/ref"):
             from_plain({"a": [1], "b": {"py/ref": ref}}, object)
@@ -688,7 +474,7 @@ class TestReferences:
 
 class TestMalformedTrees:
     @pytest.mark.parametrize("ref", [-1, 99, True, "0"])
-    def test_a_bad_reference_is_rejected(self, ref: codec.Plain) -> None:
+    def test_a_bad_reference_is_rejected(self, ref: Plain) -> None:
         with pytest.raises(ReadError, match="py/id"):
             from_plain([{"py/id": ref}], object)
 
@@ -707,89 +493,13 @@ class TestMalformedTrees:
         ],
         ids=repr,
     )
-    def test_malformed_tags_are_rejected(self, tree: codec.MutablePlainTree) -> None:
+    def test_malformed_tags_are_rejected(self, tree: MutablePlainTree) -> None:
         with pytest.raises(ReadError):
             from_plain(tree, object, allow_imports=True)
 
     def test_a_tag_must_fit_its_target(self) -> None:
         with pytest.raises(ReadError, match="as <class 'int'>"):
             from_plain({"py/tuple": [1]}, int)
-
-
-class Unreducible(dict[str, int]):
-    """A dict subclass whose reduce refuses."""
-
-    @override
-    def __reduce_ex__(self, protocol: SupportsIndex) -> str | tuple[object, ...]:
-        raise TypeError("no reduce")
-
-
-class UnreducibleList(list[int]):
-    """A list subclass whose reduce refuses."""
-
-    @override
-    def __reduce_ex__(self, protocol: SupportsIndex) -> str | tuple[object, ...]:
-        raise TypeError("no reduce")
-
-
-class UnreducibleSet(set[int]):
-    """A set subclass whose reduce refuses."""
-
-    @override
-    def __reduce_ex__(self, protocol: SupportsIndex) -> str | tuple[object, ...]:
-        raise TypeError("no reduce")
-
-
-class NamedReduce:
-    """Reduces to a name, which has no plain form here."""
-
-    @override
-    def __reduce_ex__(self, protocol: SupportsIndex) -> str | tuple[object, ...]:
-        return "NamedReduce"
-
-
-class LocalReduce:
-    """Reduces through a local callable, so state encoding takes over."""
-
-    __slots__ = ("__dict__", "a")
-
-    def __init__(self, a: int, b: int) -> None:
-        self.a = a
-        self.b = b
-
-    @override
-    def __reduce_ex__(self, protocol: SupportsIndex) -> str | tuple[object, ...]:
-        def rebuild() -> None:
-            pass
-
-        return (rebuild, ())
-
-
-class Unbuildable:
-    """Refuses construction, so a reduce replay fails."""
-
-    def __init__(self, x: int) -> None:
-        if x < 0:
-            raise ValueError("negative")
-        self.x = x
-
-
-@dataclass(frozen=True, kw_only=True, slots=True)
-class Positive:
-    n: int
-
-    def __post_init__(self) -> None:
-        if self.n <= 0:
-            raise ValueError("n must be positive")
-
-
-class Level(Enum):
-    LOW = 1
-    HIGH = 2
-
-
-def _reduce(*parts: codec.MutablePlainTree) -> codec.MutablePlainTree:
-    return {"py/reduce": list(parts)}
 
 
 class TestDecodeEdges:
@@ -863,7 +573,7 @@ class TestDecodeEdges:
             ([[1]], frozenset[object]),
             ({"json://[1]": 1}, dict[object, int]),
             ({"n": 0}, Positive),
-            ({"x": 1}, Plain),
+            ({"x": 1}, Bare),
             ("x", int | float),
             ({"py/type": 1}, object),
             ({"py/type": "builtins.max"}, type),
@@ -898,7 +608,7 @@ class TestDecodeEdges:
     )
     def test_malformed_input_raises(
         self,
-        data: codec.MutablePlainTree,
+        data: MutablePlainTree,
         target: object,
     ) -> None:
         with pytest.raises(ReadError):
@@ -908,7 +618,7 @@ class TestDecodeEdges:
         ("data", "target", "allow_imports", "match"),
         [
             ([1], Point, False, r"^expected object for Point, got \[1\]$"),
-            ({"x": 1}, Plain, False, r"^cannot read \{'x': 1\} as Plain$"),
+            ({"x": 1}, Bare, False, r"^cannot read \{'x': 1\} as Bare$"),
             ({"n": 0}, Positive, False, "^cannot build Positive: n must be positive$"),
             ({"py/object": 1}, object, True, "^invalid py/object path: 1$"),
             (
@@ -922,7 +632,7 @@ class TestDecodeEdges:
     )
     def test_an_object_that_does_not_read_names_why(
         self,
-        data: codec.MutablePlainTree,
+        data: MutablePlainTree,
         target: object,
         allow_imports: bool,
         match: str,
@@ -933,20 +643,20 @@ class TestDecodeEdges:
     def test_a_non_class_target_is_named_in_the_error(self) -> None:
         # Through ``from_plain`` the union decoder raises its own message first.
         with pytest.raises(ReadError, match=r"^expected object for .*Shape \| int"):
-            codec._decode_object([1], Shape | int, (), _decoding())
+            deserialize._decode_object([1], Shape | int, (), _decoding())
 
     def test_a_tagged_member_decodes_by_its_tag(self) -> None:
-        tree = {"py/object": f"{__name__}.Plain", "x": {"py/tuple": [1]}}
+        tree = {"py/object": f"{__name__}.Bare", "x": {"py/tuple": [1]}}
 
         restored = from_plain(tree, object, allow_imports=True)
 
-        assert isinstance(restored, Plain)
+        assert isinstance(restored, Bare)
         assert restored.x == (1,)
 
     def test_a_dataclass_is_numbered_for_later_references(self) -> None:
         state = _decoding()
 
-        value = codec._decode_object({"x": 1}, Point, (), state)
+        value = deserialize._decode_object({"x": 1}, Point, (), state)
 
         assert state.built == [value]
 
@@ -955,195 +665,6 @@ class TestDecodeEdges:
 
         with pytest.raises(ReadError, match="field types"):
             from_plain({"x": 1}, broken)
-
-
-class TestEncodeEdges:
-    def test_a_shared_set_member_object_stays_shared(self) -> None:
-        first = Point(x=1)
-
-        restored = _round_trip([{first, Point(x=2)}, first])
-
-        assert isinstance(restored, list)
-        assert restored[1] in restored[0]
-
-    def test_a_bound_method_round_trips_by_reduce(self) -> None:
-        restored = _round_trip([1].append)
-
-        assert callable(restored)
-        restored(2)
-        assert getattr(restored, "__self__", None) == [1, 2]
-
-    def test_a_failed_reduce_falls_back_to_state(self) -> None:
-        restored = _round_trip(LocalReduce(1, 2))
-
-        assert isinstance(restored, LocalReduce)
-        assert (restored.a, restored.b) == (1, 2)
-
-    @pytest.mark.parametrize(
-        ("value", "expected"),
-        [
-            (Unreducible(a=1), {"a": 1}),
-            (UnreducibleList([1]), [1]),
-            (UnreducibleSet({1}), {"py/set": [1]}),
-        ],
-        ids=repr,
-    )
-    def test_an_unreducible_container_encodes_by_kind(
-        self,
-        value: object,
-        expected: codec.MutablePlainTree,
-    ) -> None:
-        assert to_plain(value) == expected
-
-    def test_a_named_reduce_has_no_plain_form(self) -> None:
-        with pytest.raises(TypeError, match="NamedReduce"):
-            to_plain(NamedReduce())
-
-    def test_an_import_path_naming_another_object_is_rejected(self) -> None:
-        def shadow() -> None:
-            pass
-
-        shadow.__qualname__ = "max"
-        shadow.__module__ = "builtins"
-
-        with pytest.raises(TypeError, match="does not resolve"):
-            to_plain(shadow)
-
-    def test_an_unimportable_module_is_rejected(self) -> None:
-        def orphan() -> None:
-            pass
-
-        orphan.__qualname__ = "orphan"
-        orphan.__module__ = "no_such_module_xyz"
-
-        with pytest.raises(TypeError, match="does not resolve"):
-            to_plain(orphan)
-
-
-class Mode(Enum):
-    FAST = "fast"
-    SLOW = 2
-
-
-class TestParse:
-    @pytest.mark.parametrize("text", ["123", "1.5", "run_a", "true", "null"])
-    def test_a_str_target_keeps_the_text(self, text: str) -> None:
-        assert parse(text, str) == text
-
-    def test_a_quoted_json_string_reads_as_its_text(self) -> None:
-        assert parse('"a b"', str) == "a b"
-
-    @pytest.mark.parametrize(
-        ("text", "target", "expected"),
-        [
-            ("7", int, 7),
-            ("3e-4", float, 3e-4),
-            ("2", float, 2.0),
-            ("true", bool, True),
-            ("[1, 2]", list[int], [1, 2]),
-            ('{"a": 1}', dict[str, int], {"a": 1}),
-            ("[1, 2]", tuple[int, int], (1, 2)),
-            ("null", int | None, None),
-            ("7", int | str, 7),
-            ("run_a", int | str, "run_a"),
-            ("123", str | None, "123"),
-            ("fast", Mode, Mode.FAST),
-            ("2", Mode, Mode.SLOW),
-            ("a", Literal["a", "b"], "a"),
-            ("/data/x", Path, Path("/data/x")),
-            ('"/data/x"', Path, Path("/data/x")),
-            ("00000000-0000-0000-0000-000000000001", UUID, UUID(int=1)),
-            (
-                "2026-01-02T03:04:05+00:00",
-                dt.datetime,
-                dt.datetime(2026, 1, 2, 3, 4, 5, tzinfo=dt.UTC),
-            ),
-        ],
-        ids=repr,
-    )
-    def test_text_reads_as_its_target(
-        self,
-        text: str,
-        target: object,
-        expected: object,
-    ) -> None:
-        value = parse(text, target)
-
-        assert value == expected
-        assert type(value) is type(expected)
-
-    @pytest.mark.parametrize(
-        ("text", "expected"),
-        [
-            ("inf", math.inf),
-            ("-inf", -math.inf),
-            ("Infinity", math.inf),
-            (" inf ", math.inf),
-        ],
-    )
-    def test_non_finite_spellings_read_as_floats(
-        self,
-        text: str,
-        expected: float,
-    ) -> None:
-        assert parse(text, float) == expected
-
-    def test_nan_reads_as_a_float(self) -> None:
-        assert math.isnan(parse("nan", float))
-
-    def test_a_finite_number_is_not_a_spelling(self) -> None:
-        value = parse("1e3", float | str)
-
-        assert value == 1000.0
-        assert type(value) is float
-
-    @pytest.mark.parametrize(
-        ("text", "target", "match"),
-        [
-            ("abc", int, "cannot read 'abc' as int"),
-            ("[1]", int, r"cannot read \[1\] as int"),
-            ("{}", int, "cannot read {} as int"),
-            ("1.5", int, "cannot read 1.5 as int"),
-            ("yes", bool, "cannot read 'yes' as bool"),
-            ("inf", int, "cannot read inf as int"),
-            ("[1, 2, 3]", tuple[int, int], "expected 2 items"),
-            ("medium", Mode, "cannot read 'medium' as"),
-        ],
-        ids=repr,
-    )
-    def test_text_no_reading_fits_raises(
-        self,
-        text: str,
-        target: object,
-        match: str,
-    ) -> None:
-        with pytest.raises(ReadError, match=match):
-            parse(text, target)
-
-
-@dataclass(frozen=True, kw_only=True, slots=True)
-class Tagged:
-    pair: tuple[int, int] = (0, 0)
-
-
-@dataclass(frozen=True, kw_only=True, slots=True)
-class OtherTagged:
-    name: str = ""
-
-
-@dataclass(frozen=True, kw_only=True, slots=True)
-class Pair1:
-    x: int = 0
-
-
-@dataclass(frozen=True, kw_only=True, slots=True)
-class Pair2:
-    x: int = 0
-
-
-class Meta(TypedDict):
-    size: int
-    name: NotRequired[str]
 
 
 class TestTypedDict:
@@ -1166,22 +687,6 @@ class TestTypedDict:
     def test_a_non_mapping_raises(self) -> None:
         with pytest.raises(ReadError):
             from_plain([1], Meta)
-
-
-class TestLoads:
-    def test_text_reads_as_a_mutable_tree(self) -> None:
-        assert loads('{"a": [1, 2.5, null]}') == {"a": [1, 2.5, None]}
-        assert loads(b"[true]") == [True]
-
-    def test_non_finite_floats_read(self) -> None:
-        loaded = loads("[NaN, Infinity]")
-        assert isinstance(loaded, list)
-        assert math.isnan(cast("float", loaded[0]))
-        assert loaded[1] == math.inf
-
-    def test_bad_text_raises_json_decode_error(self) -> None:
-        with pytest.raises(json.JSONDecodeError):
-            loads("{")
 
 
 class TestDefault:
@@ -1231,26 +736,6 @@ class TestForeignInput:
     def test_a_typed_leaf_of_the_wrong_type_raises(self) -> None:
         with pytest.raises(ReadError):
             from_plain(dt.datetime(2026, 1, 1, tzinfo=dt.UTC), int)
-
-
-class TestFreezeChecks:
-    def test_immutable_and_mutable_accept_any_plain_object(self) -> None:
-        source: dict[str, object] = {"a": [1, {"b": None}]}
-        assert immutable(source) == MappingProxyType(
-            {"a": (1, MappingProxyType({"b": None}))},
-        )
-        assert mutable(cast("object", (1, "x"))) == [1, "x"]
-
-    @pytest.mark.parametrize(
-        "bad",
-        [{1: "a"}, [object()], {"a": b"x"}],
-        ids=["int-key", "object", "bytes"],
-    )
-    def test_a_non_plain_part_raises(self, bad: object) -> None:
-        with pytest.raises(TypeError):
-            immutable(bad)
-        with pytest.raises(TypeError):
-            mutable(bad)
 
 
 class TestLax:
@@ -1362,70 +847,35 @@ class TestObjectTagForTarget:
         assert type(from_plain(Decimal("1.50"), float)) is float
 
 
-class TestResolveImport:
-    def test_a_nested_class_resolves_without_an_import_attempt(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        attempts: list[str] = []
-        real = importlib.import_module
-
-        def spy(name: str) -> object:
-            attempts.append(name)
-            return real(name)
-
-        monkeypatch.setattr(importlib, "import_module", spy)
-
-        assert codec._resolve_import(f"{__name__}.Holder.__init__") is (Holder.__init__)
-        assert attempts == []
-
-    def test_an_unloaded_submodule_is_imported(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        # The loaded parent lacks the attribute until its submodule imports.
-        monkeypatch.delattr(mime, "text")
-        monkeypatch.delitem(sys.modules, "email.mime.text")
-
-        resolved = codec._resolve_import("email.mime.text.MIMEText")
-
-        assert isinstance(resolved, type)
-        assert resolved.__name__ == mime_text.MIMEText.__name__
-
-    def test_a_missing_attribute_of_a_loaded_module_raises(self) -> None:
-        with pytest.raises(AttributeError, match=f"no attribute of '{__name__}'"):
-            codec._resolve_import(f"{__name__}.no_such_name")
-
-
 class TestFieldTypes:
     def test_a_dataclass_lists_fields_then_non_init_slots(self) -> None:
-        assert dict(codec._field_types(Flagged)) == {"name": str, "_done": bool}
+        assert dict(deserialize._field_types(Flagged)) == {"name": str, "_done": bool}
 
     def test_a_typed_dict_lists_its_hints(self) -> None:
-        assert dict(codec._field_types(Meta)) == {"size": int, "name": str}
+        assert dict(deserialize._field_types(Meta)) == {"size": int, "name": str}
 
     def test_a_missing_hint_reads_as_object(self) -> None:
-        assert codec._field_types(Slotted) == {}
-        assert codec._field_types(LocalReduce) == {}
+        assert deserialize._field_types(Slotted) == {}
+        assert deserialize._field_types(LocalReduce) == {}
 
     def test_a_module_level_class_is_cached(self) -> None:
-        first = codec._field_types(Point)
+        first = deserialize._field_types(Point)
 
-        assert codec._field_types(Point) is first
-        assert codec._FIELD_TYPES[Point] is first
+        assert deserialize._field_types(Point) is first
+        assert deserialize._FIELD_TYPES[Point] is first
 
     def test_a_self_naming_class_is_not_cached(self) -> None:
-        codec._field_types(Node)
+        deserialize._field_types(Node)
 
-        assert Node not in codec._FIELD_TYPES
+        assert Node not in deserialize._FIELD_TYPES
 
     def test_a_class_its_module_does_not_name_is_not_cached(self) -> None:
         @dataclass(kw_only=True, slots=True)
         class Local:
             x: int
 
-        assert codec._field_types(Local) == {"x": int}
-        assert Local not in codec._FIELD_TYPES
+        assert deserialize._field_types(Local) == {"x": int}
+        assert Local not in deserialize._FIELD_TYPES
 
 
 class TestCaches:

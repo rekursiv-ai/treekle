@@ -1,32 +1,5 @@
-"""Convert Python values to and from plain data, losslessly.
+"""Convert plain trees to Python values.
 
-Plain data is ``str``, ``int``, ``float``, ``bool``, ``None``, and mappings and
-sequences of them. :data:`PlainTree` is any such tree, read-only;
-:data:`MutablePlainTree` is the dict-and-list form, which is also a
-``PlainTree``.
-This module never produces text or bytes; a caller hands plain data to
-whichever writer it chooses.
-
-What a dialect cannot carry natively is written as a ``py/*`` tag, using
-jsonpickle's spelling where one exists:
-
-- ``py/object``, ``py/type``, ``py/function``: a class instance, a class, or a
-  function, by dotted import path.
-- ``py/tuple``, ``py/set``, ``py/frozenset``, ``py/mappingproxy``: containers a
-  dialect flattens to lists or dicts.
-- ``py/float``, ``py/complex``, ``py/b64``, ``py/path``, ``py/uuid``,
-  ``py/datetime``: values a dialect lacks.
-- ``py/reduce``, ``py/hook``: a pickle reduce recipe and a caller-supplied codec.
-- ``py/ref``: a back-reference by the path of the object's first occurrence, so a
-  shared object or a cycle survives. ``py/id``, the older back-reference by
-  encounter number, still reads.
-- ``json://``: a dict key that is not a string, or that reads like a tag.
-
-``to_plain`` takes a ``dialect`` naming the target format, which decides what
-must be tagged; ``"json"`` tags non-finite floats, which ``"python"`` keeps
-native. Both tag everything else alike.
-``mutable`` picks dicts and lists, the default, or ``MappingProxyType`` and
-tuples; either way the result is freshly built and shared with no one.
 ``from_plain`` takes no dialect: it accepts the tagged and native form of every
 value alike, mutable or not.
 
@@ -36,69 +9,9 @@ names. A value that fits neither raises :class:`ReadError`; there are no silent
 defaults. ``allow_imports`` gates every tag that imports or calls code, except
 a tag naming the very class ``T`` asks for: the caller already holds it.
 
-Each tagged type has an encoder and a decoder, paired by name. A tag only
-selects which decoder runs; the decoder is the same one untagged data reaches
-through ``T``. Leaves pass through unencoded, and some targets (``Literal``,
-unions, ``object``) only decode.
-
-``immutable`` and ``mutable`` copy a plain tree to ``MappingProxyType`` and
-tuples, or to dicts and lists, whichever form it starts in. Both always copy.
-
-``parse(text, T)`` reads what a person typed, such as a command-line override.
-It is lenient about syntax and strict about type: it accepts JSON, falls back
-to the bare word, and lets ``T`` decide, so ``parse("123", str)`` is ``"123"``.
-The result then passes through ``from_plain``, so text that does not fit ``T``
-raises :class:`ReadError`, never a default.
-
-Why not another serializer:
-
-tl;dr: No library is perfect, including this one.
-
-library     C/Rust  text  class from data  callables  shared refs  best-effort
-----------  ------  ----  ---------------  ---------  -----------  -----------
-msgspec     ✓       ✓     ✗                ✗          ✗            ✗
-pydantic    ✓       ✓     ✗                ✗          ✗            ✗
-cattrs      ✗       ✓     ✗                ✗          ✗            ✗
-mashumaro   ✗       ✓     ✗                ✗          ✗            ✗
-pickle      ✓       ✗     ✓                ✓          ✓            ✗
-jsonpickle  ✗       ✓     ✓                ✓          ✓            ✗
-codec       ✗       ✓     ✓                ✓          ✓            ✓
-
-- C/Rust: the core is a compiled extension, not pure Python.
-- text: encodes to human-readable text (JSON), not opaque bytes.
-- class from data: decode builds a class the payload names by import path,
-  beyond the declared type and its subclasses.
-- callables: a function round-trips by import path, with no special field type.
-- shared refs: an object referenced twice decodes as one object; cycles too.
-- best-effort: bad input yields the partial value and every bad part's location.
-
-In our case being pure python is a bad thing; native implementations are
-faster and our preference would be to use msgspec. However we need pickle
-semantics but as raw text.
-
-Each mark is what a probe of msgspec 0.22, pydantic 2.13, cattrs 26.2,
-mashumaro 3.23, and jsonpickle 4.1 returned:
-
-library     text    class from data  callables      shared refs  best-effort
-----------  ------  ---------------  -------------  -----------  -----------------
-msgspec     JSON    ``dict``         raises         split        first error
-pydantic    JSON    ``dict``         raises         split        all, no value
-cattrs      JSON    raises           raises         split        all, no value
-mashumaro   JSON    raises           raises         split        first error
-pickle      binary  the class        same function  kept         first error
-jsonpickle  JSON    the class        same function  kept         no error, ``dict``
-codec       JSON    the class        same function  kept         partial value, all
-
-- text: what one dataclass encodes to.
-- class from data: an ``object`` field given a payload naming another class.
-- callables: a field holding a module-level function.
-- shared refs: one object in two fields; "split" decodes two separate copies.
-- best-effort: two bad fields.
-
-Fast libraries decode only classes known ahead of time: a class named in the
-data means an import and code run on read. Codec gates that behind
-``allow_imports``. One cycle shape fails to read: one through a dataclass
-decoded as its declared type.
+A tag only selects which decoder runs; the decoder is the same one untagged
+data reaches through ``T``. Some targets (``Literal``, unions, ``object``) only
+decode.
 """
 
 from __future__ import annotations
@@ -107,7 +20,6 @@ from collections.abc import (
     Callable,
     Hashable,
     Iterable,
-    Iterator,
     Mapping,
     MutableMapping,
     MutableSequence,
@@ -119,16 +31,9 @@ from dataclasses import dataclass, field, fields, is_dataclass
 from datetime import datetime
 from decimal import Decimal
 from enum import Enum
-from functools import partial
 from numbers import Real
-from pathlib import Path, PurePath
-from types import (
-    BuiltinFunctionType,
-    FunctionType,
-    MappingProxyType,
-    ModuleType,
-    UnionType,
-)
+from pathlib import Path
+from types import MappingProxyType, UnionType
 from typing import (
     Annotated,
     Final,
@@ -148,7 +53,6 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import base64
 import binascii
-import importlib
 import inspect
 import json
 import math
@@ -157,139 +61,20 @@ import typing
 import weakref
 
 from treekle.absent import ABSENT
+from treekle.reflect import PENDING, resolve_import, slot_names
+from treekle.types import (
+    FieldPath,
+    Hooks,
+    Invalid,
+    Plain,
+    PlainTree,
+    ReadError,
+)
 
 
 __all__ = [
-    "Dialect",
-    "FieldPath",
-    "Hooks",
-    "Invalid",
-    "MutablePlainTree",
-    "Plain",
-    "PlainTree",
-    "ReadError",
     "from_plain",
-    "immutable",
-    "loads",
-    "mutable",
-    "parse",
-    "to_plain",
 ]
-
-
-# A leaf of a plain tree. ``float`` includes IEEE-754 NaN and signed infinities.
-# This is not Python PODs but rather types supported by JSON, TOML, YAML, msgpack etc.
-type Plain = bool | int | float | str | None
-
-
-type PlainTree = Plain | Sequence[PlainTree] | Mapping[str, PlainTree]
-"""Any plain tree, read-only: dicts and lists, or ``MappingProxyType`` and tuples."""
-
-
-type MutablePlainTree = Plain | list[MutablePlainTree] | dict[str, MutablePlainTree]
-"""A plain tree of dicts and lists, which may be edited."""
-
-
-type Dialect = Literal["json", "python"]
-"""A target format; it decides which values ``to_plain`` must tag.
-
-``"json"`` tags non-finite floats; ``"python"`` keeps them native. Both tag
-everything else alike, so either result fits the same tree types.
-"""
-
-
-type Hooks = Mapping[type, tuple[Callable[..., object], Callable[..., object]]]
-"""Runtime types paired with their ``(encode, decode)`` callbacks."""
-
-
-type FieldPath = tuple[str | int, ...]
-"""Where a value sits: field names and indices leading to it; ``()`` is the value."""
-
-
-@dataclass(frozen=True, slots=True, kw_only=True)
-class Invalid:
-    """A value that did not match its target type, kept as it was stated."""
-
-    raw: PlainTree
-    reason: str = ""
-
-
-class ReadError(TypeError, ValueError):
-    """Plain data does not match the requested type.
-
-    Attributes:
-      partial: The value as far as it reads, an :class:`Invalid` in place of
-        each bad part; the whole value is one when nothing reads.
-      bad: Each bad part, by where it sits.
-
-    """
-
-    partial: object
-    bad: Mapping[FieldPath, Invalid]
-
-    def __init__(
-        self,
-        message: str,
-        *,
-        partial: object = None,
-        bad: Mapping[FieldPath, Invalid] = MappingProxyType({}),
-    ) -> None:
-        super().__init__(message)
-        self.partial = partial
-        self.bad = bad
-
-
-@overload
-def to_plain(
-    obj: object,
-    *,
-    dialect: Dialect = ...,
-    mutable: Literal[True] = ...,
-    hooks: Hooks = ...,
-) -> MutablePlainTree: ...
-
-
-@overload
-def to_plain(
-    obj: object,
-    *,
-    dialect: Dialect = ...,
-    mutable: bool,
-    hooks: Hooks = ...,
-) -> PlainTree: ...
-
-
-def to_plain(
-    obj: object,
-    *,
-    dialect: Dialect = "json",
-    mutable: bool = True,
-    hooks: Hooks = MappingProxyType({}),
-) -> PlainTree:
-    """Convert a Python value to plain data, tagging what ``dialect`` lacks.
-
-    Args:
-      obj: The value to convert; any object graph, shared references and cycles
-        included.
-      dialect: The target format, which decides which values need a tag.
-      mutable: Build dicts and lists when true; ``MappingProxyType`` and tuples
-        when false.
-      hooks: Codecs for leaf types with no built-in conversion, such as tensors.
-
-    Returns:
-      tree: Fresh plain data that ``from_plain`` turns back into ``obj``.
-
-    Raises:
-      TypeError: A leaf has no conversion and no hook.
-
-    """
-    state = _Encoding(
-        dialect=dialect,
-        hooks=hooks,
-        make_list=_thawed_list if mutable else _frozen_list,
-        make_dict=_thawed_dict if mutable else _frozen_dict,
-    )
-    return _encode(obj, state)
 
 
 @overload
@@ -403,182 +188,6 @@ def from_plain(
     return value
 
 
-def loads(text: str | bytes) -> MutablePlainTree:
-    """Parse JSON text into a mutable plain tree; ``NaN``/``Infinity`` read too.
-
-    Args:
-      text: JSON document.
-
-    Returns:
-      tree: Plain dicts, lists, and scalars.
-
-    Raises:
-      json.JSONDecodeError: ``text`` is not valid JSON.
-
-    """
-    return cast("MutablePlainTree", json.loads(text))
-
-
-@overload
-def parse[T](text: str, target: type[T]) -> T: ...
-
-
-@overload
-def parse(text: str, target: object) -> object: ...
-
-
-def parse(text: str, target: object) -> object:
-    """Read typed ``text`` as ``target``, accepting JSON or the bare word.
-
-    Args:
-      text: What a person typed, e.g. ``3e-4``, ``run_a``, or ``[1, 2]``.
-      target: The type to produce.
-
-    Returns:
-      value: ``text`` as a ``target``.
-
-    Raises:
-      ReadError: ``text`` does not read as ``target``.
-
-    """
-    plain = _text_to_plain(text, target)
-    try:
-        return from_plain(plain, target)
-    except ReadError as error:
-        if plain == text:
-            raise
-        # The bare word is the fallback reading; when it fails too, the JSON
-        # reading's error says more about what the person meant.
-        try:
-            return from_plain(text, target)
-        except ReadError:
-            raise error from None
-
-
-@overload
-def immutable(tree: Plain) -> Plain: ...
-
-
-@overload
-def immutable(tree: Mapping[str, object]) -> Mapping[str, PlainTree]: ...
-
-
-@overload
-def immutable(tree: Sequence[object]) -> Sequence[PlainTree]: ...
-
-
-@overload
-def immutable(tree: object) -> PlainTree: ...
-
-
-def immutable(tree: object) -> PlainTree:
-    """Copy a plain tree: mappings to ``MappingProxyType``, sequences to tuples.
-
-    Args:
-      tree: A plain tree, mutable or not.
-
-    Returns:
-      frozen: The read-only copy.
-
-    Raises:
-      TypeError: ``tree`` holds a non-str key or a value that is not plain.
-
-    """
-    return _freeze(tree)
-
-
-@overload
-def mutable(tree: Plain) -> Plain: ...
-
-
-@overload
-def mutable(tree: Mapping[str, object]) -> dict[str, MutablePlainTree]: ...
-
-
-@overload
-def mutable(tree: Sequence[object]) -> list[MutablePlainTree]: ...
-
-
-@overload
-def mutable(tree: object) -> MutablePlainTree: ...
-
-
-def mutable(tree: object) -> MutablePlainTree:
-    """Copy a plain tree: each mapping to a dict, each sequence to a list.
-
-    Args:
-      tree: A plain tree, mutable or not.
-
-    Returns:
-      thawed: The mutable copy.
-
-    Raises:
-      TypeError: ``tree`` holds a non-str key or a value that is not plain.
-
-    """
-    return _thaw(tree)
-
-
-def _freeze(tree: object) -> PlainTree:
-    """Copy ``tree`` to ``MappingProxyType`` and tuples at every level."""
-    if tree is None or isinstance(tree, (str, int, float)):
-        return tree
-    if isinstance(tree, Mapping):
-        node = cast("Mapping[object, object]", tree)
-        return MappingProxyType(
-            {_plain_key(key): _freeze(item) for key, item in node.items()},
-        )
-    return tuple(_freeze(item) for item in _plain_sequence(tree))
-
-
-def _thaw(tree: object) -> MutablePlainTree:
-    """Copy ``tree`` to dicts and lists at every level."""
-    if tree is None or isinstance(tree, (str, int, float)):
-        return tree
-    if isinstance(tree, Mapping):
-        node = cast("Mapping[object, object]", tree)
-        return {_plain_key(key): _thaw(item) for key, item in node.items()}
-    return [_thaw(item) for item in _plain_sequence(tree)]
-
-
-def _plain_key(key: object) -> str:
-    """Return ``key`` when it is a str, the only key plain data allows."""
-    if isinstance(key, str):
-        return key
-    raise TypeError(f"plain mapping key must be str, got {key!r}")
-
-
-def _plain_sequence(tree: object) -> Sequence[object]:
-    """Return ``tree`` when it is a plain sequence."""
-    if isinstance(tree, Sequence) and not isinstance(tree, (bytes, bytearray)):
-        return tree
-    raise TypeError(f"cannot represent {type(tree).__name__} as plain data")
-
-
-@dataclass(slots=True, kw_only=True)
-class _Encoding:
-    """State of one ``to_plain`` walk.
-
-    Attributes:
-      dialect: The target format.
-      hooks: Codecs for leaf types with no built-in conversion.
-      make_list: Builds a sequence node: ``list`` or ``tuple``.
-      make_dict: Builds a mapping node: ``dict`` or ``MappingProxyType``.
-      at: Where the node being encoded sits.
-      seen: The path of each registered object's first occurrence, by ``id``.
-      alive: Every registered object, so its ``id`` is not reused mid-walk.
-
-    """
-
-    dialect: Dialect
-    hooks: Hooks
-    make_list: Callable[[list[PlainTree]], PlainTree]
-    make_dict: Callable[[dict[str, PlainTree]], PlainTree]
-    at: list[str | int] = field(default_factory=list[str | int])
-    seen: dict[int, FieldPath] = field(default_factory=dict[int, FieldPath])
-    alive: list[object] = field(default_factory=list[object])
-
-
 @dataclass(slots=True, kw_only=True)
 class _Decoding:
     """State of one ``from_plain`` walk.
@@ -604,96 +213,8 @@ class _Decoding:
     bad: dict[FieldPath, Invalid] = field(default_factory=dict[FieldPath, Invalid])
 
 
-type _Encoder = Callable[[object, _Encoding], PlainTree]
-"""Encode one value into whichever kind of tree ``state`` builds."""
-
-
 type _Decoder = Callable[[PlainTree, object, FieldPath, _Decoding], object]
 """Decode one node, untagged or a tag's payload, as ``target``."""
-
-
-def _thawed_list(items: list[PlainTree]) -> PlainTree:
-    """Return a sequence node as the list it was built in."""
-    return items
-
-
-def _frozen_list(items: list[PlainTree]) -> PlainTree:
-    """Return a sequence node as a tuple."""
-    return tuple(items)
-
-
-def _thawed_dict(items: dict[str, PlainTree]) -> PlainTree:
-    """Return a mapping node as the dict it was built in."""
-    return items
-
-
-def _frozen_dict(items: dict[str, PlainTree]) -> PlainTree:
-    """Return a mapping node as a ``MappingProxyType``."""
-    return MappingProxyType(items)
-
-
-def _encode(value: object, state: _Encoding) -> PlainTree:
-    """Encode one node: plain passthrough, ``py/ref`` repeat, else its encoder."""
-    kind = type(value)
-    if value is None or (isinstance(value, (str, int)) and kind in _NATIVE_LEAVES):
-        return value
-    if kind is float:
-        return _encode_float(value, state)
-    seen = state.seen.get(id(value))
-    if seen is not None:
-        return state.make_dict({"py/ref": state.make_list(list(seen))})
-    if kind in state.hooks:
-        return _encode_hooked(value, state)
-    return _encoder_for(kind)(value, state)
-
-
-def _encode_at(value: object, key: str | int, state: _Encoding) -> PlainTree:
-    """Encode a container's part, which sits at ``key`` below the current node."""
-    state.at.append(key)
-    try:
-        return _encode(value, state)
-    finally:
-        state.at.pop()
-
-
-def _text_to_plain(text: str, target: object) -> MutablePlainTree:
-    """Turn ``text`` into a plain tree the way ``target`` reads it."""
-    if _is_verbatim(target):
-        loaded = _loads_or_word(text)
-        return loaded if isinstance(loaded, str) else text
-    number = _non_finite(text)
-    if number is not None:
-        return number
-    loaded = _loads_or_word(text)
-    # Quoting is syntax: ``count="7"`` reads the quoted text as typed.
-    if isinstance(loaded, str) and loaded != text:
-        return _text_to_plain(loaded, target)
-    return loaded
-
-
-def _is_verbatim(target: object) -> bool:
-    """Return whether ``target`` reads the raw text, e.g. str, Path, or UUID."""
-    return isinstance(target, type) and issubclass(
-        target,
-        (str, PurePath, UUID, datetime),
-    )
-
-
-def _loads_or_word(text: str) -> MutablePlainTree:
-    """Return ``text`` as JSON, or the bare word when it is not JSON."""
-    try:
-        return cast("MutablePlainTree", json.loads(text))
-    except json.JSONDecodeError:
-        return text
-
-
-def _non_finite(text: str) -> float | None:
-    """Return the float ``inf``, ``-inf``, or ``nan`` spells, else ``None``."""
-    try:
-        number = float(text.strip())
-    except ValueError:
-        return None
-    return None if math.isfinite(number) else number
 
 
 def _decode(
@@ -789,30 +310,6 @@ def _is_plain(data: object) -> bool:
     )
 
 
-def _encoder_for(kind: type) -> _Encoder:
-    """Return the encoder for ``kind``, choosing once per class and caching it."""
-    encoder = _ENCODERS.get(kind) or _ENCODER_CACHE.get(kind)
-    if encoder is not None:
-        return encoder
-    bases = kind.__mro__
-    if type in bases:
-        encoder = _encode_type
-    elif Enum in bases:
-        encoder = _encode_enum
-    elif kind is Path or kind is _CONCRETE_PATH:
-        encoder = _encode_path
-    elif kind is UUID:
-        encoder = _encode_uuid
-    elif kind is datetime:
-        encoder = _encode_datetime
-    elif is_dataclass(kind):
-        encoder = _encode_object
-    else:
-        encoder = _encode_reduce
-    _ENCODER_CACHE[kind] = encoder
-    return encoder
-
-
 def _decoder_for(target: object) -> _Decoder:
     """Return the decoder for ``target``, keyed on its origin."""
     origin: object = get_origin(target) or target
@@ -882,21 +379,6 @@ def _fits(value: object, target: object) -> bool:
         return True
 
 
-# Registering before encoding children is what makes cycles terminate: a
-# back-reference reached below finds the parent already placed.
-def _register(value: object, state: _Encoding) -> None:
-    """Record where ``value`` first sits, before its children are encoded."""
-    state.seen[id(value)] = tuple(state.at)
-    state.alive.append(value)
-
-
-def _rollback(state: _Encoding, mark: int) -> None:
-    """Forget every number assigned since ``len(state.alive)`` was ``mark``."""
-    for value in state.alive[mark:]:
-        del state.seen[id(value)]
-    del state.alive[mark:]
-
-
 def _decode_reference(
     node: Mapping[str, PlainTree],
     state: _Decoding,
@@ -912,7 +394,7 @@ def _decode_reference(
     ):
         raise ReadError(f"invalid py/id reference: {dict(node)!r}")
     value = state.built[index]
-    if value is _PENDING:
+    if value is PENDING:
         raise ReadError(f"py/id {index} names a value still being built")
     return value
 
@@ -933,7 +415,7 @@ def _decode_path_reference(
     value = state.placed.get(tuple(cast("Sequence[str | int]", path)), _ABSENT_REF)
     if value is _ABSENT_REF:
         raise ReadError(f"py/ref {list(path)!r} names no earlier value")
-    if value is _PENDING:
+    if value is PENDING:
         raise ReadError(f"py/ref {list(path)!r} names a value still being built")
     return value
 
@@ -945,7 +427,7 @@ def _place(value: object, at: FieldPath, state: _Decoding) -> None:
 
 
 def _replace(index: int, value: object, at: FieldPath, state: _Decoding) -> None:
-    """Fill a slot ``_place`` reserved with ``_PENDING`` once ``value`` is built."""
+    """Fill a slot ``_place`` reserved with ``PENDING`` once ``value`` is built."""
     state.built[index] = value
     state.placed[at] = value
 
@@ -1047,14 +529,6 @@ def _decode_str(
     raise ReadError(f"cannot read {data!r} as str")
 
 
-def _encode_float(value: object, state: _Encoding) -> PlainTree:
-    """Encode a float, as ``py/float`` when non-finite and the dialect must."""
-    number = cast("float", value)
-    if math.isfinite(number) or state.dialect == "python":
-        return number
-    return state.make_dict({"py/float": repr(number)})
-
-
 def _decode_float(
     data: PlainTree,
     target: object,
@@ -1077,13 +551,6 @@ def _decode_float(
     raise ReadError(f"cannot read {data!r} as float")
 
 
-def _encode_complex(value: object, state: _Encoding) -> PlainTree:
-    """Encode a complex as ``py/complex`` of its real and imaginary floats."""
-    number = cast("complex", value)
-    parts = [_encode_float(number.real, state), _encode_float(number.imag, state)]
-    return state.make_dict({"py/complex": state.make_list(parts)})
-
-
 def _decode_complex(
     data: PlainTree,
     target: object,
@@ -1102,12 +569,6 @@ def _decode_complex(
     raise ReadError(f"cannot read {data!r} as complex")
 
 
-def _encode_bytes(value: object, state: _Encoding) -> PlainTree:
-    """Encode bytes as ``py/b64``."""
-    text = base64.b64encode(cast("bytes", value)).decode()
-    return state.make_dict({"py/b64": text})
-
-
 def _decode_bytes(
     data: PlainTree,
     target: object,
@@ -1124,11 +585,6 @@ def _decode_bytes(
     raise ReadError(f"cannot read {data!r} as bytes")
 
 
-def _encode_path(value: object, state: _Encoding) -> PlainTree:
-    """Encode a path as ``py/path``."""
-    return state.make_dict({"py/path": str(value)})
-
-
 def _decode_path(
     data: PlainTree,
     target: object,
@@ -1140,11 +596,6 @@ def _decode_path(
     if isinstance(data, str):
         return Path(data)
     raise ReadError(f"cannot read {data!r} as Path")
-
-
-def _encode_uuid(value: object, state: _Encoding) -> PlainTree:
-    """Encode a UUID as ``py/uuid``."""
-    return state.make_dict({"py/uuid": str(value)})
 
 
 def _decode_uuid(
@@ -1161,15 +612,6 @@ def _decode_uuid(
         except ValueError as error:
             raise ReadError(f"cannot read {data!r} as UUID") from error
     raise ReadError(f"cannot read {data!r} as UUID")
-
-
-def _encode_datetime(value: object, state: _Encoding) -> PlainTree:
-    """Encode a datetime as ``py/datetime``, keeping a named zone."""
-    moment = cast("datetime", value)
-    text = moment.isoformat()
-    if isinstance(moment.tzinfo, ZoneInfo):
-        text = f"{text}[{moment.tzinfo.key}]"
-    return state.make_dict({"py/datetime": text})
 
 
 def _decode_datetime(
@@ -1200,11 +642,6 @@ def _decode_datetime(
             f"cannot read {data!r} as datetime: invalid named zone",
         ) from error
     return moment.astimezone(named)
-
-
-def _encode_enum(value: object, state: _Encoding) -> PlainTree:
-    """Encode an enum member as ``py/reduce`` of its class and value."""
-    return _encode_reduce(value, state)
 
 
 def _decode_enum(
@@ -1252,15 +689,6 @@ def _decode_literal(
     raise ReadError(f"cannot read {data!r} as {target}")
 
 
-def _encode_list(value: object, state: _Encoding) -> PlainTree:
-    """Encode a list, registering it for ``py/ref``."""
-    items = cast("Sequence[object]", value)
-    _register(value, state)
-    return state.make_list(
-        [_encode_at(item, index, state) for index, item in enumerate(items)],
-    )
-
-
 def _decode_list(
     data: PlainTree,
     target: object,
@@ -1277,15 +705,6 @@ def _decode_list(
         _decode_part(raw, item, (*at, index), state) for index, raw in enumerate(data)
     )
     return result
-
-
-def _encode_tuple(value: object, state: _Encoding) -> PlainTree:
-    """Encode a tuple as ``py/tuple``; a tuple is a value, never referenced."""
-    items = [
-        _encode_at(item, index, state)
-        for index, item in enumerate(cast("tuple[object, ...]", value))
-    ]
-    return state.make_dict({"py/tuple": state.make_list(items)})
 
 
 def _decode_tuple(
@@ -1312,15 +731,6 @@ def _decode_tuple(
     )
 
 
-def _encode_set(value: object, state: _Encoding) -> PlainTree:
-    """Encode a set as ``py/set`` with members in a deterministic order."""
-    members = cast("AbstractSet[object]", value)
-    _register(value, state)
-    ordered = sorted(members, key=lambda member: _set_order_key(member, state))
-    items = [_encode_at(member, index, state) for index, member in enumerate(ordered)]
-    return state.make_dict({"py/set": state.make_list(items)})
-
-
 def _decode_set(
     data: PlainTree,
     target: object,
@@ -1342,14 +752,6 @@ def _decode_set(
     return result
 
 
-def _encode_frozenset(value: object, state: _Encoding) -> PlainTree:
-    """Encode a frozenset as ``py/frozenset``; a frozenset is never referenced."""
-    members = cast("AbstractSet[object]", value)
-    ordered = sorted(members, key=lambda member: _set_order_key(member, state))
-    items = [_encode_at(member, index, state) for index, member in enumerate(ordered)]
-    return state.make_dict({"py/frozenset": state.make_list(items)})
-
-
 def _decode_frozenset(
     data: PlainTree,
     target: object,
@@ -1367,28 +769,6 @@ def _decode_frozenset(
         return frozenset(members)
     except TypeError as error:
         raise ReadError(f"frozenset members {members!r} are unhashable") from error
-
-
-def _set_order_key(value: object, state: _Encoding) -> tuple[str, str]:
-    """Return a set member's sort key without registering anything it reaches."""
-    mark = len(state.alive)
-    try:
-        encoded = _encode(value, state)
-    finally:
-        _rollback(state, mark)
-    text = json.dumps(mutable(encoded), sort_keys=True, separators=(",", ":"))
-    return repr(value), text
-
-
-def _encode_dict(value: object, state: _Encoding) -> PlainTree:
-    """Encode a dict, escaping keys through ``_encode_key``."""
-    mapping = cast("Mapping[object, object]", value)
-    _register(value, state)
-    encoded: dict[str, PlainTree] = {}
-    for key, member in mapping.items():
-        name = _encode_key(key, state)
-        encoded[name] = _encode_at(member, name, state)
-    return state.make_dict(encoded)
 
 
 def _decode_dict(
@@ -1415,12 +795,6 @@ def _decode_dict(
     return result
 
 
-def _encode_mappingproxy(value: object, state: _Encoding) -> PlainTree:
-    """Encode a ``MappingProxyType`` as ``py/mappingproxy`` around its dict."""
-    copied = dict(cast("Mapping[object, object]", value))
-    return state.make_dict({"py/mappingproxy": _encode_dict(copied, state)})
-
-
 def _decode_mappingproxy(
     data: PlainTree,
     target: object,
@@ -1434,19 +808,6 @@ def _decode_mappingproxy(
 def _bad_key(key: Hashable, target: object) -> Hashable:
     """Raise for a non-str key that does not fit ``target``."""
     raise ReadError(f"cannot read key {key!r} as {target}")
-
-
-def _encode_key(key: object, state: _Encoding) -> str:
-    """Return a dict key, ``json://``-escaping non-strings and tag lookalikes."""
-    if isinstance(key, str) and not key.startswith(("py/", "json://")):
-        return key
-    # A key is text, so nothing inside it has a path a later ``py/ref`` can name.
-    mark = len(state.alive)
-    try:
-        encoded = _encode(key, state)
-    finally:
-        _rollback(state, mark)
-    return "json://" + json.dumps(mutable(encoded))
 
 
 # A YAML reader yields non-str keys such as ``True``; they read as is.
@@ -1474,11 +835,6 @@ def _decode_key(
     return decoded
 
 
-def _encode_type(value: object, state: _Encoding) -> PlainTree:
-    """Encode a class as ``py/type``."""
-    return state.make_dict({"py/type": _import_path(cast("type", value))})
-
-
 def _decode_type(
     data: PlainTree,
     target: object,
@@ -1495,14 +851,6 @@ def _decode_type(
     return resolved
 
 
-def _encode_function(value: object, state: _Encoding) -> PlainTree:
-    """Encode a module-level function as ``py/function``."""
-    if not (isinstance(getattr(value, "__self__", None), (ModuleType, type(None)))):
-        return _encode_reduce(value, state)
-    path = _import_path(cast("Callable[..., object]", value))
-    return state.make_dict({"py/function": path})
-
-
 def _decode_function(
     data: PlainTree,
     target: object,
@@ -1517,17 +865,6 @@ def _decode_function(
     if not callable(resolved):
         raise ReadError(f"{data!r} does not name a callable")
     return resolved
-
-
-def _encode_object(value: object, state: _Encoding) -> PlainTree:
-    """Encode a dataclass or slotted object as ``py/object`` with its state."""
-    _register(value, state)
-    payload: dict[str, PlainTree] = {"py/object": _import_path(type(value))}
-    for name in _attribute_names(value):
-        member: object = getattr(value, name, _PENDING)
-        if member is not _PENDING:
-            payload[name] = _encode_at(member, name, state)
-    return state.make_dict(payload)
 
 
 def _decode_typeddict(
@@ -1604,7 +941,7 @@ def _decode_object(
             f"{name}: unknown field(s) {unknown}; valid: {sorted(types)}",
         )
     index = len(state.built)
-    _place(_PENDING, at, state)
+    _place(PENDING, at, state)
     before = len(state.bad)
     members = {
         key: _decode_part(raw, types[key], (*at, key), state)
@@ -1646,17 +983,6 @@ def _names_dataclass(
     )
 
 
-def _encode_hooked(value: object, state: _Encoding) -> PlainTree:
-    """Encode a value through its caller-supplied hook as ``py/hook``."""
-    encode_hook = state.hooks[type(value)][0]
-    _register(value, state)
-    # The payload is arbitrary caller data, so it takes the same walk as any
-    # other value: it may hold non-finite floats or tag-like keys.
-    path = _import_path(type(value))
-    payload = _encode_at(encode_hook(value), 1, state)
-    return state.make_dict({"py/hook": state.make_list([path, payload])})
-
-
 def _decode_hooked(
     data: PlainTree,
     target: object,
@@ -1679,54 +1005,10 @@ def _decode_hooked(
     # The encoder numbers the hooked value before its payload, so the slot is
     # reserved in that order and filled once the hook rebuilds it.
     index = len(state.built)
-    _place(_PENDING, at, state)
+    _place(PENDING, at, state)
     value = hook[1](_decode(payload, object, (*at, 1), state))
     _replace(index, value, at, state)
     return value
-
-
-def _encode_reduce(value: object, state: _Encoding) -> PlainTree:
-    """Encode a value by its pickle reduce recipe as ``py/reduce``."""
-    recipe = _canonical_reduce(value)
-    if recipe is None:
-        return _encode_unreduced(value, state)
-    # A bare-name reduce names a module global, written as an import path.
-    if isinstance(recipe, str):
-        path = _verified_path(f"{type(value).__module__}.{recipe}", value)
-        return state.make_dict({"py/type": path})
-    func, args, *rest = recipe
-    mark = len(state.alive)
-    try:
-        if any(part is not None for part in rest):
-            _register(value, state)
-        elements = [
-            _encode_at(part, index, state)
-            for index, part in enumerate((func, args, *rest))
-        ]
-    except TypeError:
-        _rollback(state, mark)
-        return _encode_unreduced(value, state)
-    while len(elements) > 2 and elements[-1] is None:
-        elements.pop()
-    return state.make_dict({"py/reduce": state.make_list(elements)})
-
-
-def _encode_unreduced(value: object, state: _Encoding) -> PlainTree:
-    """Encode a value with no usable reduce recipe by the protocols it has."""
-    kind = type(value)
-    name = kind.__name__
-    if hasattr(kind, "__dataclass_fields__") or "__slots__" in kind.__dict__:
-        return _encode_object(value, state)
-    if issubclass(kind, Mapping):
-        return _encode_dict(value, state)
-    if issubclass(kind, Sequence) and not issubclass(kind, (str, bytes)):
-        return _encode_list(value, state)
-    if issubclass(kind, AbstractSet):
-        return _encode_set(value, state)
-    raise TypeError(
-        f"Cannot serialize leaf of type {name!r}. "
-        f"Pass hooks={{{name}: (encode, decode)}} to to_plain().",
-    )
 
 
 def _decode_reduce(
@@ -1743,7 +1025,7 @@ def _decode_reduce(
     stateful = any(part is not None for part in data[2:])
     index = len(state.built)
     if stateful:
-        _place(_PENDING, at, state)
+        _place(PENDING, at, state)
     func = (
         target
         if isinstance(target, type) and data[0] == {"py/type": _import_name(target)}
@@ -1835,8 +1117,8 @@ def _decode_union(
         try:
             value = _decode(data, member, at, state)
         except ReadError:
-            value = _PENDING
-        if value is not _PENDING and len(state.bad) == len(bad):
+            value = PENDING
+        if value is not PENDING and len(state.bad) == len(bad):
             return value
         del state.built[built:]
         for key in set(state.bad) - bad:
@@ -1897,128 +1179,17 @@ def _allocate(kind: type) -> object:
     return allocate(kind)
 
 
-# A path's arguments are restated as one joined string. CPython 3.12 reduces
-# ``PurePath`` to one argument per segment and 3.14 to a single string, so the
-# raw recipe would differ per interpreter; every version rebuilds from the join.
-def _canonical_reduce(
-    value: object,
-) -> tuple[Callable[..., object], tuple[object, ...], *tuple[object, ...]] | str | None:
-    """Return ``value``'s reduce recipe with interpreter-independent arguments."""
-    try:
-        reduced = cast("object", value.__reduce_ex__(2))
-    except (AttributeError, NotImplementedError, TypeError, ValueError):
-        return None
-    if isinstance(reduced, str):
-        return reduced
-    if not isinstance(reduced, tuple):
-        return None
-    parts = list(cast("tuple[object, ...]", reduced))
-    if len(parts) < 2 or len(parts) > 5:
-        return None
-    func, args = parts[0], parts[1]
-    if not callable(func) or not isinstance(args, tuple):
-        return None
-    arguments = (
-        (str(value),) if isinstance(value, PurePath) else cast("tuple[object]", args)
-    )
-    rest = [
-        list(cast("Iterable[object]", part))
-        if index in (1, 2) and part is not None
-        else part
-        for index, part in enumerate(parts[2:])
-    ]
-    # A partial's state ends with its instance ``__dict__``, which CPython creates,
-    # empty, the first time anything reads the attribute; empty rebuilds as none.
-    if isinstance(value, partial) and rest and isinstance(rest[0], tuple):
-        *fields, instance_dict = cast("tuple[object, ...]", rest[0])
-        if instance_dict == {}:
-            rest[0] = (*fields, None)
-    return (func, arguments, *rest)
-
-
-def _import_path(value: type | Callable[..., object]) -> str:
-    """Return the verified dotted import path of a class or function, cached."""
-    cached = _IMPORT_PATHS.get(id(value))
-    if cached is not None and cached[0] is value:
-        return cached[1]
-    module: object = getattr(value, "__module__", None)
-    qualname: object = getattr(value, "__qualname__", None)
-    if (
-        not isinstance(module, str)
-        or not isinstance(qualname, str)
-        or "<locals>" in qualname
-    ):
-        raise TypeError(
-            f"Cannot serialize {value!r}: it has no importable path "
-            "(module-level __qualname__). Local/lambda callables and local "
-            "classes/subclasses cannot be deserialized.",
-        )
-    path = _verified_path(f"{module}.{qualname}", value)
-    _IMPORT_PATHS[id(value)] = (value, path)
-    return path
-
-
-def _verified_path(path: str, value: object) -> str:
-    """Return ``path`` after proving it imports as ``value`` itself."""
-    message = (
-        f"Cannot serialize {value!r}: import path {path!r} does not resolve to "
-        "the same object."
-    )
-    try:
-        resolved = _resolve_import(path)
-    except (AttributeError, ImportError) as error:
-        raise TypeError(message) from error
-    if resolved is not value:
-        raise TypeError(message)
-    return path
-
-
 def _resolve(path: str, state: _Decoding) -> object:
     """Import the object ``path`` names, refusing unless imports are allowed."""
     if not state.allow_imports:
         raise ReadError(f"{path!r} needs allow_imports=True")
-    resolved = _RESOLVED.get(path, _PENDING)
-    if resolved is _PENDING:
+    resolved = _RESOLVED.get(path, PENDING)
+    if resolved is PENDING:
         try:
-            resolved = _resolve_import(path)
+            resolved = resolve_import(path)
         except (AttributeError, ImportError) as error:
             raise ReadError(f"cannot import {path!r}: {error}") from error
         _RESOLVED[path] = resolved
-    return resolved
-
-
-def _resolve_import(path: str) -> object:
-    """Walk ``path`` from its longest loaded prefix, else its longest importable one."""
-    parts = path.split(".")
-    # A nested class such as ``pkg.mod.Cls.Config`` names no module at
-    # ``pkg.mod.Cls``; trying to import it first costs a failed finder search
-    # per class, so a loaded ancestor is walked before anything is imported.
-    for split in range(len(parts) - 1, 0, -1):
-        module = sys.modules.get(".".join(parts[:split]))
-        if module is not None:
-            resolved = _walk(module, parts[split:])
-            if resolved is not _PENDING:
-                return resolved
-            break
-    for split in range(len(parts) - 1, 0, -1):
-        try:
-            module = importlib.import_module(".".join(parts[:split]))
-        except ImportError:
-            continue
-        resolved = _walk(module, parts[split:])
-        if resolved is _PENDING:
-            raise AttributeError(f"{path!r} names no attribute of {module.__name__!r}")
-        return resolved
-    raise ImportError(f"Cannot resolve path: {path!r}")
-
-
-def _walk(start: object, parts: Iterable[str]) -> object:
-    """Return the attribute chain ``parts`` names from ``start``, else ``_PENDING``."""
-    resolved = start
-    for part in parts:
-        resolved = getattr(resolved, part, _PENDING)
-        if resolved is _PENDING:
-            break
     return resolved
 
 
@@ -2038,36 +1209,6 @@ def _resolve_alias(target: object) -> object:
     return resolved
 
 
-def _slot_names(kind: type) -> tuple[str, ...]:
-    """Return ``kind``'s state slots in MRO order, cached."""
-    cached = _SLOT_NAMES.get(kind)
-    if cached is not None:
-        return cached
-    names: dict[str, None] = {}
-    for base in kind.__mro__:
-        slots: object = getattr(base, "__slots__", ())
-        for slot in (
-            (slots,) if isinstance(slots, str) else cast("Iterable[str]", slots)
-        ):
-            if slot not in _SKIPPED_ATTRIBUTES:
-                names.setdefault(slot)
-    result = tuple(names)
-    _SLOT_NAMES[kind] = result
-    return result
-
-
-def _attribute_names(value: object) -> Iterator[str]:
-    """Yield state attributes: slots, then sorted ``__dict__`` keys."""
-    slots = _slot_names(type(value))
-    yield from slots
-    if hasattr(value, "__dict__"):
-        seen = set(slots)
-        for key in sorted(vars(value)):
-            if key not in seen and key not in _SKIPPED_ATTRIBUTES:
-                seen.add(key)
-                yield key
-
-
 # A cached value naming its own class would keep the weak key alive forever, so
 # only module-level classes whose hints do not name themselves are cached.
 def _field_types(kind: type) -> Mapping[str, object]:
@@ -2082,7 +1223,7 @@ def _field_types(kind: type) -> Mapping[str, object]:
     except (AttributeError, NameError, TypeError) as error:
         raise ReadError(f"cannot resolve field types of {kind}: {error}") from error
     names = (
-        dict.fromkeys([item.name for item in fields(kind)] + list(_slot_names(kind)))
+        dict.fromkeys([item.name for item in fields(kind)] + list(slot_names(kind)))
         if is_dataclass(kind)
         else hints
     )
@@ -2122,9 +1263,6 @@ _TAGS: Final = (
 """Every tag, in the precedence a node carrying several resolves by."""
 
 
-_NATIVE_LEAVES: Final = frozenset((str, int, bool))
-
-
 _PLAIN_LEAVES: Final = frozenset(
     cast("tuple[type, ...]", get_args(_resolve_alias(Plain))),
 )
@@ -2135,16 +1273,6 @@ _LAX_BOOLS: Final[Mapping[str, int]] = MappingProxyType(
     {"true": 1, "false": 0, "1": 1, "0": 0},
 )
 """Text a lax read takes as a bool, by its lowercased spelling."""
-
-
-_CONCRETE_PATH: Final = type(Path())
-
-
-_SKIPPED_ATTRIBUTES: Final = frozenset(("__weakref__", "__dict__"))
-
-
-_PENDING: Final = object()
-"""Fills a reference slot reserved for a value built after its children."""
 
 
 _ABSENT_REF: Final = object()
@@ -2163,24 +1291,6 @@ _NATIVE_ORIGINS: Final[Mapping[type, tuple[object, ...]]] = MappingProxyType(
     },
 )
 """The union-member origins each plain kind reads as without conversion."""
-
-
-_ENCODERS: Final[Mapping[type, _Encoder]] = MappingProxyType(
-    {
-        float: _encode_float,
-        complex: _encode_complex,
-        bytes: _encode_bytes,
-        list: _encode_list,
-        tuple: _encode_tuple,
-        set: _encode_set,
-        frozenset: _encode_frozenset,
-        dict: _encode_dict,
-        MappingProxyType: _encode_mappingproxy,
-        FunctionType: _encode_function,
-        BuiltinFunctionType: _encode_function,
-    },
-)
-"""Encoders by exact type; ``_encoder_for`` resolves and caches every other class."""
 
 
 _DECODERS: Final[Mapping[object, _Decoder]] = MappingProxyType(
@@ -2241,23 +1351,7 @@ _TAG_DECODERS: Final[Mapping[str, _Decoder]] = MappingProxyType(
 """The decoder each tag selects; the same decoder untagged data reaches by type."""
 
 
-_ENCODER_CACHE: Final[weakref.WeakKeyDictionary[type, _Encoder]] = (
-    weakref.WeakKeyDictionary()
-)
-
-
-# Keyed by ``id`` rather than weakly: a builtin function such as ``max`` cannot
-# be weakly referenced. Each entry keeps its object, so the ``id`` is never
-# reused while the entry stands.
-_IMPORT_PATHS: Final[dict[int, tuple[object, str]]] = {}
-
-
 _RESOLVED: Final[dict[str, object]] = {}
-
-
-_SLOT_NAMES: Final[weakref.WeakKeyDictionary[type, tuple[str, ...]]] = (
-    weakref.WeakKeyDictionary()
-)
 
 
 _FIELD_TYPES: Final[weakref.WeakKeyDictionary[type, Mapping[str, object]]] = (
