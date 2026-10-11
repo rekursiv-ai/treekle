@@ -726,8 +726,8 @@ def _decode_tuple(
     else:
         types = args
     return tuple(
-        _decode_part(raw, kind, (*at, index), state)
-        for index, (raw, kind) in enumerate(zip(data, types, strict=True))
+        _decode_part(raw, types[index], (*at, index), state)
+        for index, raw in enumerate(data)
     )
 
 
