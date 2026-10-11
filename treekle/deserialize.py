@@ -245,7 +245,6 @@ def _decode(
     decoder = _decoder_for(target)
     if decoder is _decode_union or not isinstance(data, Mapping):
         return decoder(data, target, at, state)
-    referenced = "py/ref" in data or "py/id" in data
     if "py/ref" in data:
         value = _decode_path_reference(data, state)
     elif "py/id" in data:
@@ -269,7 +268,7 @@ def _decode(
             raise ReadError(f"invalid {tag} envelope: {dict(data)!r}")
         payload = data if tag == "py/object" else data[tag]
         value = _TAG_DECODERS[tag](payload, target, at, state)
-    if not _fits(value, target, referenced=referenced):
+    if not _fits(value, target):
         raise ReadError(f"cannot read {value!r} as {target}")
     return value
 
@@ -280,26 +279,23 @@ def _decode_tagged(
     state: _Decoding,
 ) -> object:
     """Decode a dict read as ``object``: by its tag, else as a plain dict."""
-    if "py/object" in data:
-        if not state.allow_imports:
-            return _decode_dict(data, object, at, state)
-        return _decode_object(data, object, at, state)
-    if len(data) == 1:
-        tag = next(iter(data))
-        if tag == "py/ref":
-            return _decode_path_reference(data, state)
-        if tag == "py/id":
-            return _decode_reference(data, state)
-        decoder = _TAG_DECODERS.get(tag)
-        if decoder is not None:
-            return decoder(data[tag], object, at, state)
-    tag = _tag_of(data)
-    if tag is None:
-        return _decode_dict(data, object, at, state)
+    # References come first, in ``_decode``'s order, so both paths read one
+    # malformed node alike.
     if "py/ref" in data:
         return _decode_path_reference(data, state)
     if "py/id" in data:
         return _decode_reference(data, state)
+    if "py/object" in data:
+        if not state.allow_imports:
+            return _decode_entries(data, object, object, at, state)
+        return _decode_stored(data, at, state)
+    if len(data) == 1:
+        decoder = _TAG_DECODERS.get(next(iter(data)))
+        if decoder is not None:
+            return decoder(next(iter(data.values())), object, at, state)
+    tag = _tag_of(data)
+    if tag is None:
+        return _decode_entries(data, object, object, at, state)
     raise ReadError(f"invalid {tag} envelope: {data!r}")
 
 
@@ -358,16 +354,20 @@ def _has_tag_key(keys: Iterable[object]) -> bool:
 
 
 # ``isinstance`` alone refuses to judge a ``TypedDict`` or a Protocol that is not
-# runtime-checkable, so those are checked by their declared structure. A ``referenced``
-# value was decoded as whatever its first occurrence was, so its items are checked
-# against ``target``'s element types too.
-def _fits(value: object, target: object, *, referenced: bool = False) -> bool:
+# runtime-checkable, so those are checked by their declared structure. A referenced
+# value was decoded as whatever its first occurrence was, and a reduce, hook, or
+# ``py/object`` builds its items untyped, so items are checked against ``target``'s
+# element types too.
+def _fits(value: object, target: object) -> bool:
     """Return whether a tag-decoded or referenced ``value`` is acceptable as ``target``."""
+    # A part that did not read is already recorded where it sits.
+    if isinstance(value, Invalid):
+        return True
     target = _resolve_alias(target)
     origin: object = get_origin(target) or target
     args = cast("tuple[object, ...]", get_args(target))
-    if origin is UnionType or origin is typing.Union:  # pyright: ignore[reportDeprecated] -- A runtime origin test for pre-3.14 ``Optional``/``Union``, not an annotation.
-        return any(_fits(value, member, referenced=referenced) for member in args)
+    if _is_union(origin):
+        return any(_fits(value, member) for member in args)
     if origin is Literal:
         return value in args
     if origin is type:
@@ -380,16 +380,14 @@ def _fits(value: object, target: object, *, referenced: bool = False) -> bool:
         )
     if _is_protocol(origin):
         return _has_members(value, origin)
-    if not isinstance(value, origin):
-        return False
-    return not (referenced and args) or _items_fit(value, origin, args)
+    return isinstance(value, origin) and _items_fit(value, args)
 
 
 def _is_subclass(kind: type, bound: object) -> bool:
     """Return whether class ``kind`` lies inside ``type[bound]``."""
     bound = _resolve_alias(bound)
     origin: object = get_origin(bound) or bound
-    if origin is UnionType or origin is typing.Union:  # pyright: ignore[reportDeprecated] -- A runtime origin test for pre-3.14 ``Optional``/``Union``, not an annotation.
+    if _is_union(origin):
         return any(
             _is_subclass(kind, member)
             for member in cast("tuple[object, ...]", get_args(bound))
@@ -399,6 +397,11 @@ def _is_subclass(kind: type, bound: object) -> bool:
     if _is_protocol(origin):
         return _has_members(kind, origin)
     return issubclass(kind, origin)
+
+
+def _is_union(origin: object) -> bool:
+    """Return whether ``origin`` is a union's origin."""
+    return any(origin is kind for kind in _UNION_ORIGINS)
 
 
 def _is_protocol(kind: type) -> bool:
@@ -413,31 +416,23 @@ def _is_any(kind: type) -> bool:
 
 def _has_members(value: object, protocol: type) -> bool:
     """Return whether ``value`` has every member ``protocol`` declares."""
-    members = cast(
-        "frozenset[str]",
-        getattr(protocol, "__protocol_attrs__", frozenset[str]()),
-    )
+    members = cast("frozenset[str]", vars(protocol)["__protocol_attrs__"])
     return all(hasattr(value, name) for name in members)
 
 
-# Only containers a reference can name are walked: a decoded tuple or frozenset was
-# already read as its element types, but a ``py/ref`` value was read as nothing.
-def _items_fit(value: object, origin: type, args: tuple[object, ...]) -> bool:
+# Only the containers a reference can name are walked: lists, sets, and mappings.
+# A tuple or frozenset was read item by item as its element types already.
+def _items_fit(value: object, args: tuple[object, ...]) -> bool:
     """Return whether a container's items fit its element types."""
     if isinstance(value, Mapping) and len(args) == 2:
         mapping = cast("Mapping[object, object]", value)
         return all(
-            _fits(key, args[0], referenced=True)
-            and _fits(member, args[1], referenced=True)
+            _fits(key, args[0]) and _fits(member, args[1])
             for key, member in mapping.items()
         )
-    if (
-        isinstance(value, (list, set))
-        and len(args) == 1
-        and origin not in (tuple, frozenset)
-    ):
+    if isinstance(value, (list, set)) and args:
         items = cast("list[object] | set[object]", value)
-        return all(_fits(item, args[0], referenced=True) for item in items)
+        return all(_fits(item, args[0]) for item in items)
     return True
 
 
@@ -561,21 +556,20 @@ def _decode_int(
         return data
     if not state.strict and not isinstance(data, bool):
         number = _lax_number(data)
+        # ``is_integer`` is false for a non-finite float, so ``int`` cannot raise.
         if number is not None and number.is_integer():
             return int(number)
     raise ReadError(f"cannot read {data!r} as int")
 
 
 def _lax_number(data: PlainTree) -> float | None:
-    """Return the finite number ``data`` is or spells, else ``None``."""
+    """Return the number ``data`` is or spells, else ``None``."""
     if isinstance(data, str):
         try:
-            data = float(data)
+            return float(data)
         except ValueError:
             return None
-    if isinstance(data, (int, float)) and math.isfinite(data):
-        return float(data)
-    return None
+    return data if isinstance(data, float) else None
 
 
 def _decode_str(
@@ -619,15 +613,17 @@ def _decode_complex(
     at: FieldPath,
     state: _Decoding,
 ) -> complex:
-    """Decode a complex: a real number, or a ``py/complex`` pair."""
+    """Decode a complex: a real number, or a ``py/complex`` pair of floats."""
+    del target
     if isinstance(data, (int, float)) and not isinstance(data, bool):
         return complex(data)
     if isinstance(data, Sequence) and not isinstance(data, str) and len(data) == 2:
-        return complex(
-            _decode_float(data[0], float, (*at, 0), state),
-            _decode_float(data[1], float, (*at, 1), state),
+        # Each part is a tree of its own: a non-finite one arrives as ``py/float``.
+        real, imag = (
+            cast("float", _decode(part, float, (*at, index), state))
+            for index, part in enumerate(data)
         )
-    del target
+        return complex(real, imag)
     raise ReadError(f"cannot read {data!r} as complex")
 
 
@@ -695,7 +691,7 @@ def _decode_datetime(
         return moment
     if moment.utcoffset() is None:
         raise ReadError(f"cannot read {data!r} as datetime: timestamp is naive")
-    if not zone.endswith("]") or len(zone) == 1:
+    if not zone.endswith("]"):
         raise ReadError(f"cannot read {data!r} as datetime: invalid named zone")
     try:
         named = ZoneInfo(zone.removesuffix("]"))
@@ -714,17 +710,18 @@ def _decode_enum(
 ) -> Enum:
     """Decode an untagged value as a member of ``target``; tagged ones are reduces."""
     del at, state
-    if (
-        isinstance(target, type)
-        and issubclass(target, Enum)
-        and isinstance(data, (str, int, float))
-        and not isinstance(data, bool)
-    ):
+    # ``_decoder_for`` picks this decoder only for a class with ``Enum`` in its MRO.
+    return _enum_member(data, cast("type[Enum]", target))
+
+
+def _enum_member(data: PlainTree, kind: type[Enum]) -> Enum:
+    """Return ``kind``'s member whose value ``data`` is; a bool names none."""
+    if isinstance(data, (str, int, float)) and not isinstance(data, bool):
         try:
-            return target(data)
+            return kind(data)
         except ValueError:
             pass
-    raise ReadError(f"cannot read {data!r} as {target}")
+    raise ReadError(f"cannot read {data!r} as {kind}")
 
 
 def _decode_literal(
@@ -734,20 +731,17 @@ def _decode_literal(
     state: _Decoding,
 ) -> Plain | Enum:
     """Decode one of a ``Literal``'s values, matching bool and int apart."""
+    del at, state
     for option in cast("tuple[object, ...]", get_args(target)):
         if isinstance(option, Enum):
             try:
-                member = _decode_enum(data, type(option), at, state)
+                member = _enum_member(data, type(option))
             except ReadError:
                 continue
             if member is option:
                 return option
-        elif (
-            (option is None or isinstance(option, (str, int, float)))
-            and type(option) is type(data)
-            and option == data
-        ):
-            return option
+        elif type(option) is type(data) and option == data:
+            return cast("Plain", option)
     raise ReadError(f"cannot read {data!r} as {target}")
 
 
@@ -760,7 +754,16 @@ def _decode_list(
     """Decode a list, numbering it for ``py/id``."""
     if not isinstance(data, Sequence) or isinstance(data, str):
         raise ReadError(f"cannot read {data!r} as {target}")
-    item = _element_type(target)
+    return _decode_items(data, _element_type(target), at, state)
+
+
+def _decode_items(
+    data: Sequence[PlainTree],
+    item: object,
+    at: FieldPath,
+    state: _Decoding,
+) -> list[object]:
+    """Decode a sequence's items as ``item`` into a list numbered for ``py/id``."""
     result: list[object] = []
     _place(result, at, state)
     result.extend(
@@ -844,6 +847,17 @@ def _decode_dict(
         raise ReadError(f"cannot read {data!r} as {target}")
     args = cast("tuple[object, ...]", get_args(target))
     key_type, value_type = args if len(args) == 2 else (object, object)
+    return _decode_entries(data, key_type, value_type, at, state)
+
+
+def _decode_entries(
+    data: Mapping[str, PlainTree],
+    key_type: object,
+    value_type: object,
+    at: FieldPath,
+    state: _Decoding,
+) -> dict[Hashable, object]:
+    """Decode a mapping's keys and values into a dict numbered for ``py/id``."""
     result: dict[Hashable, object] = {}
     _place(result, at, state)
     for key, raw in data.items():
@@ -959,18 +973,18 @@ def _decode_typeddict(
     return result
 
 
-# Under ``from __future__ import annotations`` a class body's ``NotRequired``
-# is a string, so ``__required_keys__`` lists every key; the resolved hints
-# carry the qualifier.
+# ``__required_keys__`` applies each declaring class's own totality, but under
+# ``from __future__ import annotations`` it cannot see a ``Required`` or
+# ``NotRequired`` written as a string; the resolved hints carry the qualifier.
 def _required_keys(kind: type) -> frozenset[str]:
-    """Return a TypedDict's required keys, read from its resolved hints."""
-    total = cast("bool", getattr(kind, "__total__", True))
+    """Return a TypedDict's required keys: by totality, unless a hint says."""
+    by_totality = cast("frozenset[str]", vars(kind)["__required_keys__"])
     hints = get_type_hints(kind, include_extras=True)
     return frozenset(
         key
         for key, hint in hints.items()
-        if get_origin(hint) is not NotRequired
-        and (total or get_origin(hint) is Required)
+        if get_origin(hint) is Required
+        or (get_origin(hint) is not NotRequired and key in by_totality)
     )
 
 
@@ -991,19 +1005,7 @@ def _decode_object(
         }
         data = fields_only
     if "py/object" in data:
-        path = data["py/object"]
-        if not isinstance(path, str):
-            raise ReadError(f"invalid py/object path: {path!r}")
-        kind = _resolve(path, state)
-        if not isinstance(kind, type):
-            raise ReadError(f"{path!r} does not name a class")
-        value = _allocate(kind)
-        _place(value, at, state)
-        for attribute, raw in data.items():
-            if attribute != "py/object":
-                member = _decode_part(raw, object, (*at, attribute), state)
-                object.__setattr__(value, attribute, member)
-        return value
+        return _decode_stored(data, at, state)
     if not isinstance(target, type) or not is_dataclass(target):
         raise ReadError(f"cannot read {dict(data)!r} as {name}")
     types = _field_types(target)
@@ -1036,6 +1038,27 @@ def _decode_object(
     for key, member in rest.items():
         object.__setattr__(value, key, member)
     _replace(index, value, at, state)
+    return value
+
+
+def _decode_stored(
+    data: Mapping[str, PlainTree],
+    at: FieldPath,
+    state: _Decoding,
+) -> object:
+    """Rebuild the class a ``py/object`` record names, its attributes untyped."""
+    path = data["py/object"]
+    if not isinstance(path, str):
+        raise ReadError(f"invalid py/object path: {path!r}")
+    kind = _resolve(path, state)
+    if not isinstance(kind, type):
+        raise ReadError(f"{path!r} does not name a class")
+    value = _allocate(kind)
+    _place(value, at, state)
+    for attribute, raw in data.items():
+        if attribute != "py/object":
+            member = _decode_part(raw, object, (*at, attribute), state)
+            object.__setattr__(value, attribute, member)
     return value
 
 
@@ -1192,8 +1215,8 @@ def _decode_any(
     if state.untagged or data is None or isinstance(data, (str, int, float)):
         return data
     if isinstance(data, Mapping):
-        return _decode_dict(data, object, at, state)
-    return _decode_list(data, object, at, state)
+        return _decode_entries(data, object, object, at, state)
+    return _decode_items(data, object, at, state)
 
 
 def _decode_union(
@@ -1373,6 +1396,11 @@ _LAX_BOOLS: Final[Mapping[str, int]] = MappingProxyType(
     {"true": 1, "false": 0, "1": 1, "0": 0},
 )
 """Text a lax read takes as a bool, by its lowercased spelling."""
+
+
+_UNION_ORIGINS: Final = (UnionType, typing.Union)  # pyright: ignore[reportDeprecated] -- A runtime origin, not an annotation.
+"""A union's origin: ``typing.Union`` before 3.14 for ``Optional``/``Union``, else
+``UnionType``; from 3.14 the two are one class."""
 
 
 _ABSENT_REF: Final = object()

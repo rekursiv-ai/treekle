@@ -124,8 +124,8 @@ same way. Older `py/id` back-references still read.
 `from_plain(data, T)` reads `data` as `T`: a JSON array as a `tuple[int, int]`,
 `"red"` as `Color.RED`, a dict as a dataclass. Where the data carries a tag, the
 tag decides, so a field typed `object` or a Protocol reads back as whatever
-class the payload names. Importing a class by name is gated behind
-`allow_imports=True`.
+class the payload names, if that class fits the annotation. Importing a class
+by name is gated behind `allow_imports=True`.
 
 ### Best-effort decoding
 
@@ -136,28 +136,71 @@ path to its `Invalid`.
 ### Wire-invariant
 
 The core never parses or prints text. `treekle.json_loads` is the one
-reader: `json_loads(text, T)` parses and reads as `T` in one call.
+reader: `json_loads(text, T)` parses and reads as `T` in one call. This is its
+whole body, minus overloads and docstring:
+
+```python
+import json
+
+
+def json_loads(
+    text: str | bytes,
+    target: object = ABSENT,
+    *,
+    hooks: Hooks = MappingProxyType({}),
+    allow_imports: bool = False,
+    strict: bool = True,
+) -> object:
+    tree = cast("MutablePlainTree", json.loads(text))
+    if target is ABSENT:
+        return tree
+    return from_plain(
+        tree,
+        target,
+        hooks=hooks,
+        allow_imports=allow_imports,
+        strict=strict,
+    )
+```
 
 ## Why not another serializer
 
-**tl;dr:** No library is perfect, including this one. Fast libraries decode
-only classes known ahead of time; treekle trades speed for pickle semantics in
-plain text.
+**tl;dr:** The pickle-style libraries have a nearly orthogonal feature set to
+the JSON-style libraries. The group either is forgiving about types (like
+callables) and forgoes type-strictness or cannot tolerate types to achieve
+safety. `jsonpickle` is arguably the most similar to `treekle` (and was our
+default choice until making treekle).
 
-| | C/Rust | text | class from data | callables | shared refs | best-effort |
-|---|:---:|:---:|:---:|:---:|:---:|:---:|
-| [msgspec](https://github.com/jcrist/msgspec) | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ |
-| [pydantic](https://github.com/pydantic/pydantic) | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ |
-| [cattrs](https://github.com/python-attrs/cattrs) | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ |
-| [mashumaro](https://github.com/Fatal1ty/mashumaro) | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ |
-| [pickle](https://docs.python.org/3/library/pickle.html) | ✅ | ❌ | ✅ | ✅ | ✅ | ❌ |
-| [jsonpickle](https://github.com/jsonpickle/jsonpickle) | ❌ | ✅ | ✅ | ✅ | ✅ | ❌ |
-| [treekle](https://github.com/rekursiv-ai/treekle) | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ |
+
+| | [treekle](https://github.com/rekursiv-ai/treekle) | [jsonpickle](https://github.com/jsonpickle/jsonpickle) | [pickle](https://docs.python.org/3/library/pickle.html) | [mashumaro](https://github.com/Fatal1ty/mashumaro) | [cattrs](https://github.com/python-attrs/cattrs) | [pydantic](https://github.com/pydantic/pydantic) | [msgspec](https://github.com/jcrist/msgspec) |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| C/Rust | ❌ | ❌ | ✅ | ❌ | ❌ | ✅ | ✅ |
+| plain | ✅ | ✅ | ❌ | ✅ | ✅ | ✅ | ✅ |
+| typed result | ✅ | ❌ | ❌ | ✅ | ✅ | ✅ | ✅ |
+| typed contents | ✅ | ❌ | ❌ | ✅ | ✅ | ✅ | ✅ |
+| untagged input | ✅ | ❌ | ❌ | ✅ | ✅ | ✅ | ✅ |
+| class from data | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| callables | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ |
+| shared refs | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ |
+| best-effort | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| GitHub stars | -- | 1.3k | stdlib | 940 | 1.1k | 29.0k | 4.2k |
+
+✅ = yes, ❌ = no. Star counts checked 2026-10-11. Corrections welcome --
+[open a PR](https://github.com/rekursiv-ai/treekle/pulls).
 
 - **C/Rust:** the core is a compiled extension, not pure Python.
-- **text:** encodes to human-readable text (JSON), not opaque bytes.
-- **class from data:** decode builds a class the payload names by import path,
-  beyond the declared type and its subclasses.
+- **plain:** encodes to plain dicts, lists, and scalars, so any writer stores
+  it: JSON, YAML, TOML.
+- **typed result:** a type checker infers `T` from `decode(data, T)`, not
+  `Any`.
+- **typed contents:** every nested field and element is checked against its
+  annotation, e.g. `list[Layer]`. An `isinstance` check on jsonpickle's
+  result would fix typed result, not this.
+- **untagged input:** data with no `py/*` tags reads as the declared type, so
+  hand-written config works.
+- **class from data:** decode builds the class the payload names by import
+  path (a subclass, a Protocol implementation, or any class) and rejects one
+  that does not fit the field's annotation.
 - **callables:** a function round-trips by import path, with no special field
   type.
 - **shared refs:** an object referenced twice decodes as one object; cycles
@@ -165,24 +208,36 @@ plain text.
 - **best-effort:** bad input yields the partial value and every bad part's
   location.
 
-**Details:** each mark is what a probe of msgspec 0.22, pydantic 2.13, cattrs
+**Details:** each cell is what a probe of msgspec 0.22, pydantic 2.13, cattrs
 26.2, mashumaro 3.23, and jsonpickle 4.1 returned:
 
-| | text | class from data | callables | shared refs | best-effort |
-|---|---|---|---|---|---|
-| [msgspec](https://github.com/jcrist/msgspec) | JSON | `dict` | raises | split | first error |
-| [pydantic](https://github.com/pydantic/pydantic) | JSON | `dict` | raises | split | all, no value |
-| [cattrs](https://github.com/python-attrs/cattrs) | JSON | raises | raises | split | all, no value |
-| [mashumaro](https://github.com/Fatal1ty/mashumaro) | JSON | raises | raises | split | first error |
-| [pickle](https://docs.python.org/3/library/pickle.html) | binary | the class | same function | kept | first error |
-| [jsonpickle](https://github.com/jsonpickle/jsonpickle) | JSON | the class | same function | kept | no error, `dict` |
-| [treekle](https://github.com/rekursiv-ai/treekle) | JSON | the class | same function | kept | partial value, all |
+| | treekle | jsonpickle | pickle | mashumaro | cattrs | pydantic | msgspec |
+|---|---|---|---|---|---|---|---|
+| plain | `to_plain` | `Pickler().flatten` | bytes only | `encode` | `unstructure` | `dump_python` | `to_builtins` |
+| typed result | `Layer` | `dict \| list \| ...` | `Any` | `Layer` | `Layer` | `Layer` | `Layer` |
+| typed contents | raises at `layers[0].width` | `dict` holding `'x'` | no target type | raises at `layers` | raises at `layers[0].width` | raises at `layers[0].width` | raises at `layers[0].width` |
+| untagged input | `Net` | `dict` | raises: bytes only | `Net` | `Net` | `Net` | `Net` |
+| class from data: subclass | subclass | subclass | subclass | base class, subclass fields dropped | base class, subclass fields dropped | base class, subclass fields dropped | base class, subclass fields dropped |
+| class from data: Protocol | implementing class | implementing class | implementing class | raises: no Protocol schema | raises: no Protocol schema | raises: no Protocol schema | raises: no Protocol schema |
+| class from data: `object` | named class | named class | named class | raises | raises | `dict` | `dict` |
+| class from data: misfit | raises | misfit accepted | misfit accepted | raises | raises | raises | raises |
+| callables | same function | same function | same function | raises | raises | raises | raises |
+| shared refs | one object | one object | one object | two copies | two copies | two copies | two copies |
+| best-effort | partial value, all errors | no error, returns `dict` | first error | first error | all errors, no value | all errors, no value | first error |
 
-- **text:** what one dataclass encodes to.
-- **class from data:** an `object` field given a payload naming another class.
+- **plain:** the call that encodes to plain data.
+- **typed result:** what basedpyright infers for decoding a dataclass `Layer`.
+- **typed contents:** `Net` with `layers: list[Layer]`, given
+  `layers[0].width = "x"`. jsonpickle with a top-level `isinstance(obj, Net)`
+  check returned `Net(layers=[{'width': 'x'}])`.
+- **untagged input:** a valid `Net` payload with no `py/*` tags.
+- **class from data:** a payload naming a class, read into a base-class field,
+  a Protocol field, and an `object` field. cattrs keeps the subclass with
+  `include_subclasses`; msgspec and pydantic need a closed tagged union.
+  "misfit": a payload naming a class that is neither a subclass of the
+  base-class field nor an implementation of the Protocol field.
 - **callables:** a field holding a module-level function.
-- **shared refs:** one object in two fields; "split" decodes two separate
-  copies.
+- **shared refs:** one object in two fields.
 - **best-effort:** two bad fields.
 
 One cycle shape fails to read: one through a dataclass decoded as its declared

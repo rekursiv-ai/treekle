@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import Enum, IntEnum
 from functools import partial
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
@@ -20,7 +20,9 @@ from zoneinfo import ZoneInfo
 
 import datetime as dt
 import math
+import re
 import threading
+import weakref
 
 import pytest
 
@@ -30,11 +32,39 @@ from treekle.serialize import to_plain
 
 
 if TYPE_CHECKING:
-    from treekle.types import Hooks, MutablePlainTree
+    from collections.abc import Callable
+
+    from treekle.types import Dialect, Hooks, MutablePlainTree
+
+
+@pytest.fixture(autouse=True)
+def fresh_encoder_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make every test choose its encoders anew, not read an earlier test's."""
+    monkeypatch.setattr(
+        serialize,
+        "_ENCODER_CACHE",
+        weakref.WeakKeyDictionary[type, object](),
+    )
 
 
 def _round_trip(value: object) -> object:
     return from_plain(to_plain(value), object, allow_imports=True)
+
+
+def _unresolved(value: object, path: str) -> str:
+    """Return the anchored pattern of ``_verified_path``'s whole error message."""
+    return re.escape(
+        f"Cannot serialize {value!r}: import path {path!r} does not resolve to "
+        "the same object.",
+    ).join("^$")
+
+
+def _no_leaf(name: str) -> str:
+    """Return the anchored pattern of the unknown-leaf error for class ``name``."""
+    return re.escape(
+        f"Cannot serialize leaf of type {name!r}. "
+        f"Pass hooks={{{name}: (encode, decode)}} to to_plain().",
+    ).join("^$")
 
 
 class Color(Enum):
@@ -175,6 +205,177 @@ class LocalReduce:
         return (rebuild, ())
 
 
+class Level(IntEnum):
+    LOW = 1
+
+
+@dataclass(kw_only=True, slots=True)
+class Coord:
+    # An Enum builds its mixin positionally from each member's value. Not
+    # frozen: before 3.14, frozen+slots breaks Enum member construction.
+    x: int = field(kw_only=False)
+
+
+class Compass(Coord, Enum):
+    """A dataclass enum, which still encodes as an enum member."""
+
+    N = 1
+
+
+class Corner(Coord, Enum):
+    """A dataclass enum whose reduce refuses, so its state is written instead."""
+
+    A = 1
+
+    @override
+    def __reduce_ex__(self, proto: object) -> tuple[object, ...]:
+        raise TypeError("no reduce")
+
+
+@dataclass(frozen=True, kw_only=True, slots=True)
+class Ranked:
+    """A set member whose ``repr`` is its label alone."""
+
+    z: int
+    a: int
+    label: str = ""
+
+    @override
+    def __repr__(self) -> str:
+        return self.label
+
+
+class Sentinel:
+    """Reduces to the name of its one module-level instance."""
+
+    @override
+    def __reduce_ex__(self, protocol: SupportsIndex) -> str | tuple[object, ...]:
+        return "SENTINEL"
+
+
+SENTINEL = Sentinel()
+
+
+class Recipe:
+    """Reduces to whatever recipe it holds."""
+
+    def __init__(self, recipe: object) -> None:
+        self.recipe: object = recipe
+
+    @override
+    def __reduce_ex__(self, protocol: SupportsIndex) -> str | tuple[object, ...]:
+        return cast("tuple[object, ...]", self.recipe)
+
+
+class Boxed:
+    """Reduces to a call taking the very list it holds."""
+
+    def __init__(self, items: list[int]) -> None:
+        self.items = items
+
+    @override
+    def __reduce__(self) -> tuple[object, tuple[list[int]]]:
+        return (Boxed, (self.items,))
+
+
+class Items(list[int]):
+    """A list subclass, which reduces with list items."""
+
+
+@dataclass(kw_only=True, slots=True)
+class Lazy:
+    """A dataclass whose non-init slot stays unset until first use."""
+
+    name: str
+    cache: int = field(init=False)
+
+
+class Shadowed:
+    """A slot whose name also sits in the instance ``__dict__``."""
+
+    __slots__ = ("__dict__", "items")
+
+    def __init__(self, items: list[int]) -> None:
+        self.items = items
+        vars(self)["items"] = "shadow"
+
+    @override
+    def __reduce_ex__(self, protocol: SupportsIndex) -> str | tuple[object, ...]:
+        raise TypeError("no reduce")
+
+
+def _ranked(z: int, a: int, label: str = "") -> MutablePlainTree:
+    return {"py/object": f"{__name__}.Ranked", "z": z, "a": a, "label": label}
+
+
+# Equal reprs leave the encoded tree to break the tie. Sorting by ``a`` (the
+# first sorted key), by ``z`` (the first written key), and CPython's iteration
+# order give three different orders for these members.
+_RANKED = (Ranked(z=3, a=1), Ranked(z=2, a=2), Ranked(z=1, a=3))
+_RANKED_TREES = [_ranked(3, 1), _ranked(2, 2), _ranked(1, 3)]
+
+
+def _around(middle: object) -> list[object]:
+    """Return ``middle`` between two occurrences of one list."""
+    shared = [1]
+    return [shared, middle, shared]
+
+
+def _then[T](build: Callable[[T], object], part: T) -> list[object]:
+    """Return a value built around ``part``, then ``part`` itself."""
+    return [build(part), part]
+
+
+def _twice(value: object) -> list[object]:
+    return [value, value]
+
+
+def _node(children: list[Node]) -> Node:
+    return Node(name="n", children=children)
+
+
+def _frozen(member: object) -> frozenset[object]:
+    return frozenset({member})
+
+
+def _fake_encoder(value: object, state: object) -> MutablePlainTree:
+    del state
+    return f"fake {type(value).__name__}"
+
+
+_JSON_FLOATS: MutablePlainTree = [
+    {"py/float": "inf"},
+    1.5,
+    {"py/complex": [{"py/float": "-inf"}, {"py/float": "nan"}]},
+]
+
+
+_STATE_TUPLE = Recipe((Recipe, (1,), ("x", dict[str, int]())))
+_STATE_TUPLE_TREE: MutablePlainTree = {
+    "py/reduce": [
+        {"py/type": f"{__name__}.Recipe"},
+        {"py/tuple": [1]},
+        {"py/tuple": ["x", {}]},
+    ],
+}
+
+
+_NODE_TREE: MutablePlainTree = {
+    "py/object": f"{__name__}.Node",
+    "name": "n",
+    "children": [],
+}
+
+
+_BARE_TREE: MutablePlainTree = {
+    "py/reduce": [
+        {"py/function": "copyreg.__newobj__"},
+        {"py/tuple": [{"py/type": f"{__name__}.Bare"}]},
+        {"x": 1},
+    ],
+}
+
+
 class TestToPlain:
     def test_tags_name_python_types(self) -> None:
         tree = to_plain(
@@ -199,13 +400,33 @@ class TestToPlain:
             "c": {"py/complex": [1.0, 2.0]},
         }
 
-    def test_json_dialect_tags_non_finite_floats(self) -> None:
-        assert to_plain([math.inf, 1.5]) == [{"py/float": "inf"}, 1.5]
+    @pytest.mark.parametrize(
+        ("dialect", "expected"),
+        [
+            (None, _JSON_FLOATS),
+            ("json", _JSON_FLOATS),
+            ("python", [math.inf, 1.5, {"py/complex": [-math.inf, math.nan]}]),
+        ],
+        ids=repr,
+    )
+    def test_the_dialect_decides_which_floats_are_tagged(
+        self,
+        dialect: Dialect | None,
+        expected: MutablePlainTree,
+    ) -> None:
+        value = [math.inf, 1.5, complex(-math.inf, math.nan)]
 
-    def test_python_dialect_keeps_non_finite_floats(self) -> None:
-        tree = to_plain([math.inf], dialect="python")
+        tree = to_plain(value) if dialect is None else to_plain(value, dialect=dialect)
 
-        assert tree == [math.inf]
+        assert repr(tree) == repr(expected)
+
+    @pytest.mark.parametrize("dialect", ["yaml", "JSON"])
+    def test_an_unknown_dialect_is_rejected(self, dialect: str) -> None:
+        with pytest.raises(
+            ValueError,
+            match=rf"^unknown dialect '{dialect}'; expected 'json' or 'python'$",
+        ):
+            to_plain(math.inf, dialect=cast("Dialect", dialect))
 
     def test_immutable_output_is_read_only(self) -> None:
         tree = to_plain({"a": [(1,)]}, mutable=False)
@@ -213,10 +434,125 @@ class TestToPlain:
         assert isinstance(tree, MappingProxyType)
         assert tree["a"] == (MappingProxyType({"py/tuple": (1,)}),)
 
-    def test_shared_objects_become_references(self) -> None:
-        shared = [1]
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            (_twice([1]), [[1], {"py/ref": [0]}]),
+            (_twice({1}), [{"py/set": [1]}, {"py/ref": [0]}]),
+            (_twice(_STATE_TUPLE), [_STATE_TUPLE_TREE, {"py/ref": [0]}]),
+            (
+                _then(_frozen, Bare(1)),
+                [{"py/frozenset": [_BARE_TREE]}, {"py/ref": [0, 0]}],
+            ),
+            (
+                _then(_node, list[Node]()),
+                [_NODE_TREE, {"py/ref": [0, "children"]}],
+            ),
+            (
+                _then(Boxed, [1]),
+                [
+                    {
+                        "py/reduce": [
+                            {"py/type": f"{__name__}.Boxed"},
+                            {"py/tuple": [[1]]},
+                        ],
+                    },
+                    {"py/ref": [0, 1, 0]},
+                ],
+            ),
+        ],
+    )
+    def test_shared_objects_become_references(
+        self,
+        value: object,
+        expected: MutablePlainTree,
+    ) -> None:
+        assert to_plain(value) == expected
 
-        assert to_plain([shared, shared]) == [[1], {"py/ref": [0]}]
+    @pytest.mark.parametrize(
+        ("middle", "expected"),
+        [
+            pytest.param({2: "x"}, {"json://2": "x"}, id="escaped-key"),
+            pytest.param({1, 2}, {"py/set": [1, 2]}, id="set"),
+            pytest.param(
+                LocalReduce(1, 2),
+                {"py/object": f"{__name__}.LocalReduce", "a": 1, "b": 2},
+                id="failed-reduce",
+            ),
+        ],
+    )
+    def test_a_trial_encoding_forgets_only_what_it_registered(
+        self,
+        middle: object,
+        expected: MutablePlainTree,
+    ) -> None:
+        assert to_plain(_around(middle)) == [[1], expected, {"py/ref": [0]}]
+
+    def test_a_hooked_value_and_its_payload_are_referenced(self) -> None:
+        tensor = Tensor([1.0])
+
+        tree = to_plain([tensor, tensor, tensor.values], hooks=_HOOKS)
+
+        assert tree == [
+            {"py/hook": [f"{__name__}.Tensor", [1.0]]},
+            {"py/ref": [0]},
+            {"py/ref": [0, 1]},
+        ]
+
+    def test_an_unset_slot_is_omitted(self) -> None:
+        assert to_plain(Lazy(name="n")) == {
+            "py/object": f"{__name__}.Lazy",
+            "name": "n",
+        }
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            (Point, {"py/type": f"{__name__}.Point"}),
+            (
+                Color.RED,
+                {
+                    "py/reduce": [
+                        {"py/type": f"{__name__}.Color"},
+                        {"py/tuple": ["red"]},
+                    ],
+                },
+            ),
+            (
+                Compass.N,
+                {
+                    "py/reduce": [
+                        {"py/type": f"{__name__}.Compass"},
+                        {"py/tuple": [{"py/object": f"{__name__}.Coord", "x": 1}]},
+                    ],
+                },
+            ),
+            (Path("/a"), {"py/path": "/a"}),
+            (UUID(int=1), {"py/uuid": "00000000-0000-0000-0000-000000000001"}),
+            (
+                dt.datetime(2026, 1, 2, tzinfo=dt.UTC),
+                {"py/datetime": "2026-01-02T00:00:00+00:00"},
+            ),
+            (Point(x=1), {"py/object": f"{__name__}.Point", "x": 1, "y": 0.0}),
+            (Bare(1), _BARE_TREE),
+        ],
+    )
+    def test_each_class_chooses_its_encoder_once(
+        self,
+        value: object,
+        expected: MutablePlainTree,
+    ) -> None:
+        kind = type(value)
+
+        tree = to_plain(value)
+
+        assert tree == expected
+        assert serialize._ENCODER_CACHE[kind] is serialize._encoder_for(kind)
+
+    def test_a_cached_encoder_is_reused(self) -> None:
+        serialize._ENCODER_CACHE[Bare] = _fake_encoder
+
+        assert to_plain([Bare(1)]) == ["fake Bare"]
 
     def test_a_shared_mutable_reduced_value_becomes_a_reference(self) -> None:
         shared = bytearray(b"abc")
@@ -242,6 +578,14 @@ class TestToPlain:
         assert to_plain([shared, shared]) == [
             {"py/mappingproxy": {"a": 1}},
             {"py/ref": [0]},
+        ]
+
+    def test_a_value_inside_a_mappingproxy_is_named_through_its_tag(self) -> None:
+        inner = [1]
+
+        assert to_plain([MappingProxyType({"k": inner}), inner]) == [
+            {"py/mappingproxy": {"k": [1]}},
+            {"py/ref": [0, "py/mappingproxy", "k"]},
         ]
 
     def test_a_reference_names_the_path_of_the_first_occurrence(self) -> None:
@@ -272,10 +616,49 @@ class TestToPlain:
             "y": 0.0,
         }
 
-    def test_enum_encodes_by_reduce(self) -> None:
-        assert to_plain(Color.RED) == {
-            "py/reduce": [{"py/type": f"{__name__}.Color"}, {"py/tuple": ["red"]}],
-        }
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            (
+                Level.LOW,
+                {"py/reduce": [{"py/type": f"{__name__}.Level"}, {"py/tuple": [1]}]},
+            ),
+            (
+                PurePosixPath("a", "b"),
+                {
+                    "py/reduce": [
+                        {"py/type": "pathlib.PurePosixPath"},
+                        {"py/tuple": ["a/b"]},
+                    ],
+                },
+            ),
+            (
+                Items([1, 2]),
+                {
+                    "py/reduce": [
+                        {"py/function": "copyreg.__newobj__"},
+                        {"py/tuple": [{"py/type": f"{__name__}.Items"}]},
+                        None,
+                        [1, 2],
+                    ],
+                },
+            ),
+            (_STATE_TUPLE, _STATE_TUPLE_TREE),
+            (SENTINEL, {"py/type": f"{__name__}.SENTINEL"}),
+        ],
+    )
+    def test_reduce_writes_a_canonical_recipe(
+        self,
+        value: object,
+        expected: MutablePlainTree,
+    ) -> None:
+        assert to_plain(value) == expected
+
+    def test_a_stateless_hashable_reduce_is_written_in_full(self) -> None:
+        value = Recipe((Recipe, (1,), None))
+        tree = {"py/reduce": [{"py/type": f"{__name__}.Recipe"}, {"py/tuple": [1]}]}
+
+        assert to_plain([value, value]) == [tree, tree]
 
     def test_a_partial_encodes_the_same_once_its_dict_was_read(self) -> None:
         # CPython creates a partial's ``__dict__``, empty, the first time it is read.
@@ -285,8 +668,24 @@ class TestToPlain:
 
         assert to_plain(bound) == before
 
-    def test_set_order_is_deterministic(self) -> None:
-        assert to_plain({"b", "a", "c"}) == {"py/set": ["a", "b", "c"]}
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            ({"b", "a", "c"}, {"py/set": ["a", "b", "c"]}),
+            (set(_RANKED), {"py/set": _RANKED_TREES}),
+            (frozenset(_RANKED), {"py/frozenset": _RANKED_TREES}),
+            (
+                {Ranked(z=1, a=1, label="b"), Ranked(z=2, a=2, label="a")},
+                {"py/set": [_ranked(2, 2, "a"), _ranked(1, 1, "b")]},
+            ),
+        ],
+    )
+    def test_set_members_sort_by_repr_then_encoding(
+        self,
+        value: object,
+        expected: MutablePlainTree,
+    ) -> None:
+        assert to_plain(value) == expected
 
     def test_named_zone_is_kept(self) -> None:
         moment = dt.datetime(2026, 1, 2, 3, tzinfo=ZoneInfo("America/Chicago"))
@@ -302,9 +701,24 @@ class TestToPlain:
         with pytest.raises(TypeError, match="<locals>"):
             to_plain(Local)
 
-    def test_an_unknown_leaf_names_the_hook_to_add(self) -> None:
-        with pytest.raises(TypeError, match=r"hooks=\{lock:"):
-            to_plain(threading.Lock())
+    @pytest.mark.parametrize(
+        ("value", "name"),
+        [
+            (threading.Lock(), "lock"),
+            (Recipe((Recipe,)), "Recipe"),
+            (Recipe((Recipe, (1,), None, None, None, None)), "Recipe"),
+            (Recipe((1, ())), "Recipe"),
+            (Recipe((Recipe, [1])), "Recipe"),
+            (Recipe(None), "Recipe"),
+        ],
+    )
+    def test_an_unknown_leaf_names_the_hook_to_add(
+        self,
+        value: object,
+        name: str,
+    ) -> None:
+        with pytest.raises(TypeError, match=_no_leaf(name)):
+            to_plain(value)
 
 
 class TestRoundTrip:
@@ -488,10 +902,21 @@ class TestEncodeEdges:
             (Unreducible(a=1), {"a": 1}),
             (UnreducibleList([1]), [1]),
             (UnreducibleSet({1}), {"py/set": [1]}),
+            (
+                Corner.A,
+                {
+                    "py/object": f"{__name__}.Corner",
+                    "__objclass__": {"py/type": f"{__name__}.Corner"},
+                    "_name_": "A",
+                    "_sort_order_": 0,
+                    "_value_": {"py/object": f"{__name__}.Coord", "x": 1},
+                    "x": 1,
+                },
+            ),
+            (Shadowed([1]), {"py/object": f"{__name__}.Shadowed", "items": [1]}),
         ],
-        ids=repr,
     )
-    def test_an_unreducible_container_encodes_by_kind(
+    def test_an_unreducible_value_encodes_by_kind(
         self,
         value: object,
         expected: MutablePlainTree,
@@ -499,28 +924,34 @@ class TestEncodeEdges:
         assert to_plain(value) == expected
 
     def test_a_named_reduce_has_no_plain_form(self) -> None:
-        with pytest.raises(TypeError, match="NamedReduce"):
-            to_plain(NamedReduce())
+        value = NamedReduce()
 
-    def test_an_import_path_naming_another_object_is_rejected(self) -> None:
+        with pytest.raises(
+            TypeError,
+            match=_unresolved(value, f"{__name__}.NamedReduce"),
+        ):
+            to_plain(value)
+
+    @pytest.mark.parametrize(
+        ("module", "path"),
+        [
+            ("builtins", "builtins.max"),
+            ("no_such_module_xyz", "no_such_module_xyz.max"),
+        ],
+    )
+    def test_an_import_path_not_naming_the_object_is_rejected(
+        self,
+        module: str,
+        path: str,
+    ) -> None:
         def shadow() -> None:
             pass
 
         shadow.__qualname__ = "max"
-        shadow.__module__ = "builtins"
+        shadow.__module__ = module
 
-        with pytest.raises(TypeError, match="does not resolve"):
+        with pytest.raises(TypeError, match=_unresolved(shadow, path)):
             to_plain(shadow)
-
-    def test_an_unimportable_module_is_rejected(self) -> None:
-        def orphan() -> None:
-            pass
-
-        orphan.__qualname__ = "orphan"
-        orphan.__module__ = "no_such_module_xyz"
-
-        with pytest.raises(TypeError, match="does not resolve"):
-            to_plain(orphan)
 
 
 class TestImportPath:

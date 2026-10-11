@@ -35,6 +35,7 @@ from typing import (
     Final,
     Literal,
     cast,
+    get_args,
     overload,
 )
 from uuid import UUID
@@ -108,9 +109,12 @@ def to_plain(
       tree: Fresh plain data that ``from_plain`` turns back into ``obj``.
 
     Raises:
+      ValueError: ``dialect`` names no known format.
       TypeError: A leaf has no conversion and no hook.
 
     """
+    if dialect not in get_args(cast("object", Dialect.__value__)):
+        raise ValueError(f"unknown dialect {dialect!r}; expected 'json' or 'python'")
     state = _Encoding(
         dialect=dialect,
         hooks=hooks,
@@ -201,7 +205,7 @@ def _encoder_for(kind: type) -> _Encoder:
     if type in bases:
         encoder = _encode_type
     elif Enum in bases:
-        encoder = _encode_enum
+        encoder = _encode_reduce
     elif kind is Path or kind is _CONCRETE_PATH:
         encoder = _encode_path
     elif kind is UUID:
@@ -271,11 +275,6 @@ def _encode_datetime(value: object, state: _Encoding) -> PlainTree:
     return state.make_dict({"py/datetime": text})
 
 
-def _encode_enum(value: object, state: _Encoding) -> PlainTree:
-    """Encode an enum member as ``py/reduce`` of its class and value."""
-    return _encode_reduce(value, state)
-
-
 def _encode_list(value: object, state: _Encoding) -> PlainTree:
     """Encode a list, registering it for ``py/ref``."""
     items = cast("Sequence[object]", value)
@@ -318,7 +317,7 @@ def _set_order_key(value: object, state: _Encoding) -> tuple[str, str]:
         encoded = _encode(value, state)
     finally:
         _rollback(state, mark)
-    text = json.dumps(mutable(encoded), sort_keys=True, separators=(",", ":"))
+    text = json.dumps(mutable(encoded), sort_keys=True)
     return repr(value), text
 
 
@@ -417,7 +416,8 @@ def _encode_reduce(value: object, state: _Encoding) -> PlainTree:
     except TypeError:
         _rollback(state, mark)
         return _encode_unreduced(value, state)
-    while len(elements) > 2 and elements[-1] is None:
+    # ``elements[1]`` is the encoded argument tuple, never ``None``, so this stops.
+    while elements[-1] is None:
         elements.pop()
     return state.make_dict({"py/reduce": state.make_list(elements)})
 
@@ -521,10 +521,8 @@ def _attribute_names(value: object) -> Iterator[str]:
     slots = slot_names(type(value))
     yield from slots
     if hasattr(value, "__dict__"):
-        seen = set(slots)
         for key in sorted(vars(value)):
-            if key not in seen and key not in SKIPPED_ATTRIBUTES:
-                seen.add(key)
+            if key not in slots and key not in SKIPPED_ATTRIBUTES:
                 yield key
 
 
