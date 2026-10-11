@@ -16,6 +16,7 @@ if TYPE_CHECKING:
 __all__ = [
     "PENDING",
     "SKIPPED_ATTRIBUTES",
+    "is_mutable",
     "resolve_import",
     "slot_names",
 ]
@@ -64,6 +65,15 @@ def resolve_import(path: str) -> object:
             raise AttributeError(f"{path!r} names no attribute of {module.__name__!r}")
         return resolved
     raise ImportError(f"Cannot resolve path: {path!r}")
+
+
+# A class that sets ``__hash__ = None`` (``bytearray``, ``array``) is mutable by
+# Python's own convention, so two occurrences of one are one object, not two values.
+def is_mutable(value: object) -> bool:
+    """Return whether ``value``'s class opts out of hashing."""
+    kind: type = type(value)
+    hasher: object = kind.__hash__
+    return hasher is None
 
 
 def slot_names(kind: type) -> tuple[str, ...]:

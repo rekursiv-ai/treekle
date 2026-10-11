@@ -218,6 +218,32 @@ class TestToPlain:
 
         assert to_plain([shared, shared]) == [[1], {"py/ref": [0]}]
 
+    def test_a_shared_mutable_reduced_value_becomes_a_reference(self) -> None:
+        shared = bytearray(b"abc")
+
+        assert to_plain([shared, shared]) == [
+            {
+                "py/reduce": [
+                    {"py/type": "builtins.bytearray"},
+                    {"py/tuple": ["abc", "latin-1"]},
+                ],
+            },
+            {"py/ref": [0]},
+        ]
+
+    def test_a_repeated_value_typed_reduce_is_written_in_full(self) -> None:
+        member = to_plain(Color.RED)
+
+        assert to_plain([Color.RED, Color.RED]) == [member, member]
+
+    def test_a_shared_mappingproxy_becomes_a_reference(self) -> None:
+        shared = MappingProxyType({"a": 1})
+
+        assert to_plain([shared, shared]) == [
+            {"py/mappingproxy": {"a": 1}},
+            {"py/ref": [0]},
+        ]
+
     def test_a_reference_names_the_path_of_the_first_occurrence(self) -> None:
         shared = {"k": 1}
 
@@ -352,6 +378,40 @@ class TestRoundTrip:
 
         assert isinstance(restored, list)
         assert restored[1][0] is restored[0]
+
+    @pytest.mark.parametrize(
+        ("shared", "target"),
+        [
+            (bytearray(b"abc"), list[bytearray]),
+            (MappingProxyType({"a": 1}), list[MappingProxyType[str, int]]),
+        ],
+        ids=repr,
+    )
+    def test_a_shared_identity_value_stays_shared(
+        self,
+        shared: object,
+        target: object,
+    ) -> None:
+        tree = to_plain([shared, shared])
+
+        untyped = from_plain(tree, object, allow_imports=True)
+        typed = from_plain(tree, target, allow_imports=True)
+
+        assert isinstance(untyped, list)
+        assert untyped[1] is untyped[0]
+        assert isinstance(typed, list)
+        assert typed[1] is typed[0]
+        assert typed[0] == shared
+
+    def test_a_mappingproxy_cycle_survives(self) -> None:
+        inner: dict[str, object] = {}
+        proxy = MappingProxyType(inner)
+        inner["self"] = proxy
+
+        restored = _round_trip(proxy)
+
+        assert isinstance(restored, MappingProxyType)
+        assert restored["self"] is restored
 
     def test_a_dataclass_cycle_survives(self) -> None:
         parent = Node(name="p")
@@ -496,6 +556,10 @@ class TestImportPath:
 
         with pytest.raises(TypeError, match="no importable path"):
             serialize._import_path(callee)
+
+    def test_a_value_with_no_module_is_rejected(self) -> None:
+        with pytest.raises(TypeError, match="no importable path"):
+            serialize._import_path(cast("type", object()))
 
     def test_a_path_is_the_module_and_qualname(self) -> None:
         assert serialize._import_path(Point) == f"{__name__}.Point"

@@ -49,6 +49,7 @@ from treekle.plain import mutable
 from treekle.reflect import (
     PENDING,
     SKIPPED_ATTRIBUTES,
+    is_mutable,
     resolve_import,
     slot_names,
 )
@@ -334,8 +335,14 @@ def _encode_dict(value: object, state: _Encoding) -> PlainTree:
 
 def _encode_mappingproxy(value: object, state: _Encoding) -> PlainTree:
     """Encode a ``MappingProxyType`` as ``py/mappingproxy`` around its dict."""
+    _register(value, state)
     copied = dict(cast("Mapping[object, object]", value))
-    return state.make_dict({"py/mappingproxy": _encode_dict(copied, state)})
+    state.at.append("py/mappingproxy")
+    try:
+        inner = _encode_dict(copied, state)
+    finally:
+        state.at.pop()
+    return state.make_dict({"py/mappingproxy": inner})
 
 
 def _encode_key(key: object, state: _Encoding) -> str:
@@ -398,7 +405,10 @@ def _encode_reduce(value: object, state: _Encoding) -> PlainTree:
     func, args, *rest = recipe
     mark = len(state.alive)
     try:
-        if any(part is not None for part in rest):
+        # A hashable value with no state beyond its arguments (an enum member, a
+        # Decimal) is a value: each occurrence is written in full, so the output
+        # does not depend on sharing.
+        if is_mutable(value) or any(part is not None for part in rest):
             _register(value, state)
         elements = [
             _encode_at(part, index, state)

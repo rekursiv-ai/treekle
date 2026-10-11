@@ -12,7 +12,7 @@ import sys
 
 import pytest
 
-from treekle.reflect import resolve_import, slot_names
+from treekle.reflect import is_mutable, resolve_import, slot_names
 
 
 class Shape(Protocol):
@@ -84,6 +84,27 @@ class TestSlotNames:
 
     def test_the_result_is_cached(self) -> None:
         assert slot_names(Slotted) is slot_names(Slotted)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (bytearray(b"a"), True),
+        ([1], True),
+        ({"a": 1}, True),
+        (b"a", False),
+        ((1,), False),
+        (1.5, False),
+        # repr(object()) holds an address, which differs per xdist worker.
+        pytest.param(object(), False, id="object()-False"),
+    ],
+    ids=repr,
+)
+def test_a_class_that_opts_out_of_hashing_is_mutable(
+    value: object,
+    expected: bool,
+) -> None:
+    assert is_mutable(value) is expected
 
 
 if __name__ == "__main__":

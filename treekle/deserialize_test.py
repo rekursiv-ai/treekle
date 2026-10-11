@@ -198,6 +198,16 @@ class Meta(TypedDict):
     name: NotRequired[str]
 
 
+@dataclass(frozen=True, kw_only=True, slots=True)
+class Doubled:
+    """Stores twice what it is built with, so a rebuild shows as a second doubling."""
+
+    value: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "value", self.value * 2)
+
+
 class TestTypedDecode:
     def test_a_dataclass_reads_untagged_fields(self) -> None:
         assert from_plain({"x": 1, "y": 2}, Point) == Point(x=1, y=2.0)
@@ -730,6 +740,129 @@ class TestTypedDict:
     def test_a_non_mapping_raises(self) -> None:
         with pytest.raises(ReadError):
             from_plain([1], Meta)
+
+    def test_a_shared_typed_dict_round_trips_shared(self) -> None:
+        meta: Meta = {"size": 3}
+
+        first, second = from_plain(to_plain([meta, meta]), list[Meta])
+
+        assert first == meta
+        assert second is first
+
+    def test_a_legacy_index_reference_names_a_typed_dict(self) -> None:
+        first, second = from_plain([{"size": 3}, {"py/id": 1}], list[Meta])
+
+        assert second is first
+
+    @pytest.mark.parametrize(
+        "ref",
+        [{"py/ref": []}, {"py/id": 0}],
+        ids=repr,
+    )
+    def test_a_reference_to_a_non_typed_dict_is_refused(
+        self,
+        ref: MutablePlainTree,
+    ) -> None:
+        with pytest.raises(ReadError) as raised:
+            from_plain([{"size": 3}, ref], list[Meta])
+
+        assert list(raised.value.bad) == [(1,)]
+
+    def test_a_reference_missing_a_required_key_is_refused(self) -> None:
+        with pytest.raises(ReadError):
+            from_plain(
+                {"a": {"name": "x"}, "b": {"py/ref": ["a"]}},
+                tuple[dict[str, str], Meta],
+            )
+
+
+class TestTypeBound:
+    @pytest.mark.parametrize(
+        ("data", "target"),
+        [
+            ({"py/type": "builtins.str"}, type[int]),
+            ({"py/type": "builtins.int"}, type[Shape]),
+            (str, type[int]),
+            (int, type[Shape]),
+        ],
+        ids=repr,
+    )
+    def test_a_class_outside_the_bound_is_refused(
+        self,
+        data: object,
+        target: object,
+    ) -> None:
+        with pytest.raises(ReadError):
+            from_plain(data, target, allow_imports=True)
+
+    @pytest.mark.parametrize(
+        ("data", "target", "expected"),
+        [
+            ({"py/type": "builtins.bool"}, type[int], bool),
+            ({"py/type": "builtins.str"}, type[int | str], str),
+            (bool, type[int], bool),
+            (Square, type[Shape], Square),
+            (str, type[object], str),
+            (str, type, str),
+        ],
+        ids=repr,
+    )
+    def test_a_class_inside_the_bound_reads(
+        self,
+        data: object,
+        target: object,
+        expected: type,
+    ) -> None:
+        assert from_plain(data, target, allow_imports=True) is expected
+
+
+class TestReferenceFit:
+    def test_a_reference_must_fit_a_protocol(self) -> None:
+        tree: MutablePlainTree = [1, {"py/ref": []}]
+
+        with pytest.raises(ReadError):
+            from_plain(tree, list[Shape])
+
+    def test_a_reference_to_a_protocol_member_reads(self) -> None:
+        tree = to_plain([Square(side=1.0), Square(side=2.0)])
+        assert isinstance(tree, list)
+        tree.append({"py/ref": [1]})
+
+        restored = from_plain(tree, list[Shape], allow_imports=True)
+
+        assert restored[2] is restored[1]
+
+    def test_a_reference_must_fit_its_element_types(self) -> None:
+        with pytest.raises(ReadError):
+            from_plain([["a"], {"py/ref": [0]}], tuple[list[str], list[int]])
+
+    def test_a_reference_fitting_its_element_types_reads(self) -> None:
+        first, second = from_plain(
+            [[1], {"py/ref": [0]}],
+            tuple[list[int], Sequence[int]],
+        )
+
+        assert second is first
+
+
+class TestStoredState:
+    def test_a_typed_read_restores_stored_state_without_init(self) -> None:
+        stored = Doubled(value=1)
+
+        assert from_plain(to_plain(stored), Doubled).value == 2
+        assert from_plain(to_plain(stored), Doubled, allow_imports=True).value == 2
+
+    def test_an_untagged_record_is_built_through_init(self) -> None:
+        assert from_plain({"value": 1}, Doubled).value == 2
+
+    def test_stored_state_fills_a_missing_defaulted_field(self) -> None:
+        tree = {"py/object": f"{__name__}.Point", "x": 1}
+
+        assert from_plain(tree, Point) == Point(x=1)
+
+    def test_stored_state_missing_a_required_field_is_refused(self) -> None:
+        with pytest.raises(ReadError, match=r"missing field\(s\) \['x'\]"):
+            from_plain({"py/object": f"{__name__}.Point"}, Point)
 
 
 class TestDefault:

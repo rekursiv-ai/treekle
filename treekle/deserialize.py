@@ -27,7 +27,7 @@ from collections.abc import (
     Sequence,
     Set as AbstractSet,
 )
-from dataclasses import dataclass, field, fields, is_dataclass
+from dataclasses import MISSING, Field, dataclass, field, fields, is_dataclass
 from datetime import datetime
 from decimal import Decimal
 from enum import Enum
@@ -61,7 +61,7 @@ import typing
 import weakref
 
 from treekle.absent import ABSENT
-from treekle.reflect import PENDING, resolve_import, slot_names
+from treekle.reflect import PENDING, is_mutable, resolve_import, slot_names
 from treekle.types import (
     FieldPath,
     Hooks,
@@ -245,6 +245,7 @@ def _decode(
     decoder = _decoder_for(target)
     if decoder is _decode_union or not isinstance(data, Mapping):
         return decoder(data, target, at, state)
+    referenced = "py/ref" in data or "py/id" in data
     if "py/ref" in data:
         value = _decode_path_reference(data, state)
     elif "py/id" in data:
@@ -268,7 +269,7 @@ def _decode(
             raise ReadError(f"invalid {tag} envelope: {dict(data)!r}")
         payload = data if tag == "py/object" else data[tag]
         value = _TAG_DECODERS[tag](payload, target, at, state)
-    if not _fits(value, target):
+    if not _fits(value, target, referenced=referenced):
         raise ReadError(f"cannot read {value!r} as {target}")
     return value
 
@@ -324,11 +325,7 @@ def _decoder_for(target: object) -> _Decoder:
         return _decode_object
     if is_typeddict(origin):
         return _decode_typeddict
-    if (
-        origin.__dict__.get("_is_protocol") is True
-        or inspect.isabstract(origin)
-        or (origin.__module__ == "typing" and origin.__qualname__ == "Any")
-    ):
+    if _is_protocol(origin) or inspect.isabstract(origin) or _is_any(origin):
         return _decode_any
     return _decode_object
 
@@ -360,23 +357,88 @@ def _has_tag_key(keys: Iterable[object]) -> bool:
     return any(isinstance(key, str) and key.startswith("py/") for key in keys)
 
 
-def _fits(value: object, target: object) -> bool:
-    """Return whether a tag-decoded ``value`` is acceptable as ``target``."""
+# ``isinstance`` alone refuses to judge a ``TypedDict`` or a Protocol that is not
+# runtime-checkable, so those are checked by their declared structure. A ``referenced``
+# value was decoded as whatever its first occurrence was, so its items are checked
+# against ``target``'s element types too.
+def _fits(value: object, target: object, *, referenced: bool = False) -> bool:
+    """Return whether a tag-decoded or referenced ``value`` is acceptable as ``target``."""
     target = _resolve_alias(target)
     origin: object = get_origin(target) or target
+    args = cast("tuple[object, ...]", get_args(target))
+    if origin is UnionType or origin is typing.Union:  # pyright: ignore[reportDeprecated] -- A runtime origin test for pre-3.14 ``Optional``/``Union``, not an annotation.
+        return any(_fits(value, member, referenced=referenced) for member in args)
+    if origin is Literal:
+        return value in args
+    if origin is type:
+        return isinstance(value, type) and (not args or _is_subclass(value, args[0]))
+    if not _is_class(origin) or origin is object or _is_any(origin):
+        return True
+    if is_typeddict(origin):
+        return isinstance(value, Mapping) and _required_keys(origin) <= set(
+            cast("Mapping[object, object]", value),
+        )
+    if _is_protocol(origin):
+        return _has_members(value, origin)
+    if not isinstance(value, origin):
+        return False
+    return not (referenced and args) or _items_fit(value, origin, args)
+
+
+def _is_subclass(kind: type, bound: object) -> bool:
+    """Return whether class ``kind`` lies inside ``type[bound]``."""
+    bound = _resolve_alias(bound)
+    origin: object = get_origin(bound) or bound
     if origin is UnionType or origin is typing.Union:  # pyright: ignore[reportDeprecated] -- A runtime origin test for pre-3.14 ``Optional``/``Union``, not an annotation.
         return any(
-            _fits(value, member)
-            for member in cast("tuple[object, ...]", get_args(target))
+            _is_subclass(kind, member)
+            for member in cast("tuple[object, ...]", get_args(bound))
         )
-    if origin is Literal:
-        return value in cast("tuple[object, ...]", get_args(target))
-    if not isinstance(origin, type):
+    if not _is_class(origin) or origin is object or _is_any(origin):
         return True
-    try:
-        return isinstance(value, origin)
-    except TypeError:
-        return True
+    if _is_protocol(origin):
+        return _has_members(kind, origin)
+    return issubclass(kind, origin)
+
+
+def _is_protocol(kind: type) -> bool:
+    """Return whether ``kind`` is a Protocol class."""
+    return kind.__dict__.get("_is_protocol") is True
+
+
+def _is_any(kind: type) -> bool:
+    """Return whether ``kind`` is ``typing.Any``, a class ``isinstance`` refuses."""
+    return kind.__module__ == "typing" and kind.__qualname__ == "Any"
+
+
+def _has_members(value: object, protocol: type) -> bool:
+    """Return whether ``value`` has every member ``protocol`` declares."""
+    members = cast(
+        "frozenset[str]",
+        getattr(protocol, "__protocol_attrs__", frozenset[str]()),
+    )
+    return all(hasattr(value, name) for name in members)
+
+
+# Only containers a reference can name are walked: a decoded tuple or frozenset was
+# already read as its element types, but a ``py/ref`` value was read as nothing.
+def _items_fit(value: object, origin: type, args: tuple[object, ...]) -> bool:
+    """Return whether a container's items fit its element types."""
+    if isinstance(value, Mapping) and len(args) == 2:
+        mapping = cast("Mapping[object, object]", value)
+        return all(
+            _fits(key, args[0], referenced=True)
+            and _fits(member, args[1], referenced=True)
+            for key, member in mapping.items()
+        )
+    if (
+        isinstance(value, (list, set))
+        and len(args) == 1
+        and origin not in (tuple, frozenset)
+    ):
+        items = cast("list[object] | set[object]", value)
+        return all(_fits(item, args[0], referenced=True) for item in items)
+    return True
 
 
 def _decode_reference(
@@ -795,14 +857,20 @@ def _decode_dict(
     return result
 
 
+# ``to_plain`` registers the proxy at its own path and the copied dict one step below
+# it, under ``py/mappingproxy``; a ``py/ref`` may name either.
 def _decode_mappingproxy(
     data: PlainTree,
     target: object,
     at: FieldPath,
     state: _Decoding,
 ) -> MappingProxyType[Hashable, object]:
-    """Decode a ``MappingProxyType`` around a decoded dict."""
-    return MappingProxyType(_decode_dict(data, target, at, state))
+    """Decode a ``MappingProxyType`` around a decoded dict, placed before its dict."""
+    inner: dict[Hashable, object] = {}
+    value = MappingProxyType(inner)
+    state.placed[at] = value
+    inner.update(_decode_dict(data, target, (*at, "py/mappingproxy"), state))
+    return value
 
 
 def _bad_key(key: Hashable, target: object) -> Hashable:
@@ -881,11 +949,14 @@ def _decode_typeddict(
     missing = sorted(_required_keys(kind) - set(data))
     if missing:
         raise ReadError(f"{kind.__name__}: missing required field(s) {missing}")
-    return {
-        key: _decode_part(raw, hints[key], (*at, key), state)
+    result: dict[str, object] = {}
+    _place(result, at, state)
+    result.update(
+        (key, _decode_part(raw, hints[key], (*at, key), state))
         for key, raw in data.items()
         if key in hints
-    }
+    )
+    return result
 
 
 # Under ``from __future__ import annotations`` a class body's ``NotRequired``
@@ -913,6 +984,7 @@ def _decode_object(
     name = target.__name__ if isinstance(target, type) else str(target)
     if not isinstance(data, Mapping):
         raise ReadError(f"expected object for {name}, got {data!r}")
+    stored = "py/object" in data
     if _names_dataclass(data, target, state):
         fields_only: dict[str, PlainTree] = {
             key: raw for key, raw in data.items() if key != "py/object"
@@ -947,13 +1019,15 @@ def _decode_object(
         key: _decode_part(raw, types[key], (*at, key), state)
         for key, raw in data.items()
     }
-    # A part that did not read leaves ``__init__`` unrunnable, so every member is
-    # set directly; otherwise ``__init__`` takes its fields and the rest of the
-    # state, such as a non-init slot, is set after it.
-    init = {item.name for item in fields(target) if item.init}
-    if len(state.bad) > before:
-        value, rest = _allocate(target), members
+    # A ``py/object`` record is state ``to_plain`` took from a built object, so it
+    # is restored as is: running ``__init__`` again would rerun a ``__post_init__``
+    # that already transformed it. An untagged record is constructor input, so it
+    # goes through ``__init__``, which validates it. A part that did not read
+    # leaves ``__init__`` unrunnable either way.
+    if stored or len(state.bad) > before:
+        value, rest = _allocate(target), _with_defaults(fields(target), members, name)
     else:
+        init = {item.name for item in fields(target) if item.init}
         try:
             value = target(**{k: v for k, v in members.items() if k in init})
         except (TypeError, ValueError) as error:
@@ -963,6 +1037,28 @@ def _decode_object(
         object.__setattr__(value, key, member)
     _replace(index, value, at, state)
     return value
+
+
+def _with_defaults(
+    declared: tuple[Field[object], ...],
+    members: dict[str, object],
+    name: str,
+) -> dict[str, object]:
+    """Return ``members`` with each absent defaulted field filled from its default."""
+    filled = dict(members)
+    missing: list[str] = []
+    for item in declared:
+        if item.name in filled:
+            continue
+        if item.default is not MISSING:
+            filled[item.name] = item.default
+        elif item.default_factory is not MISSING:
+            filled[item.name] = item.default_factory()
+        elif item.init:
+            missing.append(item.name)
+    if missing:
+        raise ReadError(f"cannot build {name}: missing field(s) {missing}")
+    return filled
 
 
 # It does when the tag names ``target``, or when imports are off: the tag's class cannot
@@ -1040,6 +1136,10 @@ def _decode_reduce(
         raise ReadError(f"py/reduce call failed: {error}") from error
     if stateful:
         _replace(index, value, at, state)
+    elif is_mutable(value):
+        # ``to_plain`` names a mutable stateless value by path only; it wrote no
+        # ``py/id`` for one, so no encounter number is reserved for it.
+        state.placed[at] = value
     if len(data) > 2 and data[2] is not None:
         _apply_state(value, _decode(data[2], object, (*at, 2), state))
     if len(data) > 3 and data[3] is not None:
