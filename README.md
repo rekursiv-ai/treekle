@@ -135,7 +135,7 @@ path to its `Invalid`.
 
 ### Wire-invariant
 
-The core never parses or prints text. `treekle.wire.json_loads` is the one
+The core never parses or prints text. `treekle.json_loads` is the one
 reader: `json_loads(text, T)` parses and reads as `T` in one call.
 
 ## Why not another serializer

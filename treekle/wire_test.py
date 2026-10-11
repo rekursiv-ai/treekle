@@ -10,8 +10,8 @@ import math
 
 import pytest
 
+from treekle import json_loads
 from treekle.types import Hooks, ReadError
-from treekle.wire import json_loads
 
 
 class TestJsonLoads:
