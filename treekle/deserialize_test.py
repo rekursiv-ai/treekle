@@ -51,10 +51,6 @@ def _round_trip(value: object) -> object:
     return from_plain(to_plain(value), object, allow_imports=True)
 
 
-def _decoding() -> deserialize._Decoding:
-    return deserialize._Decoding(hooks={}, allow_imports=False)
-
-
 class Color(Enum):
     RED = "red"
     BLUE = "blue"
@@ -685,7 +681,12 @@ class TestDecodeEdges:
     def test_a_non_class_target_is_named_in_the_error(self) -> None:
         # Through ``from_plain`` the union decoder raises its own message first.
         with pytest.raises(ReadError, match=r"^expected object for .*Shape \| int"):
-            deserialize._decode_object([1], Shape | int, (), _decoding())
+            deserialize._decode_object(
+                [1],
+                Shape | int,
+                (),
+                deserialize._Decoding(hooks={}, allow_imports=False),
+            )
 
     def test_a_tagged_member_decodes_by_its_tag(self) -> None:
         tree = {"py/object": f"{__name__}.Bare", "x": {"py/tuple": [1]}}
@@ -696,7 +697,7 @@ class TestDecodeEdges:
         assert restored.x == (1,)
 
     def test_a_dataclass_is_numbered_for_later_references(self) -> None:
-        state = _decoding()
+        state = deserialize._Decoding(hooks={}, allow_imports=False)
 
         value = deserialize._decode_object({"x": 1}, Point, (), state)
 
