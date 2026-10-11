@@ -146,13 +146,13 @@ plain text.
 
 | | C/Rust | text | class from data | callables | shared refs | best-effort |
 |---|:---:|:---:|:---:|:---:|:---:|:---:|
-| msgspec | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ |
-| pydantic | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ |
-| cattrs | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ |
-| mashumaro | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ |
-| pickle | ✅ | ❌ | ✅ | ✅ | ✅ | ❌ |
-| jsonpickle | ❌ | ✅ | ✅ | ✅ | ✅ | ❌ |
-| treekle | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| [msgspec](https://github.com/jcrist/msgspec) | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ |
+| [pydantic](https://github.com/pydantic/pydantic) | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ |
+| [cattrs](https://github.com/python-attrs/cattrs) | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ |
+| [mashumaro](https://github.com/Fatal1ty/mashumaro) | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ |
+| [pickle](https://docs.python.org/3/library/pickle.html) | ✅ | ❌ | ✅ | ✅ | ✅ | ❌ |
+| [jsonpickle](https://github.com/jsonpickle/jsonpickle) | ❌ | ✅ | ✅ | ✅ | ✅ | ❌ |
+| [treekle](https://github.com/rekursiv-ai/treekle) | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ |
 
 - **C/Rust:** the core is a compiled extension, not pure Python.
 - **text:** encodes to human-readable text (JSON), not opaque bytes.
@@ -170,13 +170,13 @@ plain text.
 
 | | text | class from data | callables | shared refs | best-effort |
 |---|---|---|---|---|---|
-| msgspec | JSON | `dict` | raises | split | first error |
-| pydantic | JSON | `dict` | raises | split | all, no value |
-| cattrs | JSON | raises | raises | split | all, no value |
-| mashumaro | JSON | raises | raises | split | first error |
-| pickle | binary | the class | same function | kept | first error |
-| jsonpickle | JSON | the class | same function | kept | no error, `dict` |
-| treekle | JSON | the class | same function | kept | partial value, all |
+| [msgspec](https://github.com/jcrist/msgspec) | JSON | `dict` | raises | split | first error |
+| [pydantic](https://github.com/pydantic/pydantic) | JSON | `dict` | raises | split | all, no value |
+| [cattrs](https://github.com/python-attrs/cattrs) | JSON | raises | raises | split | all, no value |
+| [mashumaro](https://github.com/Fatal1ty/mashumaro) | JSON | raises | raises | split | first error |
+| [pickle](https://docs.python.org/3/library/pickle.html) | binary | the class | same function | kept | first error |
+| [jsonpickle](https://github.com/jsonpickle/jsonpickle) | JSON | the class | same function | kept | no error, `dict` |
+| [treekle](https://github.com/rekursiv-ai/treekle) | JSON | the class | same function | kept | partial value, all |
 
 - **text:** what one dataclass encodes to.
 - **class from data:** an `object` field given a payload naming another class.
