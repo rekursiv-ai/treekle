@@ -24,6 +24,7 @@ import threading
 
 import pytest
 
+from treekle import serialize
 from treekle.deserialize import from_plain
 from treekle.serialize import to_plain
 
@@ -460,6 +461,73 @@ class TestEncodeEdges:
 
         with pytest.raises(TypeError, match="does not resolve"):
             to_plain(orphan)
+
+
+class TestImportPath:
+    def test_a_local_function_names_why_it_cannot_round_trip(self) -> None:
+        def local() -> None:
+            pass
+
+        with pytest.raises(TypeError) as raised:
+            serialize._import_path(local)
+
+        assert str(raised.value) == (
+            f"Cannot serialize {local!r}: it has no importable path "
+            "(module-level __qualname__). Local/lambda callables and local "
+            "classes/subclasses cannot be deserialized."
+        )
+
+    @pytest.mark.parametrize(
+        "names",
+        [
+            {},
+            {"__module__": "no_such_module_xyz", "__qualname__": 1},
+            {"__module__": 1, "__qualname__": "x"},
+        ],
+        ids=repr,
+    )
+    def test_a_non_text_module_or_qualname_is_rejected(
+        self,
+        names: dict[str, object],
+    ) -> None:
+        callee = Callee()
+        for name, value in names.items():
+            object.__setattr__(callee, name, value)
+
+        with pytest.raises(TypeError, match="no importable path"):
+            serialize._import_path(callee)
+
+    def test_a_path_is_the_module_and_qualname(self) -> None:
+        assert serialize._import_path(Point) == f"{__name__}.Point"
+        assert serialize._import_path(Node.__init__) == f"{__name__}.Node.__init__"
+
+    def test_a_path_is_cached_for_the_same_object(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        cache: dict[int, tuple[object, str]] = {}
+        monkeypatch.setattr(serialize, "_IMPORT_PATHS", cache)
+
+        path = serialize._import_path(Point)
+
+        assert cache == {id(Point): (Point, path)}
+        cache[id(Point)] = (Point, "cached.Path")
+        assert serialize._import_path(Point) == "cached.Path"
+
+    def test_a_reused_id_holding_another_object_is_recomputed(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(serialize, "_IMPORT_PATHS", {id(Point): (Node, "stale")})
+
+        assert serialize._import_path(Point) == f"{__name__}.Point"
+
+
+class Callee:
+    """A callable instance: it has no ``__qualname__`` of its own."""
+
+    def __call__(self) -> None:
+        pass
 
 
 if __name__ == "__main__":

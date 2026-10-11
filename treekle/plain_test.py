@@ -5,12 +5,9 @@ from __future__ import annotations
 from types import MappingProxyType
 from typing import TYPE_CHECKING, cast
 
-import json
-import math
-
 import pytest
 
-from treekle.plain import immutable, loads, mutable
+from treekle.plain import immutable, mutable
 
 
 if TYPE_CHECKING:
@@ -45,22 +42,6 @@ class TestImmutableMutable:
     def test_leaves_pass_through(self, leaf: Plain) -> None:
         assert immutable(leaf) is leaf
         assert mutable(leaf) is leaf
-
-
-class TestLoads:
-    def test_text_reads_as_a_mutable_tree(self) -> None:
-        assert loads('{"a": [1, 2.5, null]}') == {"a": [1, 2.5, None]}
-        assert loads(b"[true]") == [True]
-
-    def test_non_finite_floats_read(self) -> None:
-        loaded = loads("[NaN, Infinity]")
-        assert isinstance(loaded, list)
-        assert math.isnan(cast("float", loaded[0]))
-        assert loaded[1] == math.inf
-
-    def test_bad_text_raises_json_decode_error(self) -> None:
-        with pytest.raises(json.JSONDecodeError):
-            loads("{")
 
 
 class TestFreezeChecks:

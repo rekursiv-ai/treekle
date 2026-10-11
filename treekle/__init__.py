@@ -10,7 +10,8 @@ Modules:
 
 - ``types``: every public type -- the plain trees, ``Hooks``, ``FieldPath``,
   ``Dialect``, ``Invalid``, ``ReadError``.
-- ``plain``: ``loads``, ``mutable``, ``immutable``.
+- ``plain``: ``mutable``, ``immutable``.
+- ``wire``: ``json_loads``, the one wire-format reader; not re-exported.
 - ``serialize``: ``to_plain``.
 - ``deserialize``: ``from_plain``.
 - ``parse``: ``parse``, for what a person typed.
@@ -85,7 +86,7 @@ from __future__ import annotations
 
 from treekle.deserialize import from_plain
 from treekle.parse import parse
-from treekle.plain import immutable, loads, mutable
+from treekle.plain import immutable, mutable
 from treekle.serialize import to_plain
 from treekle.types import (
     Dialect,
@@ -110,7 +111,6 @@ __all__ = [
     "ReadError",
     "from_plain",
     "immutable",
-    "loads",
     "mutable",
     "parse",
     "to_plain",

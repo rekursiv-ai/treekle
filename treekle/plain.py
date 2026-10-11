@@ -18,8 +18,6 @@ from collections.abc import (
 from types import MappingProxyType
 from typing import TYPE_CHECKING, cast, overload
 
-import json
-
 
 if TYPE_CHECKING:
     from treekle.types import MutablePlainTree, Plain, PlainTree
@@ -27,25 +25,8 @@ if TYPE_CHECKING:
 
 __all__ = [
     "immutable",
-    "loads",
     "mutable",
 ]
-
-
-def loads(text: str | bytes) -> MutablePlainTree:
-    """Parse JSON text into a mutable plain tree; ``NaN``/``Infinity`` read too.
-
-    Args:
-      text: JSON document.
-
-    Returns:
-      tree: Plain dicts, lists, and scalars.
-
-    Raises:
-      json.JSONDecodeError: ``text`` is not valid JSON.
-
-    """
-    return cast("MutablePlainTree", json.loads(text))
 
 
 @overload

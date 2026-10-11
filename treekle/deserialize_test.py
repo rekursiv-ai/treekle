@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+from collections.abc import Sequence
 from dataclasses import dataclass, field, make_dataclass
 from decimal import Decimal
 from enum import Enum
@@ -511,6 +512,47 @@ class TestDecodeEdges:
 
     def test_a_variadic_tuple_reads_any_length(self) -> None:
         assert from_plain([1, 2, 3], tuple[int, ...]) == (1, 2, 3)
+
+    def test_a_variadic_tuple_reads_each_item_as_its_element_type(self) -> None:
+        with pytest.raises(ReadError) as raised:
+            from_plain([1, "x"], tuple[int, ...])
+
+        assert list(raised.value.bad) == [(1,)]
+
+    def test_a_sequence_target_reads_each_item_as_its_element_type(self) -> None:
+        with pytest.raises(ReadError) as raised:
+            from_plain({"py/tuple": [1, "x"]}, Sequence[int])
+
+        assert list(raised.value.bad) == [(1,)]
+
+    def test_a_fixed_tuple_of_the_wrong_length_names_both_lengths(self) -> None:
+        with pytest.raises(ReadError) as raised:
+            from_plain([1, 2, 3], tuple[int, int])
+
+        assert raised.value.bad[()].reason == (
+            "expected 2 items for tuple[int, int], got 3"
+        )
+
+    def test_a_non_sequence_tuple_names_the_data(self) -> None:
+        with pytest.raises(ReadError) as raised:
+            from_plain("ab", tuple[str, ...])
+
+        assert raised.value.bad[()].reason == ("cannot read 'ab' as tuple[str, ...]")
+
+    def test_a_whole_failure_reports_the_input_as_its_one_bad_part(self) -> None:
+        with pytest.raises(ReadError) as raised:
+            from_plain("x", int)
+
+        whole = Invalid(raw="x", reason="cannot read 'x' as int")
+        assert str(raised.value) == "cannot read 'x' as int"
+        assert raised.value.partial == whole
+        assert raised.value.bad == {(): whole}
+
+    def test_a_whole_failure_keeps_the_bad_parts_found_before_it(self) -> None:
+        with pytest.raises(ReadError) as raised:
+            from_plain({"a": "x", "b": [1]}, dict[str, int] | list[int] | Point)
+
+        assert list(raised.value.bad) == [()]
 
     def test_a_literal_enum_member_reads(self) -> None:
         assert from_plain(2, Literal[Level.HIGH]) is Level.HIGH

@@ -11,4 +11,4 @@ All notable treekle changes are documented here. This project follows
   with classes, functions, shared references, and cycles; `py/ref`
   back-references by path; best-effort decoding with `ReadError.partial` and
   `ReadError.bad`.
-- `parse`, `loads`, `immutable`, and `mutable` helpers.
+- `parse`, `immutable`, and `mutable` helpers; `wire.json_loads`.
