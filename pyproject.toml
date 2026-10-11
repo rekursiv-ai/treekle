@@ -4,7 +4,7 @@
 [project]
 name = "treekle"
 version = "0.1.0"
-description = "Pickle semantics as plain text: lossless Python values to and from JSON-ready trees, with best-effort decoding."
+description = "Pickle semantics as plain python trees."
 readme = "README.md"
 requires-python = ">=3.12"
 license = "Apache-2.0"

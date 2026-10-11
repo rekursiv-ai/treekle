@@ -6,8 +6,8 @@
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Discord](https://img.shields.io/discord/1530237005311639592?logo=discord&logoColor=white&label=Discord&color=5865F2)](https://discord.gg/2GZFPPvCqn)
 
-Pickle semantics as plain text: any Python object graph to a tree of dicts,
-lists, and scalars, and back.
+**tree** + pic**kle**: pickle's semantics, written as a plain tree of dicts,
+lists, and scalars instead of opaque bytes.
 
 ## Quick Start
 

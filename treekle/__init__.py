@@ -1,4 +1,4 @@
-"""Treekle: pickle semantics as plain text.
+"""Treekle: pickle semantics as plain python trees.
 
 ``to_plain`` turns any Python object graph -- dataclasses, functions, shared
 references, cycles -- into a plain tree of dicts, lists, and scalars that any
