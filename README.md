@@ -33,49 +33,158 @@ text, so the wire format is yours.
 ## Example
 
 ```python
-from dataclasses import dataclass, field
+from __future__ import annotations
+
+from collections.abc import Callable
+from dataclasses import dataclass
+from pathlib import Path
+from types import MappingProxyType
 
 import json
 import math
 
-from treekle import ReadError, from_plain, to_plain
+from treekle import ABSENT, ReadError, from_plain, to_plain
 
 
-def mse(a: float, b: float) -> float:
-    return (a - b) ** 2
-
-
-@dataclass
-class Layer:
-    width: int
+def by_name(user: User) -> str:
+    return user.name
 
 
 @dataclass
-class Model:
-    encoder: Layer
-    decoder: Layer
-    shape: tuple[int, int] = (2, 3)
-    clip: float = math.inf
-    loss: object = mse
-    tags: set[str] = field(default_factory=lambda: {"base"})
+class User:
+    name: str
 
 
-layer = Layer(width=64)
-text = json.dumps(to_plain(Model(encoder=layer, decoder=layer)))
-# {"py/object": "__main__.Model",
-#  "clip": {"py/float": "inf"},
-#  "decoder": {"py/object": "__main__.Layer", "width": 64},
-#  "encoder": {"py/ref": ["decoder"]},
-#  "loss": {"py/function": "__main__.mse"},
-#  "shape": {"py/tuple": [2, 3]},
-#  "tags": {"py/set": ["base"]}}
+@dataclass
+class Job:
+    owner: User
+    reviewer: User
+    fallback: object
+    sort_key: Callable[[User], str]
+    output: type
+    root: Path
+    timeout: float
+    env: MappingProxyType[str, str]
 
-model = from_plain(json.loads(text), Model, allow_imports=True)
-assert model.encoder is model.decoder  # one object, not two copies
-assert model.shape == (2, 3)  # a tuple, not a list
-assert model.clip == math.inf  # JSON has no inf
-assert model.loss is mse  # the function itself
+
+ada = User("ada")
+job = Job(
+    owner=ada,
+    reviewer=ada,  # the same object
+    fallback=ABSENT,  # a singleton
+    sort_key=by_name,  # a function
+    output=dict,  # a class
+    root=Path("/srv"),
+    timeout=math.inf,  # JSON has no inf
+    env=MappingProxyType({"LANG": "C"}),
+)
+
+back = from_plain(json.loads(json.dumps(to_plain(job))), Job, allow_imports=True)
+assert back.owner is back.reviewer
+assert back.fallback is ABSENT
+assert back.sort_key is by_name
+assert back.output is dict
+assert back.root == Path("/srv")
+assert back.timeout == math.inf
+assert isinstance(back.env, MappingProxyType)
 ```
+
+Every other library fails on the same `job`:
+
+- jsonpickle
+
+  ```
+  AttributeError: 'Absent' object attribute '_instance' is read-only
+  ```
+
+- pickle
+
+  ```
+  TypeError: cannot pickle 'mappingproxy' object
+  ```
+
+- msgspec
+
+  ```
+  TypeError: Encoding objects of type Absent is unsupported
+  ```
+
+- pydantic
+
+  ```
+  PydanticSchemaGenerationError: Unable to generate pydantic-core schema for mappingproxy[str, str]. Set `arbitrary_types_allowed=True` in the model_config to ignore this error or implement `__get_pydantic_core_schema__` on your type to fully support it.
+  ```
+
+- cattrs
+
+  ```
+  TypeError: Object of type Absent is not JSON serializable
+  ```
+
+- mashumaro
+
+  ```
+  UnserializableField: Field "fallback" of type object in Job is not serializable
+  ```
+
+Additionally, `treekle` reads bad inputs all the way through:
+
+```python
+@dataclass
+class Team:
+    a: User
+    b: User
+    c: User
+
+
+bad = '{"a": {"name": "ada"}, "b": {"name": 7}, "c": {"name": 8}}'
+try:
+    from_plain(json.loads(bad), Team)
+except ReadError as error:
+    error.partial
+    # Team(a=User(name='ada'),
+    #      b=User(name=Invalid(raw=7, reason='cannot read 7 as str')),
+    #      c=User(name=Invalid(raw=8, reason='cannot read 8 as str')))
+```
+
+Every other library on the same `bad`:
+
+- jsonpickle
+
+  ```
+  {'a': {'name': 'ada'}, 'b': {'name': 7}, 'c': {'name': 8}}
+  ```
+
+- msgspec
+
+  ```
+  ValidationError: Expected `str`, got `int` - at `$.b.name`
+  ```
+
+- pydantic
+
+  ```
+  ValidationError: 2 validation errors for Team
+  b.name
+    Input should be a valid string [type=string_type, input_value=7, input_type=int]
+  c.name
+    Input should be a valid string [type=string_type, input_value=8, input_type=int]
+  ```
+
+- cattrs
+
+  ```
+  Team(a=User(name='ada'), b=User(name='7'), c=User(name='8'))
+  ```
+
+- mashumaro
+
+  ```
+  Team(a=User(name='ada'), b=User(name='7'), c=User(name='8'))
+  ```
+
+Captured with jsonpickle 4.1.3, msgspec 0.22.0, pydantic 2.13.5, cattrs
+26.2.1, and mashumaro 3.23.
 
 A lambda has no import path, so it is refused when written, not when read:
 
@@ -83,16 +192,6 @@ A lambda has no import path, so it is refused when written, not when read:
 to_plain(lambda x: x)
 # TypeError: Cannot serialize <function <lambda> ...>: import path
 # '__main__.<lambda>' does not resolve to the same object.
-```
-
-Bad input reads as far as it can:
-
-```python
-try:
-    from_plain({"width": "wide"}, Layer)
-except ReadError as error:
-    error.partial  # Layer(width=Invalid(raw='wide', reason="cannot read 'wide' as int"))
-    error.bad  # {('width',): Invalid(raw='wide', reason="cannot read 'wide' as int")}
 ```
 
 ## Features

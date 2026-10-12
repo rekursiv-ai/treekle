@@ -8,6 +8,7 @@ partial value and the location of every bad part.
 
 Modules:
 
+- ``absent``: ``ABSENT``, ``Absent``.
 - ``types``: every public type -- the plain trees, ``Hooks``, ``FieldPath``,
   ``Dialect``, ``Invalid``, ``ReadError``.
 - ``plain``: ``mutable``, ``immutable``.
@@ -84,6 +85,7 @@ decoded as its declared type.
 
 from __future__ import annotations
 
+from treekle.absent import ABSENT, Absent
 from treekle.deserialize import from_plain
 from treekle.parse import parse
 from treekle.plain import immutable, mutable
@@ -102,6 +104,8 @@ from treekle.wire import json_loads
 
 
 __all__ = [
+    "ABSENT",
+    "Absent",
     "Dialect",
     "FieldPath",
     "Hooks",
