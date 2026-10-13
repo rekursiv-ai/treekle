@@ -36,20 +36,36 @@ Why not another serializer:
 
 tl;dr: No library is perfect, including this one.
 
-library     C/Rust  text  class from data  callables  shared refs  best-effort
-----------  ------  ----  ---------------  ---------  -----------  -----------
-treekle     ✗       ✓     ✓                ✓          ✓            ✓
-pickle      ✓       ✗     ✓                ✓          ✓            ✗
-jsonpickle  ✗       ✓     ✓                ✓          ✓            ✗
-pydantic    ✓       ✓     ✗                ✗          ✗            ✗
-msgspec     ✓       ✓     ✗                ✗          ✗            ✗
-cattrs      ✗       ✓     ✗                ✗          ✗            ✗
-mashumaro   ✗       ✓     ✗                ✗          ✗            ✗
+                 treekle  pickle  jsonpickle  pydantic  msgspec  cattrs  mashumaro
+---------------  -------  ------  ----------  --------  -------  ------  ---------
+C/Rust           ✗        ✓       ✗           ✓         ✓        ✗       ✗
+stdlib           ✓        ✓       ✓           ✗         ✗        ✗       ✗
+plain            ✓        ✗       ✓           ✓         ✓        ✓       ✓
+typed result     ✓        ✗       ✗           ✓         ✓        ✓       ✓
+typed contents   ✓        ✗       ✗           ✓         ✓        ✓       ✓
+untagged input   ✓        ✗       ✗           ✓         ✓        ✓       ✓
+class from data  ✓        ✗       ✗           ✗         ✗        ✗       ✗
+callables        ✓        ✓       ✓           ✗         ✗        ✗       ✗
+shared refs      ✓        ✓       ✓           ✗         ✗        ✗       ✗
+best-effort      ✓        ✗       ✗           ✗         ✗        ✗       ✗
+GitHub stars     --       stdlib  1.3k        29.0k     4.2k     1.1k    940
+
+✓ = yes, ✗ = no. Star counts checked 2026-10-11.
 
 - C/Rust: the core is a compiled extension, not pure Python.
-- text: encodes to human-readable text (JSON), not opaque bytes.
-- class from data: decode builds a class the payload names by import path,
-  beyond the declared type and its subclasses.
+- stdlib: part of, or pure Python importing only, the standard library.
+- plain: encodes to plain dicts, lists, and scalars, so any writer stores it:
+  JSON, YAML, TOML.
+- typed result: a type checker infers ``T`` from ``decode(data, T)``, not
+  ``Any``.
+- typed contents: every nested field and element is checked against its
+  annotation, e.g. ``list[Layer]``. An ``isinstance`` check on jsonpickle's
+  result would fix typed result, not this.
+- untagged input: data with no ``py/*`` tags reads as the declared type, so
+  hand-written config works.
+- class from data: decode builds the class the payload names by import path
+  (a subclass, a Protocol implementation, or any class) and rejects one that
+  does not fit the field's annotation.
 - callables: a function round-trips by import path, with no special field type.
 - shared refs: an object referenced twice decodes as one object; cycles too.
 - best-effort: bad input yields the partial value and every bad part's location.
@@ -58,23 +74,22 @@ In our case being pure python is a bad thing; native implementations are
 faster and our preference would be to use msgspec. However we need pickle
 semantics but as raw text.
 
-Each mark is what a probe of jsonpickle 4.1, pydantic 2.13, msgspec 0.22,
+Each cell is what a probe of jsonpickle 4.1, pydantic 2.13, msgspec 0.22,
 cattrs 26.2, and mashumaro 3.23 returned:
 
-library     text    class from data  callables      shared refs  best-effort
-----------  ------  ---------------  -------------  -----------  -----------------
-treekle     JSON    the class        same function  kept         partial value, all
-pickle      binary  the class        same function  kept         first error
-jsonpickle  JSON    the class        same function  kept         no error, ``dict``
-pydantic    JSON    ``dict``         raises         split        all, no value
-msgspec     JSON    ``dict``         raises         split        first error
-cattrs      JSON    raises           raises         split        all, no value
-mashumaro   JSON    raises           raises         split        first error
+library     object       callables      shared refs  best-effort
+----------  -----------  -------------  -----------  --------------------------
+treekle     named class  same function  one object   partial value, all errors
+pickle      named class  same function  one object   first error
+jsonpickle  named class  same function  one object   no error, returns ``dict``
+pydantic    ``dict``     raises         two copies   all errors, no value
+msgspec     ``dict``     raises         two copies   first error
+cattrs      raises       raises         two copies   all errors, no value
+mashumaro   raises       raises         two copies   first error
 
-- text: what one dataclass encodes to.
-- class from data: an ``object`` field given a payload naming another class.
+- object: class from data, an ``object`` field given a payload naming a class.
 - callables: a field holding a module-level function.
-- shared refs: one object in two fields; "split" decodes two separate copies.
+- shared refs: one object in two fields.
 - best-effort: two bad fields.
 
 Fast libraries decode only classes known ahead of time: a class named in the
