@@ -624,6 +624,19 @@ class TestToPlain:
         assert tree == expected
         assert serialize._ENCODER_CACHE[kind] is serialize._encoder_for(kind)
 
+    def test_object_attributes_sort_by_name_but_can_keep_declaration_order(
+        self,
+    ) -> None:
+        node = Node(name="root")
+
+        sorted_tree = to_plain(node)
+        declared_tree = to_plain(node, sort=False)
+
+        assert isinstance(sorted_tree, dict)
+        assert isinstance(declared_tree, dict)
+        assert list(sorted_tree) == ["py/object", "children", "name"]
+        assert list(declared_tree) == ["py/object", "name", "children"]
+
     def test_a_cached_encoder_is_reused(self) -> None:
         serialize._ENCODER_CACHE[Bare] = _fake_encoder
 

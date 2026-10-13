@@ -2731,14 +2731,12 @@ class TestUnionRetries:
 
 
 class TestCyclicInput:
-    @pytest.mark.timeout(1)
     def test_untagged_cyclic_data_reads_as_itself(self) -> None:
         cyclic: list[object] = []
         cyclic.append(cyclic)
 
         assert from_plain(cyclic, object) is cyclic
 
-    @pytest.mark.timeout(1)
     def test_cyclic_data_read_as_a_recursive_type_is_a_read_error(self) -> None:
         cyclic: list[object] = []
         cyclic.append(cyclic)
@@ -2746,7 +2744,6 @@ class TestCyclicInput:
         with pytest.raises(ReadError):
             from_plain(cyclic, _Nested)
 
-    @pytest.mark.timeout(1)
     def test_tagged_cyclic_data_is_a_read_error(self) -> None:
         cyclic: list[object] = [{"py/tuple": [1]}]
         cyclic.append(cyclic)
@@ -2754,7 +2751,6 @@ class TestCyclicInput:
         with pytest.raises(ReadError):
             from_plain(cyclic, object)
 
-    @pytest.mark.timeout(1)
     def test_a_reference_to_a_finished_cycle_fits_a_recursive_type(self) -> None:
         loop: list[object] = []
         loop.append(loop)

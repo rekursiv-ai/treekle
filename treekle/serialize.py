@@ -72,6 +72,7 @@ def to_plain(
     dialect: Dialect = ...,
     mutable: Literal[True] = ...,
     hooks: Hooks = ...,
+    sort: bool = ...,
 ) -> MutablePlainTree: ...
 
 
@@ -82,6 +83,7 @@ def to_plain(
     dialect: Dialect = ...,
     mutable: bool,
     hooks: Hooks = ...,
+    sort: bool = ...,
 ) -> PlainTree: ...
 
 
@@ -91,6 +93,7 @@ def to_plain(
     dialect: Dialect = "json",
     mutable: bool = True,
     hooks: Hooks = MappingProxyType({}),
+    sort: bool = True,
 ) -> PlainTree:
     """Convert a Python value to plain data, tagging what ``dialect`` lacks.
 
@@ -101,6 +104,9 @@ def to_plain(
       mutable: Build dicts and lists when true; ``MappingProxyType`` and tuples
         when false.
       hooks: Codecs for leaf types with no built-in conversion, such as tensors.
+      sort: Order each object's attributes by name; when false, keep slots in
+        MRO order then ``__dict__`` keys in insertion order. A stored form that
+        must stay byte-stable sets this false.
 
     Returns:
       tree: Fresh plain data that ``from_plain`` turns back into ``obj``.
@@ -114,7 +120,7 @@ def to_plain(
         raise ValueError(f"unknown dialect {dialect!r}; expected 'json' or 'python'")
     tree = cast(
         "MutablePlainTree",
-        _encode(obj, _Encoding(dialect=dialect, hooks=hooks)),
+        _encode(obj, _Encoding(dialect=dialect, hooks=hooks, sort=sort)),
     )
     return tree if mutable else immutable(tree)
 
@@ -140,6 +146,7 @@ class _Encoding:
     Attributes:
       dialect: The target format.
       hooks: Codecs for leaf types with no built-in conversion.
+      sort: Order each object's attributes by name, or keep declaration order.
       here: Where the value being encoded sits.
       node: The node the value being encoded is written into.
       key: Where in ``node`` it is written.
@@ -151,6 +158,7 @@ class _Encoding:
 
     dialect: Dialect
     hooks: Hooks
+    sort: bool = True
     here: _Here = None
     node: _Node = field(default_factory=list[object])
     key: str | int = 0
@@ -489,7 +497,7 @@ def _encode_object(value: object, state: _Encoding) -> object:
     """Encode a dataclass or slotted object as ``py/object`` with its state."""
     _register(value, state)
     node: dict[str, object] = {"py/object": _import_path(type(value))}
-    for name in attribute_names(value):
+    for name in attribute_names(value, sort=state.sort):
         member: object = getattr(value, name, PENDING)
         if member is not PENDING:
             node[name] = member

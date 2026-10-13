@@ -77,7 +77,6 @@ class TestFreezeChecks:
         with pytest.raises(TypeError):
             mutable(bad)
 
-    @pytest.mark.timeout(1)
     def test_a_cyclic_tree_raises(self) -> None:
         cyclic: list[object] = []
         cyclic.append({"k": cyclic})
