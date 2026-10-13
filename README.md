@@ -91,28 +91,28 @@ assert isinstance(back.env, MappingProxyType)
 
 Every other library fails on the same `job`:
 
-- jsonpickle
-
-  ```
-  AttributeError: 'Absent' object attribute '_instance' is read-only
-  ```
-
 - pickle
 
   ```
   TypeError: cannot pickle 'mappingproxy' object
   ```
 
-- msgspec
+- jsonpickle
 
   ```
-  TypeError: Encoding objects of type Absent is unsupported
+  AttributeError: 'Absent' object attribute '_instance' is read-only
   ```
 
 - pydantic
 
   ```
   PydanticSchemaGenerationError: Unable to generate pydantic-core schema for mappingproxy[str, str]. Set `arbitrary_types_allowed=True` in the model_config to ignore this error or implement `__get_pydantic_core_schema__` on your type to fully support it.
+  ```
+
+- msgspec
+
+  ```
+  TypeError: Encoding objects of type Absent is unsupported
   ```
 
 - cattrs
@@ -155,12 +155,6 @@ Every other library on the same `bad`:
   {'a': {'name': 'ada'}, 'b': {'name': 7}, 'c': {'name': 8}}
   ```
 
-- msgspec
-
-  ```
-  ValidationError: Expected `str`, got `int` - at `$.b.name`
-  ```
-
 - pydantic
 
   ```
@@ -169,6 +163,12 @@ Every other library on the same `bad`:
     Input should be a valid string [type=string_type, input_value=7, input_type=int]
   c.name
     Input should be a valid string [type=string_type, input_value=8, input_type=int]
+  ```
+
+- msgspec
+
+  ```
+  ValidationError: Expected `str`, got `int` - at `$.b.name`
   ```
 
 - cattrs
@@ -183,7 +183,7 @@ Every other library on the same `bad`:
   Team(a=User(name='ada'), b=User(name='7'), c=User(name='8'))
   ```
 
-Captured with jsonpickle 4.1.3, msgspec 0.22.0, pydantic 2.13.5, cattrs
+Captured with jsonpickle 4.1.3, pydantic 2.13.5, msgspec 0.22.0, cattrs
 26.2.1, and mashumaro 3.23.
 
 A lambda has no import path, so it is refused when written, not when read:
@@ -271,10 +271,11 @@ safety. `jsonpickle` is arguably the most similar to `treekle` (and was our
 default choice until making treekle).
 
 
-| | [treekle](https://github.com/rekursiv-ai/treekle) | [jsonpickle](https://github.com/jsonpickle/jsonpickle) | [pickle](https://docs.python.org/3/library/pickle.html) | [mashumaro](https://github.com/Fatal1ty/mashumaro) | [cattrs](https://github.com/python-attrs/cattrs) | [pydantic](https://github.com/pydantic/pydantic) | [msgspec](https://github.com/jcrist/msgspec) |
+| | [treekle](https://github.com/rekursiv-ai/treekle) | [pickle](https://docs.python.org/3/library/pickle.html) | [jsonpickle](https://github.com/jsonpickle/jsonpickle) | [pydantic](https://github.com/pydantic/pydantic) | [msgspec](https://github.com/jcrist/msgspec) | [cattrs](https://github.com/python-attrs/cattrs) | [mashumaro](https://github.com/Fatal1ty/mashumaro) |
 |---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| C/Rust | ❌ | ❌ | ✅ | ❌ | ❌ | ✅ | ✅ |
-| plain | ✅ | ✅ | ❌ | ✅ | ✅ | ✅ | ✅ |
+| C/Rust | ❌ | ✅ | ❌ | ✅ | ✅ | ❌ | ❌ |
+| stdlib | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ |
+| plain | ✅ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | typed result | ✅ | ❌ | ❌ | ✅ | ✅ | ✅ | ✅ |
 | typed contents | ✅ | ❌ | ❌ | ✅ | ✅ | ✅ | ✅ |
 | untagged input | ✅ | ❌ | ❌ | ✅ | ✅ | ✅ | ✅ |
@@ -282,12 +283,13 @@ default choice until making treekle).
 | callables | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ |
 | shared refs | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ |
 | best-effort | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| GitHub stars | -- | 1.3k | stdlib | 940 | 1.1k | 29.0k | 4.2k |
+| GitHub stars | -- | stdlib | 1.3k | 29.0k | 4.2k | 1.1k | 940 |
 
 ✅ = yes, ❌ = no. Star counts checked 2026-10-11. Corrections welcome --
 [open a PR](https://github.com/rekursiv-ai/treekle/pulls).
 
 - **C/Rust:** the core is a compiled extension, not pure Python.
+- **stdlib:** part of, or pure Python importing only, the standard library.
 - **plain:** encodes to plain dicts, lists, and scalars, so any writer stores
   it: JSON, YAML, TOML.
 - **typed result:** a type checker infers `T` from `decode(data, T)`, not
@@ -307,22 +309,22 @@ default choice until making treekle).
 - **best-effort:** bad input yields the partial value and every bad part's
   location.
 
-**Details:** each cell is what a probe of msgspec 0.22, pydantic 2.13, cattrs
-26.2, mashumaro 3.23, and jsonpickle 4.1 returned:
+**Details:** each cell is what a probe of jsonpickle 4.1, pydantic 2.13,
+msgspec 0.22, cattrs 26.2, and mashumaro 3.23 returned:
 
-| | treekle | jsonpickle | pickle | mashumaro | cattrs | pydantic | msgspec |
+| | treekle | pickle | jsonpickle | pydantic | msgspec | cattrs | mashumaro |
 |---|---|---|---|---|---|---|---|
-| plain | `to_plain` | `Pickler().flatten` | bytes only | `encode` | `unstructure` | `dump_python` | `to_builtins` |
-| typed result | `Layer` | `dict \| list \| ...` | `Any` | `Layer` | `Layer` | `Layer` | `Layer` |
-| typed contents | raises at `layers[0].width` | `dict` holding `'x'` | no target type | raises at `layers` | raises at `layers[0].width` | raises at `layers[0].width` | raises at `layers[0].width` |
-| untagged input | `Net` | `dict` | raises: bytes only | `Net` | `Net` | `Net` | `Net` |
+| plain | `to_plain` | bytes only | `Pickler().flatten` | `dump_python` | `to_builtins` | `unstructure` | `encode` |
+| typed result | `Layer` | `Any` | `dict \| list \| ...` | `Layer` | `Layer` | `Layer` | `Layer` |
+| typed contents | raises at `layers[0].width` | no target type | `dict` holding `'x'` | raises at `layers[0].width` | raises at `layers[0].width` | raises at `layers[0].width` | raises at `layers` |
+| untagged input | `Net` | raises: bytes only | `dict` | `Net` | `Net` | `Net` | `Net` |
 | class from data: subclass | subclass | subclass | subclass | base class, subclass fields dropped | base class, subclass fields dropped | base class, subclass fields dropped | base class, subclass fields dropped |
 | class from data: Protocol | implementing class | implementing class | implementing class | raises: no Protocol schema | raises: no Protocol schema | raises: no Protocol schema | raises: no Protocol schema |
-| class from data: `object` | named class | named class | named class | raises | raises | `dict` | `dict` |
+| class from data: `object` | named class | named class | named class | `dict` | `dict` | raises | raises |
 | class from data: misfit | raises | misfit accepted | misfit accepted | raises | raises | raises | raises |
 | callables | same function | same function | same function | raises | raises | raises | raises |
 | shared refs | one object | one object | one object | two copies | two copies | two copies | two copies |
-| best-effort | partial value, all errors | no error, returns `dict` | first error | first error | all errors, no value | all errors, no value | first error |
+| best-effort | partial value, all errors | first error | no error, returns `dict` | all errors, no value | first error | all errors, no value | first error |
 
 - **plain:** the call that encodes to plain data.
 - **typed result:** what basedpyright infers for decoding a dataclass `Layer`.
@@ -332,7 +334,7 @@ default choice until making treekle).
 - **untagged input:** a valid `Net` payload with no `py/*` tags.
 - **class from data:** a payload naming a class, read into a base-class field,
   a Protocol field, and an `object` field. cattrs keeps the subclass with
-  `include_subclasses`; msgspec and pydantic need a closed tagged union.
+  `include_subclasses`; pydantic and msgspec need a closed tagged union.
   "misfit": a payload naming a class that is neither a subclass of the
   base-class field nor an implementation of the Protocol field.
 - **callables:** a field holding a module-level function.

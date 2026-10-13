@@ -38,13 +38,13 @@ tl;dr: No library is perfect, including this one.
 
 library     C/Rust  text  class from data  callables  shared refs  best-effort
 ----------  ------  ----  ---------------  ---------  -----------  -----------
-msgspec     ✓       ✓     ✗                ✗          ✗            ✗
-pydantic    ✓       ✓     ✗                ✗          ✗            ✗
-cattrs      ✗       ✓     ✗                ✗          ✗            ✗
-mashumaro   ✗       ✓     ✗                ✗          ✗            ✗
+treekle     ✗       ✓     ✓                ✓          ✓            ✓
 pickle      ✓       ✗     ✓                ✓          ✓            ✗
 jsonpickle  ✗       ✓     ✓                ✓          ✓            ✗
-treekle     ✗       ✓     ✓                ✓          ✓            ✓
+pydantic    ✓       ✓     ✗                ✗          ✗            ✗
+msgspec     ✓       ✓     ✗                ✗          ✗            ✗
+cattrs      ✗       ✓     ✗                ✗          ✗            ✗
+mashumaro   ✗       ✓     ✗                ✗          ✗            ✗
 
 - C/Rust: the core is a compiled extension, not pure Python.
 - text: encodes to human-readable text (JSON), not opaque bytes.
@@ -58,18 +58,18 @@ In our case being pure python is a bad thing; native implementations are
 faster and our preference would be to use msgspec. However we need pickle
 semantics but as raw text.
 
-Each mark is what a probe of msgspec 0.22, pydantic 2.13, cattrs 26.2,
-mashumaro 3.23, and jsonpickle 4.1 returned:
+Each mark is what a probe of jsonpickle 4.1, pydantic 2.13, msgspec 0.22,
+cattrs 26.2, and mashumaro 3.23 returned:
 
 library     text    class from data  callables      shared refs  best-effort
 ----------  ------  ---------------  -------------  -----------  -----------------
-msgspec     JSON    ``dict``         raises         split        first error
-pydantic    JSON    ``dict``         raises         split        all, no value
-cattrs      JSON    raises           raises         split        all, no value
-mashumaro   JSON    raises           raises         split        first error
+treekle     JSON    the class        same function  kept         partial value, all
 pickle      binary  the class        same function  kept         first error
 jsonpickle  JSON    the class        same function  kept         no error, ``dict``
-treekle     JSON    the class        same function  kept         partial value, all
+pydantic    JSON    ``dict``         raises         split        all, no value
+msgspec     JSON    ``dict``         raises         split        first error
+cattrs      JSON    raises           raises         split        all, no value
+mashumaro   JSON    raises           raises         split        first error
 
 - text: what one dataclass encodes to.
 - class from data: an ``object`` field given a payload naming another class.
