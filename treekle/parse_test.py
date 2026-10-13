@@ -118,6 +118,6 @@ class TestParse:
 
 
 if __name__ == "__main__":
-    from treekle.lib.testing.main import test_main
+    from treekle.lib.testing.runner import test_main
 
     test_main(__file__)

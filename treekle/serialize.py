@@ -15,7 +15,6 @@ from __future__ import annotations
 from collections.abc import (
     Callable,
     Iterable,
-    Iterator,
     Mapping,
     Sequence,
     Set as AbstractSet,
@@ -24,6 +23,7 @@ from dataclasses import dataclass, field, is_dataclass
 from datetime import datetime
 from enum import Enum
 from functools import partial
+from math import isfinite
 from pathlib import Path, PurePath
 from types import (
     BuiltinFunctionType,
@@ -43,20 +43,17 @@ from zoneinfo import ZoneInfo
 
 import base64
 import json
-import math
 import weakref
 
-from treekle.plain import mutable
+from treekle.plain import immutable
 from treekle.reflect import (
     PENDING,
-    SKIPPED_ATTRIBUTES,
+    attribute_names,
     is_mutable,
     resolve_import,
-    slot_names,
 )
 from treekle.types import (
     Dialect,
-    FieldPath,
     Hooks,
     MutablePlainTree,
     PlainTree,
@@ -115,13 +112,25 @@ def to_plain(
     """
     if dialect not in get_args(cast("object", Dialect.__value__)):
         raise ValueError(f"unknown dialect {dialect!r}; expected 'json' or 'python'")
-    state = _Encoding(
-        dialect=dialect,
-        hooks=hooks,
-        make_list=_thawed_list if mutable else _frozen_list,
-        make_dict=_thawed_dict if mutable else _frozen_dict,
+    tree = cast(
+        "MutablePlainTree",
+        _encode(obj, _Encoding(dialect=dialect, hooks=hooks)),
     )
-    return _encode(obj, state)
+    return tree if mutable else immutable(tree)
+
+
+# A place links to its parent's rather than holding the whole path, so placing a
+# node costs one tuple however deep it sits; a ``py/ref`` spells it out.
+type _Here = tuple[_Here, str | int] | None
+"""Where a node sits: its parent's place and its own key; ``None`` is the root."""
+
+
+type _Node = list[object] | dict[str, object]
+"""A container node: raw parts at first, each replaced in place by its plain form."""
+
+
+type _Entry = tuple[object, _Node, str | int | _RawKey, _Here]
+"""A part still to encode: the value, its node and key, and the node's place."""
 
 
 @dataclass(slots=True, kw_only=True)
@@ -131,69 +140,158 @@ class _Encoding:
     Attributes:
       dialect: The target format.
       hooks: Codecs for leaf types with no built-in conversion.
-      make_list: Builds a sequence node: ``list`` or ``tuple``.
-      make_dict: Builds a mapping node: ``dict`` or ``MappingProxyType``.
-      at: Where the node being encoded sits.
-      seen: The path of each registered object's first occurrence, by ``id``.
+      here: Where the value being encoded sits.
+      node: The node the value being encoded is written into.
+      key: Where in ``node`` it is written.
+      seen: Where each registered object first sits, by ``id``.
       alive: Every registered object, so its ``id`` is not reused mid-walk.
+      stack: Every part still to encode, the next one last.
 
     """
 
     dialect: Dialect
     hooks: Hooks
-    make_list: Callable[[list[PlainTree]], PlainTree]
-    make_dict: Callable[[dict[str, PlainTree]], PlainTree]
-    at: list[str | int] = field(default_factory=list[str | int])
-    seen: dict[int, FieldPath] = field(default_factory=dict[int, FieldPath])
+    here: _Here = None
+    node: _Node = field(default_factory=list[object])
+    key: str | int = 0
+    seen: dict[int, _Here] = field(default_factory=dict[int, "_Here"])
     alive: list[object] = field(default_factory=list[object])
+    stack: list[_Entry] = field(default_factory=list["_Entry"])
 
 
-type _Encoder = Callable[[object, _Encoding], PlainTree]
-"""Encode one value into whichever kind of tree ``state`` builds."""
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _RawKey:
+    """A dict key that is not written as itself, escaped when its entry is reached."""
+
+    key: object
 
 
-def _thawed_list(items: list[PlainTree]) -> PlainTree:
-    """Return a sequence node as the list it was built in."""
-    return items
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _Checkpoint:
+    """Where a reduce restarts by protocol when one of its parts fails.
+
+    Attributes:
+      value: The value being reduced.
+      mark: ``len(alive)`` before the reduce registered anything.
+      node: The node the reduce is written into.
+      key: Where in ``node`` it is written.
+      here: Where the reduced value sits.
+
+    """
+
+    value: object
+    mark: int
+    node: _Node
+    key: str | int
+    here: _Here
 
 
-def _frozen_list(items: list[PlainTree]) -> PlainTree:
-    """Return a sequence node as a tuple."""
-    return tuple(items)
+type _Encoder = Callable[[object, _Encoding], object]
+"""Encode one value; a container pushes the parts it has yet to encode."""
 
 
-def _thawed_dict(items: dict[str, PlainTree]) -> PlainTree:
-    """Return a mapping node as the dict it was built in."""
-    return items
+# Parts wait on ``state.stack`` rather than the call stack, so a tree of any
+# depth encodes; recursion stopped near a thousand levels. Each container is
+# built at once with its leaves in place, and each other part is written into
+# it when popped, in the order a depth-first walk reaches it.
+def _encode(value: object, state: _Encoding) -> object:
+    """Encode ``value`` and everything it holds."""
+    outer = state.stack, state.here, state.node, state.key
+    root: list[object] = [None]
+    stack: list[_Entry] = []
+    state.stack, state.node, state.key = stack, root, 0
+    try:
+        root[0] = _encode_node(value, state)
+        while stack:
+            item, node, key, parent = stack.pop()
+            if isinstance(item, _Checkpoint):
+                continue
+            try:
+                if isinstance(key, _RawKey):
+                    key = _encode_key(key.key, state)
+                state.here, state.node, state.key = (parent, key), node, key
+                done = _encode_node(item, state)
+            except TypeError as error:
+                node, key, done = _recover(error, state)
+            if isinstance(node, list):
+                assert isinstance(key, int)
+                node[key] = done
+            else:
+                assert isinstance(key, str)
+                node[key] = done
+        return root[0]
+    finally:
+        state.stack, state.here, state.node, state.key = outer
 
 
-def _frozen_dict(items: dict[str, PlainTree]) -> PlainTree:
-    """Return a mapping node as a ``MappingProxyType``."""
-    return MappingProxyType(items)
-
-
-def _encode(value: object, state: _Encoding) -> PlainTree:
-    """Encode one node: plain passthrough, ``py/ref`` repeat, else its encoder."""
+def _encode_node(value: object, state: _Encoding) -> object:
+    """Encode a leaf or a ``py/ref`` repeat, else run the value's encoder."""
     kind = type(value)
-    if value is None or (isinstance(value, (str, int)) and kind in _NATIVE_LEAVES):
+    if value is None or kind in _NATIVE_LEAVES:
         return value
     if kind is float:
         return _encode_float(value, state)
-    seen = state.seen.get(id(value))
-    if seen is not None:
-        return state.make_dict({"py/ref": state.make_list(list(seen))})
+    if id(value) in state.seen:
+        return _reference(state.seen[id(value)])
     if kind in state.hooks:
         return _encode_hooked(value, state)
     return _encoder_for(kind)(value, state)
 
 
-def _encode_at(value: object, key: str | int, state: _Encoding) -> PlainTree:
-    """Encode a container's part, which sits at ``key`` below the current node."""
-    state.at.append(key)
-    try:
-        return _encode(value, state)
-    finally:
-        state.at.pop()
+def _recover(
+    error: TypeError,
+    state: _Encoding,
+) -> tuple[_Node, str | int, object]:
+    """Drop parts down to the innermost reduce and encode it by protocol instead."""
+    stack = state.stack
+    while stack:
+        checkpoint = stack.pop()[0]
+        if not isinstance(checkpoint, _Checkpoint):
+            continue
+        _rollback(state, checkpoint.mark)
+        state.here = checkpoint.here
+        state.node, state.key = checkpoint.node, checkpoint.key
+        try:
+            done = _encode_unreduced(checkpoint.value, state)
+        except TypeError as again:
+            error = again
+            continue
+        return checkpoint.node, checkpoint.key, done
+    raise error
+
+
+def _push_items(node: list[object], state: _Encoding) -> None:
+    """Queue each part of ``node`` that is not yet plain, the first last."""
+    stack, here, python = state.stack, state.here, state.dialect == "python"
+    for index in range(len(node) - 1, -1, -1):
+        item = node[index]
+        if item is None or type(item) in _NATIVE_LEAVES:
+            continue
+        if type(item) is float and (python or isfinite(item)):
+            continue
+        stack.append((item, node, index, here))
+
+
+def _push_values(node: dict[str, object], state: _Encoding) -> None:
+    """Queue each value of ``node`` that is not yet plain, the first last."""
+    stack, here, python = state.stack, state.here, state.dialect == "python"
+    for key in reversed(node):
+        item = node[key]
+        if item is None or type(item) in _NATIVE_LEAVES:
+            continue
+        if type(item) is float and (python or isfinite(item)):
+            continue
+        stack.append((item, node, key, here))
+
+
+def _reference(place: _Here) -> object:
+    """Return a ``py/ref`` naming ``place`` as the path of keys leading to it."""
+    keys: list[str | int] = []
+    while place is not None:
+        place, key = place
+        keys.append(key)
+    keys.reverse()
+    return {"py/ref": keys}
 
 
 def _encoder_for(kind: type) -> _Encoder:
@@ -224,7 +322,7 @@ def _encoder_for(kind: type) -> _Encoder:
 # back-reference reached below finds the parent already placed.
 def _register(value: object, state: _Encoding) -> None:
     """Record where ``value`` first sits, before its children are encoded."""
-    state.seen[id(value)] = tuple(state.at)
+    state.seen[id(value)] = state.here
     state.alive.append(value)
 
 
@@ -235,79 +333,80 @@ def _rollback(state: _Encoding, mark: int) -> None:
     del state.alive[mark:]
 
 
-def _encode_float(value: object, state: _Encoding) -> PlainTree:
+def _encode_float(value: object, state: _Encoding) -> object:
     """Encode a float, as ``py/float`` when non-finite and the dialect must."""
     number = cast("float", value)
-    if math.isfinite(number) or state.dialect == "python":
+    if isfinite(number) or state.dialect == "python":
         return number
-    return state.make_dict({"py/float": repr(number)})
+    return {"py/float": repr(number)}
 
 
-def _encode_complex(value: object, state: _Encoding) -> PlainTree:
+def _encode_complex(value: object, state: _Encoding) -> object:
     """Encode a complex as ``py/complex`` of its real and imaginary floats."""
     number = cast("complex", value)
     parts = [_encode_float(number.real, state), _encode_float(number.imag, state)]
-    return state.make_dict({"py/complex": state.make_list(parts)})
+    return {"py/complex": parts}
 
 
-def _encode_bytes(value: object, state: _Encoding) -> PlainTree:
+def _encode_bytes(value: object, state: _Encoding) -> object:
     """Encode bytes as ``py/b64``."""
-    text = base64.b64encode(cast("bytes", value)).decode()
-    return state.make_dict({"py/b64": text})
+    del state
+    return {"py/b64": base64.b64encode(cast("bytes", value)).decode()}
 
 
-def _encode_path(value: object, state: _Encoding) -> PlainTree:
+def _encode_path(value: object, state: _Encoding) -> object:
     """Encode a path as ``py/path``."""
-    return state.make_dict({"py/path": str(value)})
+    del state
+    return {"py/path": str(value)}
 
 
-def _encode_uuid(value: object, state: _Encoding) -> PlainTree:
+def _encode_uuid(value: object, state: _Encoding) -> object:
     """Encode a UUID as ``py/uuid``."""
-    return state.make_dict({"py/uuid": str(value)})
+    del state
+    return {"py/uuid": str(value)}
 
 
-def _encode_datetime(value: object, state: _Encoding) -> PlainTree:
+def _encode_datetime(value: object, state: _Encoding) -> object:
     """Encode a datetime as ``py/datetime``, keeping a named zone."""
+    del state
     moment = cast("datetime", value)
     text = moment.isoformat()
     if isinstance(moment.tzinfo, ZoneInfo):
         text = f"{text}[{moment.tzinfo.key}]"
-    return state.make_dict({"py/datetime": text})
+    return {"py/datetime": text}
 
 
-def _encode_list(value: object, state: _Encoding) -> PlainTree:
+def _encode_list(value: object, state: _Encoding) -> object:
     """Encode a list, registering it for ``py/ref``."""
-    items = cast("Sequence[object]", value)
     _register(value, state)
-    return state.make_list(
-        [_encode_at(item, index, state) for index, item in enumerate(items)],
-    )
+    node = list(cast("Iterable[object]", value))
+    _push_items(node, state)
+    return node
 
 
-def _encode_tuple(value: object, state: _Encoding) -> PlainTree:
+def _encode_tuple(value: object, state: _Encoding) -> object:
     """Encode a tuple as ``py/tuple``; a tuple is a value, never referenced."""
-    items = [
-        _encode_at(item, index, state)
-        for index, item in enumerate(cast("tuple[object, ...]", value))
-    ]
-    return state.make_dict({"py/tuple": state.make_list(items)})
+    node = list(cast("tuple[object, ...]", value))
+    _push_items(node, state)
+    return {"py/tuple": node}
 
 
-def _encode_set(value: object, state: _Encoding) -> PlainTree:
+def _encode_set(value: object, state: _Encoding) -> object:
     """Encode a set as ``py/set`` with members in a deterministic order."""
-    members = cast("AbstractSet[object]", value)
     _register(value, state)
-    ordered = sorted(members, key=lambda member: _set_order_key(member, state))
-    items = [_encode_at(member, index, state) for index, member in enumerate(ordered)]
-    return state.make_dict({"py/set": state.make_list(items)})
+    return {"py/set": _ordered(cast("AbstractSet[object]", value), state)}
 
 
-def _encode_frozenset(value: object, state: _Encoding) -> PlainTree:
+def _encode_frozenset(value: object, state: _Encoding) -> object:
     """Encode a frozenset as ``py/frozenset``; a frozenset is never referenced."""
-    members = cast("AbstractSet[object]", value)
-    ordered = sorted(members, key=lambda member: _set_order_key(member, state))
-    items = [_encode_at(member, index, state) for index, member in enumerate(ordered)]
-    return state.make_dict({"py/frozenset": state.make_list(items)})
+    return {"py/frozenset": _ordered(cast("AbstractSet[object]", value), state)}
+
+
+def _ordered(members: AbstractSet[object], state: _Encoding) -> object:
+    """Return a set's members as a node in a deterministic order, queued."""
+    node = sorted(members, key=lambda member: _set_order_key(member, state))
+    _push_items(node, state)
+    return node
 
 
 def _set_order_key(value: object, state: _Encoding) -> tuple[str, str]:
@@ -317,112 +416,130 @@ def _set_order_key(value: object, state: _Encoding) -> tuple[str, str]:
         encoded = _encode(value, state)
     finally:
         _rollback(state, mark)
-    text = json.dumps(mutable(encoded), sort_keys=True)
-    return repr(value), text
+    return repr(value), json.dumps(encoded, sort_keys=True)
 
 
-def _encode_dict(value: object, state: _Encoding) -> PlainTree:
+def _encode_dict(value: object, state: _Encoding) -> object:
     """Encode a dict, escaping keys through ``_encode_key``."""
     mapping = cast("Mapping[object, object]", value)
     _register(value, state)
-    encoded: dict[str, PlainTree] = {}
-    for key, member in mapping.items():
-        name = _encode_key(key, state)
-        encoded[name] = _encode_at(member, name, state)
-    return state.make_dict(encoded)
+    if all(map(_is_plain_key, mapping)):
+        node = {cast("str", key): item for key, item in mapping.items()}
+        _push_values(node, state)
+        return node
+    # An escaped key is encoded when its entry is reached, after every earlier
+    # value, so a key naming an object written earlier becomes a ``py/ref``.
+    # Every entry waits its turn, plain ones too, to keep the keys in order.
+    escaped: dict[str, object] = {}
+    here = state.here
+    for key, item in reversed(list(mapping.items())):
+        name = cast("str", key) if _is_plain_key(key) else _RawKey(key=key)
+        state.stack.append((item, escaped, name, here))
+    return escaped
 
 
-def _encode_mappingproxy(value: object, state: _Encoding) -> PlainTree:
+def _encode_mappingproxy(value: object, state: _Encoding) -> object:
     """Encode a ``MappingProxyType`` as ``py/mappingproxy`` around its dict."""
     _register(value, state)
+    node: dict[str, object] = {"py/mappingproxy": None}
     copied = dict(cast("Mapping[object, object]", value))
-    state.at.append("py/mappingproxy")
-    try:
-        inner = _encode_dict(copied, state)
-    finally:
-        state.at.pop()
-    return state.make_dict({"py/mappingproxy": inner})
+    state.stack.append((copied, node, "py/mappingproxy", state.here))
+    return node
+
+
+def _is_plain_key(key: object) -> bool:
+    """Return whether a dict key is written as itself, needing no escape."""
+    return type(key) is str and not key.startswith(("py/", "json://"))
 
 
 def _encode_key(key: object, state: _Encoding) -> str:
     """Return a dict key, ``json://``-escaping non-strings and tag lookalikes."""
-    if isinstance(key, str) and not key.startswith(("py/", "json://")):
-        return key
+    if _is_plain_key(key):
+        return cast("str", key)
     # A key is text, so nothing inside it has a path a later ``py/ref`` can name.
     mark = len(state.alive)
     try:
         encoded = _encode(key, state)
     finally:
         _rollback(state, mark)
-    return "json://" + json.dumps(mutable(encoded))
+    return "json://" + json.dumps(encoded)
 
 
-def _encode_type(value: object, state: _Encoding) -> PlainTree:
+def _encode_type(value: object, state: _Encoding) -> object:
     """Encode a class as ``py/type``."""
-    return state.make_dict({"py/type": _import_path(cast("type", value))})
+    del state
+    return {"py/type": _import_path(cast("type", value))}
 
 
-def _encode_function(value: object, state: _Encoding) -> PlainTree:
+def _encode_function(value: object, state: _Encoding) -> object:
     """Encode a module-level function as ``py/function``."""
     if not (isinstance(getattr(value, "__self__", None), (ModuleType, type(None)))):
         return _encode_reduce(value, state)
-    path = _import_path(cast("Callable[..., object]", value))
-    return state.make_dict({"py/function": path})
+    try:
+        return {"py/function": _import_path(cast("Callable[..., object]", value))}
+    except TypeError:
+        # A static builtin method (``torch.relu``) has no importable path of its
+        # own; its reduce recipe, ``getattr(owner, name)``, names one that imports.
+        if type(value) is not BuiltinFunctionType:
+            raise
+        return _encode_reduce(value, state)
 
 
-def _encode_object(value: object, state: _Encoding) -> PlainTree:
+def _encode_object(value: object, state: _Encoding) -> object:
     """Encode a dataclass or slotted object as ``py/object`` with its state."""
     _register(value, state)
-    payload: dict[str, PlainTree] = {"py/object": _import_path(type(value))}
-    for name in _attribute_names(value):
+    node: dict[str, object] = {"py/object": _import_path(type(value))}
+    for name in attribute_names(value):
         member: object = getattr(value, name, PENDING)
         if member is not PENDING:
-            payload[name] = _encode_at(member, name, state)
-    return state.make_dict(payload)
+            node[name] = member
+    _push_values(node, state)
+    return node
 
 
-def _encode_hooked(value: object, state: _Encoding) -> PlainTree:
+def _encode_hooked(value: object, state: _Encoding) -> object:
     """Encode a value through its caller-supplied hook as ``py/hook``."""
     encode_hook = state.hooks[type(value)][0]
     _register(value, state)
     # The payload is arbitrary caller data, so it takes the same walk as any
     # other value: it may hold non-finite floats or tag-like keys.
     path = _import_path(type(value))
-    payload = _encode_at(encode_hook(value), 1, state)
-    return state.make_dict({"py/hook": state.make_list([path, payload])})
+    node: list[object] = [path, encode_hook(value)]
+    _push_items(node, state)
+    return {"py/hook": node}
 
 
-def _encode_reduce(value: object, state: _Encoding) -> PlainTree:
+def _encode_reduce(value: object, state: _Encoding) -> object:
     """Encode a value by its pickle reduce recipe as ``py/reduce``."""
     recipe = _canonical_reduce(value)
     if recipe is None:
         return _encode_unreduced(value, state)
     # A bare-name reduce names a module global, written as an import path.
     if isinstance(recipe, str):
-        path = _verified_path(f"{type(value).__module__}.{recipe}", value)
-        return state.make_dict({"py/type": path})
-    func, args, *rest = recipe
+        return {"py/type": _verified_path(f"{type(value).__module__}.{recipe}", value)}
     mark = len(state.alive)
-    try:
-        # A hashable value with no state beyond its arguments (an enum member, a
-        # Decimal) is a value: each occurrence is written in full, so the output
-        # does not depend on sharing.
-        if is_mutable(value) or any(part is not None for part in rest):
-            _register(value, state)
-        elements = [
-            _encode_at(part, index, state)
-            for index, part in enumerate((func, args, *rest))
-        ]
-    except TypeError:
-        _rollback(state, mark)
-        return _encode_unreduced(value, state)
-    # ``elements[1]`` is the encoded argument tuple, never ``None``, so this stops.
-    while elements[-1] is None:
-        elements.pop()
-    return state.make_dict({"py/reduce": state.make_list(elements)})
+    # A hashable value with no state beyond its arguments (an enum member, a
+    # Decimal) is a value: each occurrence is written in full, so the output
+    # does not depend on sharing.
+    if is_mutable(value) or any(part is not None for part in recipe[2:]):
+        _register(value, state)
+    parts: list[object] = list(recipe)
+    # ``parts[1]`` is the argument tuple, never ``None``, so this stops.
+    while parts[-1] is None:
+        parts.pop()
+    checkpoint = _Checkpoint(
+        value=value,
+        mark=mark,
+        node=state.node,
+        key=state.key,
+        here=state.here,
+    )
+    state.stack.append((checkpoint, state.node, state.key, None))
+    _push_items(parts, state)
+    return {"py/reduce": parts}
 
 
-def _encode_unreduced(value: object, state: _Encoding) -> PlainTree:
+def _encode_unreduced(value: object, state: _Encoding) -> object:
     """Encode a value with no usable reduce recipe by the protocols it has."""
     kind = type(value)
     name = kind.__name__
@@ -514,16 +631,6 @@ def _verified_path(path: str, value: object) -> str:
     if resolved is not value:
         raise TypeError(message)
     return path
-
-
-def _attribute_names(value: object) -> Iterator[str]:
-    """Yield state attributes: slots, then sorted ``__dict__`` keys."""
-    slots = slot_names(type(value))
-    yield from slots
-    if hasattr(value, "__dict__"):
-        for key in sorted(vars(value)):
-            if key not in slots and key not in SKIPPED_ATTRIBUTES:
-                yield key
 
 
 _NATIVE_LEAVES: Final = frozenset((str, int, bool))

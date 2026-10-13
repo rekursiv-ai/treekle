@@ -16,7 +16,12 @@ import weakref
 import pytest
 
 from treekle import reflect
-from treekle.reflect import is_mutable, resolve_import, slot_names
+from treekle.reflect import (
+    attribute_names,
+    is_mutable,
+    resolve_import,
+    slot_names,
+)
 
 
 class Shape(Protocol):
@@ -269,6 +274,72 @@ class TestSlotNames:
         assert slot_names(Slotted) == ("planted",)
 
 
+class Mixed:
+    """Slots across two classes plus a ``__dict__``, declared out of name order."""
+
+    __slots__ = ("__dict__", "beta", "zeta")
+
+    def __init__(self) -> None:
+        self.zeta = 1
+        self.beta = 2
+        self.mid = 3
+        self.alpha = 4
+
+
+class MixedChild(Mixed):
+    __slots__ = ("gamma",)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.gamma = 5
+
+
+class TestAttributeNames:
+    def test_names_come_sorted_across_slots_bases_and_dict(self) -> None:
+        assert list(attribute_names(MixedChild())) == [
+            "alpha",
+            "beta",
+            "gamma",
+            "mid",
+            "zeta",
+        ]
+
+    def test_the_declaring_class_does_not_change_the_order(self) -> None:
+        moved = type("Moved", (), {"__slots__": ("beta", "gamma", "zeta", "__dict__")})
+        value = moved()
+        for name, item in (("beta", 2), ("gamma", 5), ("zeta", 1)):
+            setattr(value, name, item)
+        vars(value).update(mid=3, alpha=4)
+
+        assert list(attribute_names(value)) == list(attribute_names(MixedChild()))
+
+    def test_unsorted_keeps_slots_in_mro_order_then_dict_keys(self) -> None:
+        assert list(attribute_names(MixedChild(), sort=False)) == [
+            "gamma",
+            "beta",
+            "zeta",
+            "mid",
+            "alpha",
+        ]
+
+    def test_a_name_in_both_a_slot_and_the_dict_comes_once(self) -> None:
+        value = Slotted()
+        vars(value)["a"] = 9
+
+        assert list(attribute_names(value)) == ["a"]
+
+    def test_an_unset_slot_is_still_named(self) -> None:
+        assert list(attribute_names(WeakSlot())) == ["w"]
+
+    @pytest.mark.parametrize(
+        "value",
+        [1, "s", [1], object()],
+        ids=["int", "str", "list", "object"],
+    )
+    def test_a_value_without_attributes_names_none(self, value: object) -> None:
+        assert list(attribute_names(value)) == []
+
+
 @pytest.mark.parametrize(
     ("value", "expected"),
     [
@@ -291,6 +362,6 @@ def test_a_class_that_opts_out_of_hashing_is_mutable(
 
 
 if __name__ == "__main__":
-    from treekle.lib.testing.main import test_main
+    from treekle.lib.testing.runner import test_main
 
     test_main(__file__)

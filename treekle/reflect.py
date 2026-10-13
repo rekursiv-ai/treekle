@@ -16,6 +16,7 @@ if TYPE_CHECKING:
 __all__ = [
     "PENDING",
     "SKIPPED_ATTRIBUTES",
+    "attribute_names",
     "is_mutable",
     "resolve_import",
     "slot_names",
@@ -102,6 +103,38 @@ def slot_names(kind: type) -> tuple[str, ...]:
     return result
 
 
+# Sorted so moving a field between base classes leaves ``to_plain`` bytes unchanged.
+def attribute_names(value: object, *, sort: bool = True) -> tuple[str, ...]:
+    """Return the names of ``value``'s state: its slots and ``__dict__`` keys.
+
+    Args:
+      value: The object whose state to name.
+      sort: Order names alphabetically; when false, slots in MRO order then
+        ``__dict__`` keys in insertion order.
+
+    Returns:
+      names: Each name once; an unset slot is still named.
+
+    """
+    slots = slot_names(type(value))
+    if sort:
+        slots = _SORTED_SLOT_NAMES.get(type(value)) or _sorted_slots(type(value))
+    state = getattr(value, "__dict__", None)
+    if not state:
+        return slots
+    extra = [key for key in cast("dict[str, object]", state) if key not in slots]
+    if not extra:
+        return slots
+    return tuple(sorted((*slots, *extra))) if sort else (*slots, *extra)
+
+
+def _sorted_slots(kind: type) -> tuple[str, ...]:
+    """Return and cache ``kind``'s slot names in alphabetical order."""
+    result = tuple(sorted(slot_names(kind)))
+    _SORTED_SLOT_NAMES[kind] = result
+    return result
+
+
 def _walk(start: object, parts: Iterable[str]) -> object:
     """Return the attribute chain ``parts`` names from ``start``, else ``PENDING``."""
     resolved = start
@@ -113,5 +146,10 @@ def _walk(start: object, parts: Iterable[str]) -> object:
 
 
 _SLOT_NAMES: Final[weakref.WeakKeyDictionary[type, tuple[str, ...]]] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+_SORTED_SLOT_NAMES: Final[weakref.WeakKeyDictionary[type, tuple[str, ...]]] = (
     weakref.WeakKeyDictionary()
 )

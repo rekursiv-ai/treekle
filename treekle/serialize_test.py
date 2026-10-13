@@ -28,7 +28,9 @@ import pytest
 
 from treekle import serialize
 from treekle.deserialize import from_plain
+from treekle.lib.testing.resources import recursion_headroom
 from treekle.serialize import to_plain
+from treekle.types import ReadError
 
 
 if TYPE_CHECKING:
@@ -209,11 +211,11 @@ class Level(IntEnum):
     LOW = 1
 
 
-@dataclass(kw_only=True, slots=True)
+@dataclass(
+    slots=True,
+)  # house-ignore[dataclass] -- An Enum mixin is built positionally; frozen+slots breaks it before 3.14.
 class Coord:
-    # An Enum builds its mixin positionally from each member's value. Not
-    # frozen: before 3.14, frozen+slots breaks Enum member construction.
-    x: int = field(kw_only=False)
+    x: int
 
 
 class Compass(Coord, Enum):
@@ -288,6 +290,39 @@ class Lazy:
 
     name: str
     cache: int = field(init=False)
+
+
+@dataclass(frozen=True, kw_only=True, slots=True)
+class Zed:
+    """Sorts after ``Alpha`` by class path, before it by state."""
+
+    a: int
+
+    @override
+    def __repr__(self) -> str:
+        return ""
+
+
+@dataclass(frozen=True, kw_only=True, slots=True)
+class Alpha:
+    """Sorts before ``Zed`` by class path, after it by state."""
+
+    a: int
+
+    @override
+    def __repr__(self) -> str:
+        return ""
+
+
+@dataclass(eq=False, kw_only=True, slots=True)
+class Member:
+    """A set member that holds the set it is in."""
+
+    owner: set[object]
+
+
+class Celsius(float):
+    """A float subclass."""
 
 
 class Shadowed:
@@ -419,6 +454,46 @@ class TestToPlain:
         tree = to_plain(value) if dialect is None else to_plain(value, dialect=dialect)
 
         assert repr(tree) == repr(expected)
+
+    @pytest.mark.parametrize(
+        ("dialect", "expected"),
+        [
+            ("json", {"inf": {"py/float": "inf"}, "t": {"py/tuple": [1]}, "f": 1.5}),
+            ("python", {"inf": math.inf, "t": {"py/tuple": [1]}, "f": 1.5}),
+        ],
+    )
+    def test_each_dict_value_before_a_plain_float_is_encoded(
+        self,
+        dialect: Dialect,
+        expected: MutablePlainTree,
+    ) -> None:
+        tree = to_plain({"inf": math.inf, "t": (1,), "f": 1.5}, dialect=dialect)
+
+        assert tree == expected
+
+    @pytest.mark.parametrize(
+        ("dialect", "value"),
+        [("json", 1.5), ("python", math.inf)],
+    )
+    def test_a_dict_of_plain_values_encodes_no_value(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        dialect: Dialect,
+        value: float,
+    ) -> None:
+        encoded: list[object] = []
+        encode_node = serialize._encode_node
+
+        def counted(item: object, state: serialize._Encoding) -> object:
+            encoded.append(item)
+            return encode_node(item, state)
+
+        monkeypatch.setattr(serialize, "_encode_node", counted)
+        root = {"n": None, "i": 1, "s": "s", "f": value}
+
+        to_plain(root, dialect=dialect)
+
+        assert encoded == [root]
 
     @pytest.mark.parametrize("dialect", ["yaml", "JSON"])
     def test_an_unknown_dialect_is_rejected(self, dialect: str) -> None:
@@ -687,6 +762,34 @@ class TestToPlain:
     ) -> None:
         assert to_plain(value) == expected
 
+    def test_set_members_tie_on_their_encoding_with_sorted_keys(self) -> None:
+        tree = to_plain({Alpha(a=2), Zed(a=1)})
+
+        assert tree == {
+            "py/set": [
+                {"py/object": f"{__name__}.Zed", "a": 1},
+                {"py/object": f"{__name__}.Alpha", "a": 2},
+            ],
+        }
+
+    def test_a_cycle_through_a_set_member_is_a_reference(self) -> None:
+        owner: set[object] = set()
+        owner.add(Member(owner=owner))
+
+        assert to_plain(owner) == {
+            "py/set": [{"py/object": f"{__name__}.Member", "owner": {"py/ref": []}}],
+        }
+
+    def test_a_failed_reduce_is_referenced_where_it_sits(self) -> None:
+        shared = LocalReduce(1, 2)
+
+        tree = to_plain([[shared], shared])
+
+        assert tree == [
+            [{"py/object": f"{__name__}.LocalReduce", "a": 1, "b": 2}],
+            {"py/ref": [0, 0]},
+        ]
+
     def test_named_zone_is_kept(self) -> None:
         moment = dt.datetime(2026, 1, 2, 3, tzinfo=ZoneInfo("America/Chicago"))
 
@@ -923,6 +1026,25 @@ class TestEncodeEdges:
     ) -> None:
         assert to_plain(value) == expected
 
+    @pytest.mark.parametrize("dialect", ["json", "python"])
+    def test_a_nested_float_subclass_encodes_as_it_does_alone(
+        self,
+        dialect: Dialect,
+    ) -> None:
+        value = Celsius(1.5)
+
+        assert to_plain([value], dialect=dialect) == [to_plain(value, dialect=dialect)]
+        assert to_plain({"t": value}, dialect=dialect) == {
+            "t": to_plain(value, dialect=dialect),
+        }
+
+    def test_a_nested_float_subclass_takes_its_hook(self) -> None:
+        hooks: Hooks = {Celsius: (float, Celsius)}
+
+        assert to_plain([Celsius(1.5)], hooks=hooks) == [
+            {"py/hook": [f"{__name__}.Celsius", 1.5]},
+        ]
+
     def test_a_named_reduce_has_no_plain_form(self) -> None:
         value = NamedReduce()
 
@@ -955,6 +1077,17 @@ class TestEncodeEdges:
 
 
 class TestImportPath:
+    @pytest.mark.parametrize(
+        "method",
+        [str.maketrans, bytes.maketrans, bytearray.maketrans],
+        ids=["str", "bytes", "bytearray"],
+    )
+    def test_a_static_builtin_method_round_trips(
+        self,
+        method: Callable[..., object],
+    ) -> None:
+        assert _round_trip(method) == method
+
     def test_a_local_function_names_why_it_cannot_round_trip(self) -> None:
         def local() -> None:
             pass
@@ -1025,7 +1158,102 @@ class Callee:
         pass
 
 
+@dataclass(kw_only=True, slots=True)
+class Link:
+    next: Link | None = None
+
+
+type _Chain = list[_Chain] | int
+
+
+# Deeper than ``recursion_headroom`` allows, so recursing once per level raises.
+_DEPTH = 200
+_HEADROOM = 100
+
+
+def _deep(wrap: Callable[[object], object]) -> tuple[object, int]:
+    """Return ``0`` wrapped ``_DEPTH`` deep, and that depth."""
+    depth = _DEPTH
+    value: object = 0
+    for _ in range(depth):
+        value = wrap(value)
+    return value, depth
+
+
+def _list(inner: object) -> object:
+    return [inner]
+
+
+def _dict(inner: object) -> object:
+    return {"k": inner}
+
+
+def _tuple(inner: object) -> object:
+    return (inner,)
+
+
+def _link(inner: object) -> object:
+    return Link(next=cast("Link | None", inner or None))
+
+
+class TestDeepTrees:
+    @pytest.mark.parametrize(
+        "wrap",
+        [_list, _dict, _tuple],
+        ids=["list", "dict", "tuple"],
+    )
+    def test_a_tree_deeper_than_the_recursion_limit_round_trips(
+        self,
+        wrap: Callable[[object], object],
+    ) -> None:
+        value, _ = _deep(wrap)
+
+        with recursion_headroom(_HEADROOM):
+            restored = _round_trip(value)
+
+        assert restored == value
+
+    def test_a_deep_dataclass_chain_round_trips_typed(self) -> None:
+        value, depth = _deep(_link)
+
+        with recursion_headroom(_HEADROOM):
+            restored: Link | None = from_plain(to_plain(value), Link)
+
+        for _ in range(depth):
+            assert isinstance(restored, Link)
+            restored = restored.next
+        assert restored is None
+
+    def test_a_deep_union_reads(self) -> None:
+        value, _ = _deep(_list)
+
+        with recursion_headroom(_HEADROOM):
+            restored = from_plain(to_plain(value), _Chain)
+
+        assert restored == value
+
+    def test_a_deep_bad_leaf_is_a_read_error(self) -> None:
+        tree, depth = _deep(_list)
+        node = tree
+        for _ in range(depth - 1):
+            node = cast("list[object]", node)[0]
+        cast("list[object]", node)[0] = "bad"
+
+        with recursion_headroom(_HEADROOM), pytest.raises(ReadError) as raised:
+            from_plain(tree, _Chain)
+
+        assert len(raised.value.bad) == 1
+
+    def test_a_deep_shared_reference_round_trips(self) -> None:
+        value, _ = _deep(_list)
+
+        with recursion_headroom(_HEADROOM):
+            restored = cast("list[object]", _round_trip([value, value]))
+
+        assert restored[0] is restored[1]
+
+
 if __name__ == "__main__":
-    from treekle.lib.testing.main import test_main
+    from treekle.lib.testing.runner import test_main
 
     test_main(__file__)

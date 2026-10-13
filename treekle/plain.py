@@ -12,6 +12,8 @@ tuples, or to dicts and lists, whichever form it starts in. Both always copy.
 from __future__ import annotations
 
 from collections.abc import (
+    Callable,
+    Iterator,
     Mapping,
     Sequence,
 )
@@ -58,7 +60,7 @@ def immutable(tree: object) -> PlainTree:
       TypeError: ``tree`` holds a non-str key or a value that is not plain.
 
     """
-    return _freeze(tree)
+    return cast("PlainTree", _rebuild(tree, sequence=tuple, mapping=MappingProxyType))
 
 
 @overload
@@ -90,29 +92,61 @@ def mutable(tree: object) -> MutablePlainTree:
       TypeError: ``tree`` holds a non-str key or a value that is not plain.
 
     """
-    return _thaw(tree)
+    return cast("MutablePlainTree", _rebuild(tree, sequence=list, mapping=dict))
 
 
-def _freeze(tree: object) -> PlainTree:
-    """Copy ``tree`` to ``MappingProxyType`` and tuples at every level."""
+type _Frame = tuple[int, list[str] | None, list[object], Iterator[object]]
+"""A node being copied: its id, keys (``None`` for a sequence), copied items, the rest."""
+
+
+# A frame per open node rather than recursion, so a tree of any depth copies.
+def _rebuild(
+    tree: object,
+    *,
+    sequence: Callable[[list[object]], object],
+    mapping: Callable[[dict[str, object]], object],
+) -> object:
+    """Copy ``tree`` bottom-up, building each node through ``sequence``/``mapping``."""
     if tree is None or isinstance(tree, (str, int, float)):
         return tree
-    if isinstance(tree, Mapping):
-        node = cast("Mapping[object, object]", tree)
-        return MappingProxyType(
-            {_plain_key(key): _freeze(item) for key, item in node.items()},
+    stack = [_open(tree)]
+    open_ids = {stack[0][0]}
+    while True:
+        identity, keys, items, rest = stack[-1]
+        for item in rest:
+            if item is None or isinstance(item, (str, int, float)):
+                items.append(item)
+            elif id(item) in open_ids:
+                raise TypeError("plain data cannot hold a cycle")
+            else:
+                stack.append(_open(item))
+                open_ids.add(id(item))
+                break
+        else:
+            stack.pop()
+            open_ids.discard(identity)
+            node = (
+                sequence(items)
+                if keys is None
+                else mapping(dict(zip(keys, items, strict=True)))
+            )
+            if not stack:
+                return node
+            stack[-1][2].append(node)
+
+
+def _open(node: object) -> _Frame:
+    """Start copying ``node``, a plain mapping or sequence."""
+    identity = id(node)
+    if isinstance(node, Mapping):
+        entries = cast("Mapping[object, object]", node)
+        return (
+            identity,
+            [_plain_key(key) for key in entries],
+            [],
+            iter(entries.values()),
         )
-    return tuple(_freeze(item) for item in _plain_sequence(tree))
-
-
-def _thaw(tree: object) -> MutablePlainTree:
-    """Copy ``tree`` to dicts and lists at every level."""
-    if tree is None or isinstance(tree, (str, int, float)):
-        return tree
-    if isinstance(tree, Mapping):
-        node = cast("Mapping[object, object]", tree)
-        return {_plain_key(key): _thaw(item) for key, item in node.items()}
-    return [_thaw(item) for item in _plain_sequence(tree)]
+    return identity, None, [], iter(_plain_sequence(node))
 
 
 def _plain_key(key: object) -> str:

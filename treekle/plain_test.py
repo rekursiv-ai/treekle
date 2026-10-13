@@ -7,11 +7,12 @@ from typing import TYPE_CHECKING, cast
 
 import pytest
 
+from treekle.lib.testing.resources import recursion_headroom
 from treekle.plain import immutable, mutable
 
 
 if TYPE_CHECKING:
-    from treekle.types import Plain
+    from treekle.types import MutablePlainTree, Plain
 
 
 class TestImmutableMutable:
@@ -43,6 +44,19 @@ class TestImmutableMutable:
         assert immutable(leaf) is leaf
         assert mutable(leaf) is leaf
 
+    def test_a_tree_deeper_than_the_recursion_limit_copies(self) -> None:
+        depth = 200
+        tree: object = "leaf"
+        for index in range(depth):
+            tree = [tree] if index % 2 else {"k": tree}
+
+        with recursion_headroom(100):
+            node: MutablePlainTree = mutable(immutable(tree))
+        for _ in range(depth):
+            assert isinstance(node, (list, dict))
+            node = node[0] if isinstance(node, list) else node["k"]
+        assert node == "leaf"
+
 
 class TestFreezeChecks:
     def test_immutable_and_mutable_accept_any_plain_object(self) -> None:
@@ -63,8 +77,23 @@ class TestFreezeChecks:
         with pytest.raises(TypeError):
             mutable(bad)
 
+    @pytest.mark.timeout(1)
+    def test_a_cyclic_tree_raises(self) -> None:
+        cyclic: list[object] = []
+        cyclic.append({"k": cyclic})
+
+        with pytest.raises(TypeError, match="cycle"):
+            immutable(cyclic)
+        with pytest.raises(TypeError, match="cycle"):
+            mutable(cyclic)
+
+    def test_a_shared_subtree_copies_at_each_use(self) -> None:
+        shared = [1]
+
+        assert mutable({"a": shared, "b": [shared]}) == {"a": [1], "b": [[1]]}
+
 
 if __name__ == "__main__":
-    from treekle.lib.testing.main import test_main
+    from treekle.lib.testing.runner import test_main
 
     test_main(__file__)

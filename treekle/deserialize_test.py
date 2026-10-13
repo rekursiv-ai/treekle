@@ -8,9 +8,11 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, make_dataclass
 from decimal import Decimal
 from enum import Enum
+from fractions import Fraction
 from pathlib import Path, PurePosixPath
-from types import MappingProxyType, UnionType
+from types import MappingProxyType, ModuleType, UnionType
 from typing import (
+    TYPE_CHECKING,
     Annotated,
     Any,
     Final,
@@ -34,6 +36,8 @@ from zoneinfo import ZoneInfo
 import datetime as dt
 import gc
 import math
+import numbers
+import sys
 import weakref
 
 import pytest
@@ -50,6 +54,10 @@ from treekle.types import (
     PlainTree,
     ReadError,
 )
+
+
+if TYPE_CHECKING:
+    from numbers import Rational
 
 
 _T = TypeVar("_T")
@@ -93,6 +101,17 @@ class Node:
     children: list[Node] = field(default_factory=list["Node"])
 
 
+@dataclass(kw_only=True, slots=True)
+class HintedLater:
+    point: "Rational"  # Bound only under ``TYPE_CHECKING``.
+    count: int
+
+
+class HintedLaterDict(TypedDict):
+    point: Rational
+    count: int
+
+
 class Shape(Protocol):
     def area(self) -> float: ...
 
@@ -133,6 +152,7 @@ def _tensor_values(tensor: Tensor) -> list[float]:
 
 type Ints = list[int]
 type IntsAgain = Ints
+type _Nested = list[_Nested] | tuple[_Nested, ...] | int
 
 
 _HOOKS: Hooks = MappingProxyType({Tensor: (_tensor_values, Tensor)})
@@ -433,8 +453,47 @@ class TestTypedDecode:
     def test_a_union_tries_members_in_order(self) -> None:
         assert from_plain("/a", UUID | Path) == Path("/a")
 
+    def test_a_nested_union_reads_each_node_once_per_member(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        depth = 12
+        tree: MutablePlainTree = "bad"
+        for _ in range(depth):
+            tree = [tree]
+        calls: list[object] = []
+
+        def counted(
+            data: PlainTree,
+            target: object,
+            at: FieldPath,
+            state: deserialize._Decoding,
+        ) -> object:
+            calls.append(data)
+            return deserialize._decode_list(data, target, at, state)
+
+        monkeypatch.setattr(
+            deserialize,
+            "_DECODERS",
+            MappingProxyType({**deserialize._DECODERS, list: counted}),
+        )
+
+        with pytest.raises(ReadError):
+            from_plain(tree, _Nested)
+
+        assert len(calls) <= 2 * depth
+
+    def test_a_union_retries_a_member_whose_reference_reads_differently(self) -> None:
+        shared = Ints | int
+        target = tuple[tuple[int, ...], shared] | tuple[list[int], shared]
+
+        assert from_plain([[1], {"py/ref": [0]}], target) == ([1], [1])
+
     def test_a_float_accepts_an_int_and_a_tag(self) -> None:
-        assert from_plain(1, float) == 1.0
+        read = from_plain(1, float)
+
+        assert read == 1.0
+        assert type(read) is float
         assert from_plain({"py/float": "-inf"}, float) == -math.inf
 
     def test_a_pep695_alias_resolves(self) -> None:
@@ -660,6 +719,15 @@ class TestReferences:
 
         assert isinstance(first, set)
         assert next(iter(cast("set[object]", first))) is second
+
+    def test_a_stored_dataclass_cycle_reads_as_its_declared_type(self) -> None:
+        node = Node(name="p")
+        node.children.append(node)
+
+        restored = from_plain(to_plain(node), Node)
+
+        assert restored.name == "p"
+        assert restored.children[0] is restored
 
     def test_a_reference_into_an_unbuilt_dataclass_is_invalid(self) -> None:
         tree: MutablePlainTree = {"name": "n", "children": [{"py/ref": []}]}
@@ -972,15 +1040,80 @@ class TestDecodeEdges:
     def test_a_dataclass_is_numbered_for_later_references(self) -> None:
         state = deserialize._Decoding(hooks={}, allow_imports=False)
 
-        value = deserialize._decode_object({"x": 1}, Point, (), state)
+        value = deserialize._decode({"x": 1}, Point, (), state)
 
         assert state.built == [value]
 
-    def test_an_unresolvable_annotation_raises(self) -> None:
-        broken = make_dataclass("Broken", [("x", "NoSuchName")])
+    def test_each_py_id_read_counts_one_reference(self) -> None:
+        state = deserialize._Decoding(hooks={}, allow_imports=False, built=[1])
 
-        with pytest.raises(ReadError, match="field types"):
-            from_plain({"x": 1}, broken)
+        counts = [
+            (deserialize._decode_reference({"py/id": 0}, state), state.references)
+            for _ in range(2)
+        ]
+
+        assert counts == [(1, 1), (1, 2)]
+
+    def test_each_py_ref_read_counts_one_reference(self) -> None:
+        state = deserialize._Decoding(
+            hooks={},
+            allow_imports=False,
+            placed={("a",): 1},
+        )
+
+        counts = [
+            (
+                deserialize._decode_path_reference({"py/ref": ["a"]}, state),
+                state.references,
+            )
+            for _ in range(2)
+        ]
+
+        assert counts == [(1, 1), (1, 2)]
+
+    def test_a_remembered_union_failure_raises_the_same_error(self) -> None:
+        state = deserialize._Decoding(hooks={}, allow_imports=False)
+        data, target = "x", int | None
+        with pytest.raises(ReadError):
+            deserialize._decode(data, target, (), state)
+
+        with pytest.raises(ReadError, match=r"^cannot read 'x' as int \| None$"):
+            deserialize._decode(data, target, (), state)
+
+        assert state.unread == {(id(data), id(target)): data}
+
+    @pytest.mark.parametrize("target", [dict, Mapping], ids=["dict", "Mapping"])
+    def test_a_bare_mapping_target_reads_entries_as_object(
+        self,
+        target: object,
+    ) -> None:
+        assert from_plain({"a": [1], "b": {"py/tuple": [2]}}, target) == {
+            "a": [1],
+            "b": (2,),
+        }
+
+    def test_a_union_failure_blocks_neither_other_data_nor_other_unions(self) -> None:
+        state = deserialize._Decoding(hooks={}, allow_imports=False)
+        data, target = "x", int | None
+        with pytest.raises(ReadError):
+            deserialize._decode(data, target, (), state)
+
+        assert deserialize._decode(1, target, (), state) == 1
+        assert deserialize._decode(data, str | None, (), state) == "x"
+
+    def test_a_value_reads_back_as_its_type_despite_an_unresolvable_hint(self) -> None:
+        value = HintedLater(point=Fraction(3, 2), count=2)
+
+        restored = from_plain(to_plain(value), HintedLater, allow_imports=True)
+
+        assert restored == value
+
+    def test_an_unresolvable_hint_reads_its_part_by_tags(self) -> None:
+        tree = {"point": {"py/tuple": [1]}, "count": 2}
+
+        restored = from_plain(tree, HintedLater)
+
+        assert (restored.point, restored.count) == ((1,), 2)
 
 
 class TestTypedDict:
@@ -1077,6 +1210,45 @@ class TestTypedDict:
                 {"a": {"name": "x"}, "b": {"py/ref": ["a"]}},
                 tuple[dict[str, str], Meta],
             )
+
+    def test_an_unresolvable_hint_reads_its_key_as_object(self) -> None:
+        data = {"point": [1], "count": 2}
+
+        assert from_plain(data, HintedLaterDict) == data
+
+    def test_an_unresolvable_hint_keeps_its_key_required(self) -> None:
+        with pytest.raises(
+            ReadError,
+            match=r"^HintedLaterDict: missing required field\(s\) \['point'\]$",
+        ):
+            from_plain({"count": 2}, HintedLaterDict)
+
+    def test_an_unresolvable_eager_hint_keeps_every_other_key(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        pytest.importorskip("annotationlib")
+        module = ModuleType("_treekle_eager_hint_test")
+        monkeypatch.setitem(sys.modules, module.__name__, module)
+        source = """
+from typing import TypedDict
+
+class Eager(TypedDict):
+    count: int
+    point: Missing
+"""
+        exec(  # noqa: S102 -- Native deferred annotations need a module compiled without the test file's future import.
+            compile(source, "<treekle-eager-hint-test>", "exec", dont_inherit=True),
+            vars(module),
+        )
+        eager = cast("type", vars(module)["Eager"])
+
+        assert from_plain({"count": 2, "point": [1]}, eager) == {
+            "count": 2,
+            "point": [1],
+        }
+        with pytest.raises(ReadError, match=r"missing required field\(s\) \['point'\]"):
+            from_plain({"count": 2}, eager)
 
 
 class TestTypeBound:
@@ -2521,6 +2693,78 @@ class TestFieldTypes:
         assert deserialize._field_types(Local) == {"x": int}
         assert Local not in deserialize._FIELD_TYPES
 
+    def test_a_class_with_an_unresolved_hint_is_not_cached(self) -> None:
+        assert dict(deserialize._field_types(HintedLater)) == {
+            "point": object,
+            "count": int,
+        }
+        assert HintedLater not in deserialize._FIELD_TYPES
+
+    def test_a_hint_that_resolves_later_reads_as_its_type(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(
+            deserialize,
+            "_FIELD_TYPES",
+            weakref.WeakKeyDictionary[type, Mapping[str, object]](),
+        )
+        deserialize._field_types(HintedLater)
+        monkeypatch.setitem(globals(), "Rational", numbers.Rational)
+
+        assert deserialize._field_types(HintedLater)["point"] is numbers.Rational
+
+
+class TestUnionRetries:
+    def test_a_failed_key_does_not_fail_a_later_key(self) -> None:
+        data: dict[str, int] = {}
+        for index in range(200):
+            data[f'json://[1, "x{index}"]'] = index
+            data[f"json://[{index}, {index}]"] = index
+
+        with pytest.raises(ReadError) as raised:
+            from_plain(data, dict[tuple[int, int] | tuple[str, str], int])
+
+        assert sorted(str(at[0]) for at in raised.value.bad) == sorted(
+            f'json://[1, "x{index}"]' for index in range(200)
+        )
+
+
+class TestCyclicInput:
+    @pytest.mark.timeout(1)
+    def test_untagged_cyclic_data_reads_as_itself(self) -> None:
+        cyclic: list[object] = []
+        cyclic.append(cyclic)
+
+        assert from_plain(cyclic, object) is cyclic
+
+    @pytest.mark.timeout(1)
+    def test_cyclic_data_read_as_a_recursive_type_is_a_read_error(self) -> None:
+        cyclic: list[object] = []
+        cyclic.append(cyclic)
+
+        with pytest.raises(ReadError):
+            from_plain(cyclic, _Nested)
+
+    @pytest.mark.timeout(1)
+    def test_tagged_cyclic_data_is_a_read_error(self) -> None:
+        cyclic: list[object] = [{"py/tuple": [1]}]
+        cyclic.append(cyclic)
+
+        with pytest.raises(ReadError):
+            from_plain(cyclic, object)
+
+    @pytest.mark.timeout(1)
+    def test_a_reference_to_a_finished_cycle_fits_a_recursive_type(self) -> None:
+        loop: list[object] = []
+        loop.append(loop)
+
+        first, second = from_plain(to_plain([loop, loop]), list[_Nested])
+
+        assert isinstance(first, list)
+        assert second is first
+        assert first[0] is first
+
 
 class TestCaches:
     def test_a_local_dataclass_stays_collectible(self) -> None:
@@ -2537,6 +2781,6 @@ class TestCaches:
 
 
 if __name__ == "__main__":
-    from treekle.lib.testing.main import test_main
+    from treekle.lib.testing.runner import test_main
 
     test_main(__file__)
