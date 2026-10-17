@@ -250,12 +250,13 @@ jobs:
             --record-on-validation-failure "${{ github.event_name == 'push' }}" \
             --refresh-public-lockfile \
             --validation-command 'uv sync --frozen --all-groups' \
-            --validation-command 'uv run pre-commit run --all-files --hook-stage pre-commit' \
-            --validation-command 'uv run pre-commit run --all-files --hook-stage pre-push' \
-            --validation-command 'uv run python -c "import treekle"' \
+            --validation-command 'TREEKLE_PURE_PYTHON=1 uv run pre-commit run --all-files --hook-stage pre-commit' \
+            --validation-command 'TREEKLE_PURE_PYTHON=1 uv run pre-commit run --all-files --hook-stage pre-push' \
+            --validation-command 'uv run pytest -q -p no:cacheprovider' \
             --validation-command 'rm -rf dist' \
             --validation-command 'uv build --out-dir dist' \
-            --validation-command 'wheels=(dist/treekle-*.whl); wheel="${wheels[0]}"; uv run --isolated --with "$wheel" python -P -c "import treekle; print(treekle.__file__)"' \
+            --validation-command 'uv run --isolated --no-project --no-index --no-build --find-links dist --with treekle python -P -W error scripts/check_wheel.py native' \
+            --validation-command 'uv run --isolated --no-project --with "$(uv run scripts/build_pure_wheel.py dist)" python -P -W error scripts/check_wheel.py python' \
             --open-pr false
 
       - name: Open or update target import PR

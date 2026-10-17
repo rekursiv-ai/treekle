@@ -2475,8 +2475,8 @@ class TestScalars:
         [
             ("1e3", 1000),
             ("2.0", 2),
-            ("9007199254740993.0", 9007199254740993),
-            ("-9007199254740993e0", -9007199254740993),
+            ("9007199254740993.0", 9_007_199_254_740_993),
+            ("-9007199254740993e0", -9_007_199_254_740_993),
             ("1.5e30", 15 * 10**29),
             # Integral only after rounding to a float: keeps the rounded value.
             ("1.0000000000000000001", 1),
@@ -2588,7 +2588,7 @@ class _FreshParts(Sequence[object]):
         return len(self.items)
 
     @override
-    def __getitem__(self, index: object) -> object:  # pyright: ignore[reportIncompatibleMethodOverride]  # ty: ignore[invalid-method-override]
+    def __getitem__(self, index: object) -> object:  # pyright: ignore[reportIncompatibleMethodOverride] -- Accepts any index to raise IndexError as a misbehaving sequence would.  # ty: ignore[invalid-method-override] -- Same.
         if not isinstance(index, int) or index >= len(self.items):
             raise IndexError(index)
         return [self.items[index]]
@@ -2799,7 +2799,7 @@ class TestFieldTypes:
 
         def counted(*args: object, **kwargs: object) -> object:
             calls.append(args[0])
-            return get_type_hints(*args, **kwargs)  # pyright: ignore[reportArgumentType]  # ty: ignore[invalid-argument-type]
+            return get_type_hints(*args, **kwargs)  # pyright: ignore[reportArgumentType] -- Forwards the spied call's arguments unchanged.  # ty: ignore[invalid-argument-type] -- Same.
 
         monkeypatch.setattr(deserialize, "get_type_hints", counted)
 

@@ -43,10 +43,9 @@ from zoneinfo import ZoneInfo
 
 import base64
 import json
-import os
-import warnings
 import weakref
 
+from treekle.native import native
 from treekle.plain import immutable
 from treekle.reflect import (
     PENDING,
@@ -717,24 +716,14 @@ _python_to_plain: Final = to_plain
 """The Python walker, used when the optional Rust core is unavailable."""
 
 
-if os.environ.get("TREEKLE_PURE_PYTHON", "") in {"", "0"}:
-    try:
-        from treekle._rust import (
-            setup_encode as _setup_rust,
-            to_plain as _rust_to_plain,
-        )
+def _walker[F](python: F) -> F:
+    """Return the Rust core's ``to_plain`` when it serves, else ``python``."""
+    return native(
+        python,
+        name="to_plain",
+        setup="setup_encode",
+        module=globals(),
+    )
 
-        _setup_rust(globals())
-    except ModuleNotFoundError:
-        pass
-    # A core built from other sources may lack this module's functions or fail
-    # to set up against it; Python must still serve rather than fail import.
-    except Exception as error:  # noqa: BLE001
-        warnings.warn(
-            f"treekle's Rust core does not match this treekle ({error}); "
-            "using the Python implementation until the core is rebuilt",
-            RuntimeWarning,
-            stacklevel=2,
-        )
-    else:
-        to_plain = _rust_to_plain  # ty: ignore[invalid-assignment]
+
+to_plain = _walker(_python_to_plain)

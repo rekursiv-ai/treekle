@@ -1,3 +1,4 @@
+# house-ignore[cli-shape] -- Runs as `python` in an environment that has priml, msgspec and jsonpickle.
 """Time msgspec, treekle, pickle and jsonpickle on every priml ``exp000`` config.
 
 priml, msgspec and jsonpickle are not treekle dependencies, so run this in an
@@ -34,12 +35,18 @@ import operator
 import pickle
 import sys
 import timeit
+import uuid
 
 from treekle import deserialize, serialize
 
 
 def main() -> int:
-    """Print the encode, decode and summary tables; return the process exit code."""
+    """Time every library on every config and print the tables.
+
+    Returns:
+      code: 0 once the encode, decode and summary tables are printed.
+
+    """
     parser = argparse.ArgumentParser(
         description=(__doc__ or "").strip(),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -49,7 +56,9 @@ def main() -> int:
     configs, skipped = _configs(f"{flags.priml}.baselines")
     for label in skipped:
         print(f"skipped {label}: exp000 raised")
-    module = ModuleType("treekle_bench_analogue")
+    # Treekle caches the class each import path names, so every run needs a
+    # module name of its own.
+    module = ModuleType(f"treekle_bench_analogue_{uuid.uuid4().hex}")
     sys.modules[module.__name__] = module
     classes: dict[tuple[str, tuple[tuple[str, object], ...]], type] = {}
     codecs = [_CODECS[name]() for name in flags.columns]
@@ -430,7 +439,7 @@ def _pickle_codec() -> _Codec:
 
 def _prepare_pickle(analogue: object) -> _Prepared:
     data = pickle.dumps(analogue)
-    return lambda: cast("object", pickle.loads(data)), analogue.__eq__  # noqa: S301
+    return lambda: cast("object", pickle.loads(data)), analogue.__eq__  # noqa: S301 -- Loads the bytes it pickled a line above.
 
 
 def _jsonpickle_codec() -> _Codec:
@@ -543,8 +552,8 @@ _CODECS: dict[str, Callable[[], _Codec]] = {
     "treekle-python": functools.partial(
         _treekle_codec,
         "treekle-python",
-        to_plain=serialize._python_to_plain,  # noqa: SLF001
-        from_plain=deserialize._python_from_plain,  # noqa: SLF001
+        to_plain=serialize._python_to_plain,  # noqa: SLF001 -- The Python walker has no public name.
+        from_plain=deserialize._python_from_plain,  # noqa: SLF001 -- The Python walker has no public name.
     ),
     "pickle": _pickle_codec,
     "jsonpickle": _jsonpickle_codec,

@@ -6,22 +6,24 @@ jsonpickle by pickle, msgspec by a converter that builds the requested Struct.
 
 from __future__ import annotations
 
-from pathlib import Path
 from types import GenericAlias, SimpleNamespace, UnionType
 from typing import TYPE_CHECKING, cast, get_args, get_origin
 
+import argparse
 import dataclasses
 import functools
-import importlib.util
 import pickle
 import sys
 import textwrap
 
 import pytest
 
+from scripts import bench_configs
+
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Iterator
+    from pathlib import Path
 
 
 _TOY = """
@@ -96,16 +98,7 @@ def bench(
     monkeypatch.setattr(sys, "path", [str(tmp_path), *sys.path])
     monkeypatch.setitem(sys.modules, "msgspec", _fake_msgspec())
     monkeypatch.setitem(sys.modules, "jsonpickle", _fake_jsonpickle())
-    spec = importlib.util.spec_from_file_location(
-        "bench_configs",
-        Path(__file__).with_name("bench_configs.py"),
-    )
-    assert spec
-    assert spec.loader
-    module = importlib.util.module_from_spec(spec)
-    monkeypatch.setitem(sys.modules, spec.name, module)
-    spec.loader.exec_module(module)
-    main = cast("Callable[[], int]", vars(module)["main"])
+    main = bench_configs.main
     before = set(sys.modules)
 
     def run(*columns: str) -> None:
@@ -194,6 +187,36 @@ def test_without_msgspec_the_tables_have_no_percent_columns(
     assert "%" not in out
 
 
+def test_the_flags_default_to_every_library_on_installed_priml() -> None:
+    parser = argparse.ArgumentParser()
+    bench_configs._add_arguments(parser)
+    assert vars(parser.parse_args([])) == {
+        "priml": "priml",
+        "columns": list(bench_configs._CODECS),
+        "budget_sec": 0.002,
+        "repeat": 5,
+    }
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--columns", "nope"])
+
+
+def test_treekle_decodes_into_the_analogue_type() -> None:
+    calls: list[tuple[object, object, bool]] = []
+
+    def from_plain(data: object, target: object, *, allow_imports: bool) -> object:
+        calls.append((data, target, allow_imports))
+        return data
+
+    decode, check = bench_configs._prepare_treekle(
+        3,
+        to_plain=str,
+        from_plain=from_plain,
+    )
+    assert decode() == "3"
+    assert calls == [("3", int, True)]
+    assert check(3)
+
+
 def _fake_jsonpickle() -> SimpleNamespace:
     pickler = SimpleNamespace(flatten=pickle.dumps)
     unpickler = SimpleNamespace(restore=pickle.loads)
@@ -251,12 +274,10 @@ def _defstruct(
     return made
 
 
+# A dict picks its union member by ``$type`` among Struct twins; among plain
+# dataclasses, which carry no tag, a union of two is refused.
 def _convert(value: object, target: object) -> object:
-    """Rebuild ``value`` as ``target``, as msgspec would.
-
-    A dict picks its union member by ``$type`` among Struct twins; among plain
-    dataclasses, which carry no tag, a union of two is refused.
-    """
+    """Rebuild ``value`` as ``target``, as msgspec would."""
     if isinstance(target, type) and dataclasses.is_dataclass(target):
         fields = {
             field.name: _convert(
@@ -289,3 +310,9 @@ def _convert(value: object, target: object) -> object:
             )
         return [_convert(item, args[0]) for item in items]
     return value
+
+
+if __name__ == "__main__":
+    from treekle.lib.testing.runner import test_main
+
+    test_main(__file__)

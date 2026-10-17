@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
+from importlib.metadata import version as installed_version
 from pathlib import Path
-from typing import cast
+from typing import Final, cast
 from zipfile import ZipFile
 
-import importlib.metadata
 import os
 import subprocess
 import sys
@@ -15,7 +15,16 @@ import tomllib
 import pytest
 
 
-ROOT = Path(__file__).resolve().parents[1]
+_CWD: Final = Path(__file__).resolve().parent
+
+ROOT = _CWD.parent
+
+# The wheel builds from the public repository's ``pyproject.toml``, which the
+# monorepo keeps in ``.export`` and does not build from.
+pytestmark = pytest.mark.skipif(
+    not (ROOT / "pyproject.toml").is_file(),
+    reason="needs the public repository layout",
+)
 
 
 @pytest.fixture(scope="module")
@@ -63,7 +72,7 @@ def test_the_release_builds_with_the_hatchling_the_tests_use() -> None:
     block = script[script.index("# /// script") + 1 : script.index("# ///")]
     metadata = tomllib.loads("\n".join(line.removeprefix("# ") for line in block))
     assert metadata["dependencies"] == [
-        f"hatchling=={importlib.metadata.version('hatchling')}",
+        f"hatchling=={installed_version('hatchling')}",
     ]
 
 
@@ -117,3 +126,9 @@ def test_check_wheel_accepts_a_built_core() -> None:
     result = _check_wheel("native", ROOT)
     assert result.returncode == 0, result.stderr
     assert result.stdout.startswith("native: ")
+
+
+if __name__ == "__main__":
+    from treekle.lib.testing.runner import test_main
+
+    test_main(__file__)

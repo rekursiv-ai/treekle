@@ -62,14 +62,13 @@ import importlib
 import inspect
 import json
 import math
-import os
 import reprlib
 import sys
 import typing
-import warnings
 import weakref
 
 from treekle.absent import ABSENT
+from treekle.native import native
 from treekle.reflect import PENDING, is_mutable, resolve_import, slot_names
 from treekle.types import (
     FieldPath,
@@ -1234,20 +1233,18 @@ def _decode_object(
     )
 
 
+# Taken for a dict whose keys are all ``str``, each a field of ``target`` but a
+# ``py/object`` naming ``target`` itself. Such a record reads as ``_start_node`` and
+# ``_decode_object`` would read it, minus their reference and tag lookups and the copy
+# without the tag; anything else, refusals included, goes the full path, which words
+# every error.
 def _decode_exact_object(
     data: dict[str, PlainTree],
     target: object,
     at: FieldPath,
     state: _Decoding,
 ) -> _Object | None:
-    """Start a dataclass record in one pass, else ``None`` for the full path.
-
-    Taken for a dict whose keys are all ``str``, each a field of ``target``
-    but a ``py/object`` naming ``target`` itself. Such a record reads as
-    ``_start_node`` and ``_decode_object`` would read it, minus their
-    reference and tag lookups and the copy without the tag; anything else,
-    refusals included, goes the full path, which words every error.
-    """
+    """Start a dataclass record in one pass, else ``None`` for the full path."""
     if (
         not isinstance(target, type)
         or not is_dataclass(target)
@@ -2033,12 +2030,12 @@ def _union_candidates(
 ) -> tuple[object, ...]:
     """Return the union members to try: the data's own kind first."""
     if data is None or isinstance(data, (str, int, float)):
-        native: type = type(data)
+        kind: type = type(data)
     elif isinstance(data, Mapping):
-        native = dict
+        kind = dict
     else:
-        native = list
-    origins = _NATIVE_ORIGINS[native]
+        kind = list
+    origins = _NATIVE_ORIGINS[kind]
     exact = tuple(
         member
         for member in members
@@ -2462,24 +2459,14 @@ _python_from_plain: Final = from_plain
 """The Python walker, used when the optional Rust core is unavailable."""
 
 
-if os.environ.get("TREEKLE_PURE_PYTHON", "") in {"", "0"}:
-    try:
-        from treekle._rust import (
-            from_plain as _rust_from_plain,
-            setup_decode as _setup_rust,
-        )
+def _walker[F](python: F) -> F:
+    """Return the Rust core's ``from_plain`` when it serves, else ``python``."""
+    return native(
+        python,
+        name="from_plain",
+        setup="setup_decode",
+        module=globals(),
+    )
 
-        _setup_rust(globals())
-    except ModuleNotFoundError:
-        pass
-    # A core built from other sources may lack this module's functions or fail
-    # to set up against it; Python must still serve rather than fail import.
-    except Exception as error:  # noqa: BLE001
-        warnings.warn(
-            f"treekle's Rust core does not match this treekle ({error}); "
-            "using the Python implementation until the core is rebuilt",
-            RuntimeWarning,
-            stacklevel=2,
-        )
-    else:
-        from_plain = _rust_from_plain  # ty: ignore[invalid-assignment]
+
+from_plain = _walker(_python_from_plain)

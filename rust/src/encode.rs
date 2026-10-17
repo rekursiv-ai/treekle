@@ -209,8 +209,12 @@ pub fn setup(module: &Bound<'_, PyDict>) -> PyResult<()> {
     let dialect = item(module, "Dialect")?;
     let dialects = item(module, "get_args")?.call1((dialect.getattr("__value__")?,))?;
     let abc = py.import("collections.abc")?;
-    let reflect = py.import("treekle.reflect")?;
-    let plain = py.import("treekle.plain")?;
+    // The package is wherever ``serialize`` lives: ``treekle`` once exported,
+    // ``loop.treekle`` in the monorepo, which builds from this same source.
+    let name = item(module, "__name__")?.extract::<String>()?;
+    let package = name.rsplit_once('.').map_or("", |(package, _)| package);
+    let reflect = py.import(format!("{package}.reflect").as_str())?;
+    let plain = py.import(format!("{package}.plain").as_str())?;
     let enum_type = py.import("enum")?.getattr("Enum")?;
     let enum_reduce_ex = enum_type.getattr("__dict__")?.get_item("__reduce_ex__")?;
     let object_class = builtins

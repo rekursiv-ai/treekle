@@ -14,6 +14,7 @@ from decimal import Decimal
 from enum import Enum, IntEnum
 from fractions import Fraction
 from functools import partial
+from importlib import util
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType, MemberDescriptorType, ModuleType, SimpleNamespace
 from typing import (
@@ -31,7 +32,6 @@ from zoneinfo import ZoneInfo
 
 import datetime as dt
 import gc
-import importlib.util
 import inspect
 import math
 import os
@@ -78,20 +78,22 @@ class Pair(NamedTuple):
     b: list[int]
 
 
-@dataclass
+@dataclass(
+    slots=True,
+)  # house-ignore[dataclass] -- Built positionally, as the parity cases write it.
 class Point:
     x: int = 0
     y: float = 0.0
 
 
-@dataclass
+@dataclass(kw_only=True, slots=True)
 class WithClassVar:
     x: int
     y: int = 7
     shared: ClassVar[int] = 0
 
 
-@dataclass
+@dataclass(kw_only=True, slots=True)
 class ChangingField:
     x: int = 1
 
@@ -99,7 +101,9 @@ class ChangingField:
         self.x *= 10
 
 
-@dataclass
+@dataclass(
+    slots=True,
+)  # house-ignore[dataclass] -- Built positionally; nodes link into cycles.
 class Node:
     name: str
     children: list[Node] = field(default_factory=list["Node"])
@@ -114,7 +118,7 @@ class Slotted:
         self.b = b
 
 
-@dataclass(slots=True)
+@dataclass(slots=True, kw_only=True)
 class AttributeOrder:
     z: int = 1
     a: int = 2
@@ -146,7 +150,10 @@ class Tensor:
         self.data = data
 
 
-@dataclass(frozen=True)
+@dataclass(
+    frozen=True,
+    slots=True,
+)  # house-ignore[dataclass] -- Built positionally inside generated deep trees.
 class Frozen:
     x: int
 
@@ -154,13 +161,15 @@ class Frozen:
 type _Retried = list[_Retried] | tuple[_Retried, ...] | UUID
 
 
-@dataclass(slots=True)
+@dataclass(
+    slots=True,
+)  # house-ignore[dataclass] -- Built positionally beside ChangingDict.
 class ChangingSlot:
     a: Tensor | int
     b: int
 
 
-@dataclass
+@dataclass  # house-ignore[dataclass] -- The dict-backed twin of ChangingSlot: its fields live in __dict__; built positionally.
 class ChangingDict:
     a: Tensor
     b: int
@@ -178,13 +187,17 @@ def _tensor_tagged(tensor: Tensor) -> dict[str, list[float]]:
     return {"py/x": tensor.data}
 
 
-@dataclass(slots=True)
+@dataclass(
+    slots=True,
+)  # house-ignore[dataclass] -- Built positionally in the parity cases.
 class SlotPoint:
     x: int = 0
     y: list[int] = field(default_factory=list[int])
 
 
-@dataclass(slots=True)
+@dataclass(
+    slots=True,
+)  # house-ignore[dataclass] -- Built positionally in the parity cases.
 class SlotDynamic:
     a: int = 0
     b: int = 0
@@ -195,15 +208,22 @@ class SlotDynamic:
         raise AttributeError(name)
 
 
-class SlotShadow(SlotPoint):
-    """A property that shadows a slot: ``getattr`` reads the property."""
+def _ninety_nine(self: object) -> int:
+    del self
+    return 99
 
-    __slots__ = ()
 
-    @property
-    @override
-    def x(self) -> int:  # pyright: ignore[reportIncompatibleVariableOverride]  # ty: ignore[invalid-property-type-override]
-        return 99
+# Built with ``type`` because a checker rejects a property overriding a field.
+def _slot_shadow() -> type[SlotPoint]:
+    """Return a class whose property shadows a slot: ``getattr`` reads the property."""
+    return type(
+        "SlotShadow",
+        (SlotPoint,),
+        {"__slots__": (), "__module__": __name__, "x": property(_ninety_nine)},
+    )
+
+
+SlotShadow = _slot_shadow()
 
 
 class ForeignSlotOwner:
@@ -235,7 +255,7 @@ def _unset_dynamic() -> SlotDynamic:
     return dynamic
 
 
-def _shadow() -> SlotShadow:
+def _shadow() -> SlotPoint:
     shadow = SlotShadow.__new__(SlotShadow)
     cast("MemberDescriptorType", vars(SlotPoint)["x"]).__set__(shadow, 1)
     cast("MemberDescriptorType", vars(SlotPoint)["y"]).__set__(shadow, [2])
@@ -292,7 +312,7 @@ class Liar(Sequence[object]):
         return self.length
 
     @override
-    def __getitem__(self, index: object) -> object:  # pyright: ignore[reportIncompatibleMethodOverride]  # ty: ignore[invalid-method-override]
+    def __getitem__(self, index: object) -> object:  # pyright: ignore[reportIncompatibleMethodOverride] -- Accepts any index to raise IndexError as a misbehaving sequence would.  # ty: ignore[invalid-method-override] -- Same.
         if not isinstance(index, int) or index >= len(self.items):
             raise IndexError(index)
         return self.items[index]
@@ -321,7 +341,7 @@ class LowersToOne(str):
     __slots__ = ()
 
     @override
-    def lower(self) -> int:  # pyright: ignore[reportIncompatibleMethodOverride]  # ty: ignore[invalid-method-override]
+    def lower(self) -> int:  # pyright: ignore[reportIncompatibleMethodOverride] -- The test needs a str whose lower() is not text.  # ty: ignore[invalid-method-override] -- Same.
         return 1
 
 
@@ -416,12 +436,10 @@ class Pairs(Mapping[object, object]):
         return len(self.pairs)
 
 
+# Local classes are not cached, and ``get_type_hints`` strips ``Annotated`` into new
+# objects each time, which die as soon as a read moves on.
 def _typeddict_targets() -> tuple[object, object]:
-    """Return a union and a tuple of ``TypedDict`` classes read afresh each call.
-
-    Local classes are not cached, and ``get_type_hints`` strips ``Annotated``
-    into new objects each time, which die as soon as a read moves on.
-    """
+    """Return a union and a tuple of ``TypedDict`` classes read afresh each call."""
 
     class Listed(TypedDict):
         x: list[Annotated[int, "unit"]]
@@ -676,23 +694,19 @@ def _assert_same_shape(actual: object, expected: object) -> None:
             assert left == right, _path(at)
 
 
+# A ``ReadError`` also gives its ``_failure``.
 def _outcome(call: Callable[[], object]) -> object:
-    """Return the call's result shape, or the type and text of what it raised.
-
-    A ``ReadError`` also gives its ``_failure``.
-    """
+    """Return the call's result shape, or the type and text of what it raised."""
     try:
         return ("ok", _shape(call()))
     except ReadError as error:
         return ("raise", "ReadError", _shape(_failure(error)))
-    except Exception as error:  # noqa: BLE001
+    except Exception as error:  # noqa: BLE001 -- Parity compares whatever either walker raises.
         return ("raise", type(error).__name__, str(error))
 
 
 def _failure(error: ReadError) -> tuple[object, ...]:
-    """Return a read's error as plain data: its text, each bad part's place and
-    reason, its partial value as Python encodes it, and the errors that caused it.
-    """
+    """Return a read's error as plain data: its text, each bad part's place and reason, its partial value as Python encodes it, and the errors that caused it."""
     bad = [(list(at), invalid.reason) for at, invalid in error.bad.items()]
     causes: list[object] = []
     cause = error.__cause__
@@ -786,7 +800,11 @@ class _Unordered(str):
         raise ValueError("unordered")
 
 
-@dataclass(frozen=True, repr=False)
+@dataclass(
+    frozen=True,
+    repr=False,
+    slots=True,
+)  # house-ignore[dataclass] -- Built positionally by its test.
 class _ShownScrambled:
     n: int
 
@@ -795,7 +813,11 @@ class _ShownScrambled:
         return _Scrambled(f"m{self.n}")
 
 
-@dataclass(frozen=True, repr=False)
+@dataclass(
+    frozen=True,
+    repr=False,
+    slots=True,
+)  # house-ignore[dataclass] -- Built positionally by its test.
 class _ShownUnordered:
     n: int
 
@@ -816,7 +838,7 @@ def test_set_members_with_inconsistent_repr_order_match_python(
     )
 
 
-@dataclass(slots=True)
+@dataclass(slots=True)  # house-ignore[dataclass] -- Built positionally.
 class _SlottedPair:
     a: int
     b: int
@@ -830,7 +852,7 @@ def test_planted_cache_entries_encode_as_python_does(
     planted: str,
     sort: bool,
 ) -> None:
-    from treekle import reflect  # noqa: PLC0415 -- only this test reads its caches
+    from treekle import reflect  # noqa: PLC0415 -- Only this test reads it.
 
     value = _SlottedPair(1, 2)
     serialize._python_to_plain(value, sort=sort)
@@ -871,7 +893,8 @@ def test_encoder_changes_during_walk_match_python(
 ) -> None:
     original = serialize._ENCODERS
 
-    def replaced(_obj: object, _state: serialize._Encoding) -> str:
+    def replaced(obj: object, state: serialize._Encoding) -> str:
+        del obj, state
         return "replaced"
 
     def decoded(value: str) -> str:
@@ -885,7 +908,8 @@ def test_encoder_changes_during_walk_match_python(
             weakref.WeakKeyDictionary[type, serialize._Encoder](),
         )
 
-        def replace(_value: Tensor) -> str:
+        def replace(value: Tensor) -> str:
+            del value
             if source == "cache":
                 serialize._ENCODER_CACHE[Point] = replaced
             else:
@@ -954,7 +978,7 @@ def test_same_size_dict_key_mutation_matches_python() -> None:
     assert run(serialize.to_plain) == expected
 
 
-@dataclass
+@dataclass(kw_only=True, slots=True)
 class ThreeFields:
     a: int
     b: str
@@ -997,7 +1021,7 @@ def test_record_keys_match_fields_as_python_does(data: dict[object, object]) -> 
 _EDIT_WHILE_READ: list[Callable[[], None]] = []
 
 
-@dataclass
+@dataclass(kw_only=True, slots=True)
 class EditsWhileRead:
     x: int
 
@@ -1097,7 +1121,8 @@ def test_attribute_changes_during_walk_match_python(
 ) -> None:
     original_slot = cast("object", ChangingSlot.__dict__["b"])
 
-    def replaced_b(_value: ChangingSlot) -> int:
+    def replaced_b(value: ChangingSlot) -> int:
+        del value
         return 99
 
     def decoded(value: str) -> str:
@@ -1110,7 +1135,8 @@ def test_attribute_changes_during_walk_match_python(
         else:
             target = ChangingDict(Tensor([]), 2)
 
-        def replace(_value: Tensor) -> str:
+        def replace(value: Tensor) -> str:
+            del value
             if change == "slot":
                 monkeypatch.setattr(ChangingSlot, "b", property(replaced_b))
             else:
@@ -1130,10 +1156,12 @@ def test_slot_changes_between_objects_match_python(
 ) -> None:
     original_slot = cast("object", ChangingSlot.__dict__["b"])
 
-    def replaced_b(_value: ChangingSlot) -> int:
+    def replaced_b(value: ChangingSlot) -> int:
+        del value
         return 99
 
-    def replace(_value: Tensor) -> str:
+    def replace(value: Tensor) -> str:
+        del value
         monkeypatch.setattr(ChangingSlot, "b", property(replaced_b))
         return "triggered"
 
@@ -1200,7 +1228,7 @@ class HashHidden(metaclass=_HidesHash):
 
 
 class HashReported(metaclass=_ReportsHash):
-    __hash__ = None  # pyright: ignore[reportAssignmentType]
+    __hash__ = None  # pyright: ignore[reportAssignmentType] -- An unhashable class is the case under test.
 
     def __init__(self, n: int) -> None:
         self.n = n
@@ -1571,7 +1599,7 @@ def test_rolled_back_registrations_deep_in_the_tree_match_python(
     assert _shape(serialize.to_plain(value, mutable=mutable)) == _shape(expected)
 
 
-@dataclass(eq=False)
+@dataclass(eq=False, kw_only=True, slots=True)
 class KeyBox:
     """A key hashed by identity, holding whatever it is given."""
 
@@ -1621,7 +1649,7 @@ def test_a_python_encoder_inside_a_key_sees_it_is_inside_one(
     assert "py/ref" not in next(iter(expected))
 
 
-@dataclass
+@dataclass(kw_only=True, slots=True)
 class RegisteredUnhashable:
     """Unhashable, as an ``eq`` dataclass is, yet registered as ``Hashable``."""
 
@@ -1682,7 +1710,8 @@ def test_list_changes_during_walk_match_python() -> None:
     def run(function: Callable[..., object]) -> object:
         value: list[object] = []
 
-        def grow(_tensor: Tensor) -> str:
+        def grow(tensor: Tensor) -> str:
+            del tensor
             value.append("added")
             return "triggered"
 
@@ -1837,7 +1866,7 @@ def test_a_cycle_is_refused_after_its_container_is_numbered() -> None:
 def test_a_nested_union_reads_its_innermost_node_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from treekle import _rust  # noqa: PLC0415 -- optional in pure-Python mode
+    from treekle import _rust  # noqa: PLC0415 -- Absent in a pure-Python run.
 
     depth = 12
     data: object = "bad"
@@ -1848,7 +1877,7 @@ def test_a_nested_union_reads_its_innermost_node_once(
 
     def counted(data: PlainTree, target: object, at: object, state: object) -> object:
         calls.append(data)
-        return original(data, target, at, state)  # pyright: ignore[reportArgumentType]  # ty: ignore[invalid-argument-type]
+        return original(data, target, at, state)  # pyright: ignore[reportArgumentType] -- Forwards the spied decoder's arguments unchanged.  # ty: ignore[invalid-argument-type] -- Same.
 
     counts: list[int] = []
     try:
@@ -1875,7 +1904,7 @@ def test_a_nested_union_reads_its_innermost_node_once(
 def test_repeated_top_level_union_reuses_its_plan(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from treekle import _rust  # noqa: PLC0415 -- optional in pure-Python mode
+    from treekle import _rust  # noqa: PLC0415 -- Absent in a pure-Python run.
 
     original = deserialize._union_candidates
     calls = 0
@@ -1955,7 +1984,7 @@ def _nested_dataclass(module: ModuleType, **annotations: object) -> type[object]
 def test_a_nested_dataclass_keeps_its_field_types_across_reads(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from treekle import _rust  # noqa: PLC0415 -- optional in pure-Python mode
+    from treekle import _rust  # noqa: PLC0415 -- Absent in a pure-Python run.
 
     module = ModuleType("treekle_parity_nested")
     monkeypatch.setitem(sys.modules, module.__name__, module)
@@ -2058,7 +2087,7 @@ class _Areal(Protocol):
     def area(self) -> float: ...
 
 
-@dataclass
+@dataclass(kw_only=True, slots=True)
 class _Plot:
     side: float = 1.0
 
@@ -2179,7 +2208,7 @@ def test_deep_nesting_on_a_small_thread_stack_round_trips(
 
 def _run_python(script: str, **env: str) -> str:
     """Run ``script`` in a fresh interpreter; return what it printed."""
-    completed = subprocess.run(  # noqa: S603
+    completed = subprocess.run(  # noqa: S603 -- Runs this interpreter on the test's own script.
         [sys.executable, "-c", textwrap.dedent(script)],
         capture_output=True,
         check=False,
@@ -2343,7 +2372,7 @@ def test_a_core_without_the_decoder_reads_with_python_and_warns() -> None:
 # Runs whenever a core is built, even in a TREEKLE_PURE_PYTHON run, so a core
 # that installs only one direction fails here instead of skipping.
 @pytest.mark.skipif(
-    importlib.util.find_spec("treekle._rust") is None,
+    util.find_spec("treekle._rust") is None,
     reason="the Rust core is not built",
 )
 @pytest.mark.parametrize("setting", ["", "0"])
@@ -2377,3 +2406,9 @@ def test_the_rust_functions_document_themselves_as_python_does(
         if (default := cast("object", each.default)) is not Ellipsis
     }
     assert literal == {name: cast("object", theirs[name].default) for name in literal}
+
+
+if __name__ == "__main__":
+    from treekle.lib.testing.runner import test_main
+
+    test_main(__file__)

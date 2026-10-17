@@ -298,6 +298,29 @@ repos:
         require_serial: true
         types_or: [python, pyi, jupyter]
 
+  # The Rust core's ruff: rustfmt rewrites in place, then clippy denies every
+  # warning. Cargo builds the whole crate, so each hook runs once per commit.
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo-fmt
+        language: system
+        stages: [pre-commit]
+        require_serial: true
+        pass_filenames: false
+        files: ^rust/.*\.(rs|toml)$
+        entry: cargo fmt --manifest-path rust/Cargo.toml
+      - id: cargo-clippy
+        name: cargo-clippy
+        language: system
+        stages: [pre-commit]
+        require_serial: true
+        pass_filenames: false
+        files: ^rust/.*\.(rs|toml|lock)$
+        entry: >-
+          nice -n 19 cargo clippy --manifest-path rust/Cargo.toml
+          --all-targets --locked -- -D warnings
+
   - repo: local
     hooks:
       # No official ty hook yet (https://github.com/astral-sh/ty/issues/269).
