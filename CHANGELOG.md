@@ -3,6 +3,22 @@
 All notable treekle changes are documented here. This project follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## 0.2.0 - 2026-10-17
+
+### Added
+
+- A Rust core for `to_plain` and `from_plain`, shipped as wheels for Linux
+  and macOS (x86_64, aarch64) and Windows (x64) on CPython 3.12-3.14. Other
+  platforms install a pure-Python wheel with the same behavior; set
+  `TREEKLE_PURE_PYTHON=1` to force it.
+- `ABSENT` and `Absent` are exported from the package root.
+- `to_plain(..., sort=False)` keeps attributes in declaration order.
+
+### Changed
+
+- Encoding, decoding, and rendering are iterative, so deeply nested values
+  no longer raise `RecursionError`.
+
 ## 0.1.1 - 2026-10-11
 
 ### Added
