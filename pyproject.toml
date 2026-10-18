@@ -23,11 +23,17 @@ classifiers = [
     "Topic :: Software Development :: Libraries",
     "Typing :: Typed",
 ]
-dependencies = []
+dependencies = [
+    # Prefer https://awesome-python.com deps over alternatives.
+]
 
 [dependency-groups]
 # NEVER ADD MORE DEPENDENCIES!
 
+debug = [
+    "ipython",
+    "tqdm",
+]
 lint = [
     "codespell>=2.2.4",
     "ruff",
@@ -60,6 +66,7 @@ typecheck = [
 ]
 dev = [
     {include-group = "pre-commit"},
+    {include-group = "debug"},
     {include-group = "publish"},
 ]
 
@@ -228,6 +235,9 @@ omit = [
     "*/.venv/*",
     "*/typings/*",
     "*/tools/*",
+    "*/scripts/*",
+    "*/testdata/*",
+    "*/__main__.py",
     # Wheels the tests extract to tmp_path and run in a subprocess.
     "*/pytest-of-*/*",
 ]
