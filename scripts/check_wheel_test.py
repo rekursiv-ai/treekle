@@ -21,6 +21,12 @@ def _run(monkeypatch: pytest.MonkeyPatch, *argv: str) -> int:
     return check_wheel.main()
 
 
+def _exit_message(monkeypatch: pytest.MonkeyPatch, *argv: str) -> object:
+    with pytest.raises(SystemExit) as caught:
+        _run(monkeypatch, *argv)
+    return caught.value.code
+
+
 def _without_core(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setitem(sys.modules, _CORE, None)
     monkeypatch.setattr(serialize, "to_plain", serialize._python_to_plain)
@@ -44,8 +50,8 @@ def test_rejects_a_bad_mode(
     monkeypatch: pytest.MonkeyPatch,
     argv: tuple[str, ...],
 ) -> None:
-    with pytest.raises(SystemExit, match="usage"):
-        _run(monkeypatch, *argv)
+    usage = "usage: check_wheel.py native|python"
+    assert _exit_message(monkeypatch, *argv) == usage
 
 
 def test_accepts_the_python_walkers_without_a_core(
@@ -70,14 +76,12 @@ def test_rejects_a_native_wheel_without_a_core(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _without_core(monkeypatch)
-    with pytest.raises(SystemExit, match="_rust is missing"):
-        _run(monkeypatch, "native")
+    assert _exit_message(monkeypatch, "native") == f"{_CORE} is missing"
 
 
 def test_rejects_a_python_wheel_with_a_core(monkeypatch: pytest.MonkeyPatch) -> None:
     _with_core(monkeypatch)
-    with pytest.raises(SystemExit, match="_rust is present"):
-        _run(monkeypatch, "python")
+    assert _exit_message(monkeypatch, "python") == f"{_CORE} is present"
 
 
 def test_rejects_python_walkers_that_were_replaced(
@@ -85,8 +89,21 @@ def test_rejects_python_walkers_that_were_replaced(
 ) -> None:
     _without_core(monkeypatch)
     monkeypatch.setattr(serialize, "to_plain", repr)
-    with pytest.raises(SystemExit, match="does not run its python implementation"):
-        _run(monkeypatch, "python")
+    assert (
+        _exit_message(monkeypatch, "python")
+        == "treekle does not run its python implementation"
+    )
+
+
+def test_rejects_core_walkers_that_were_replaced(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _with_core(monkeypatch)
+    monkeypatch.setattr(deserialize, "from_plain", _plain_only)
+    assert (
+        _exit_message(monkeypatch, "native")
+        == "treekle does not run its native implementation"
+    )
 
 
 def test_rejects_walkers_that_do_not_round_trip(
@@ -95,8 +112,7 @@ def test_rejects_walkers_that_do_not_round_trip(
     _without_core(monkeypatch)
     monkeypatch.setattr(deserialize, "_python_from_plain", _plain_only)
     monkeypatch.setattr(deserialize, "from_plain", _plain_only)
-    with pytest.raises(SystemExit, match="does not round-trip"):
-        _run(monkeypatch, "python")
+    assert _exit_message(monkeypatch, "python") == "a dataclass does not round-trip"
 
 
 def _plain_only(data: object, target: object) -> object:

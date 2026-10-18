@@ -47,10 +47,12 @@ def main() -> int:
         expected = (built.to_plain, built.from_plain)
     else:
         expected = (serialize._python_to_plain, deserialize._python_from_plain)  # noqa: SLF001 -- The Python walker has no public name.
-    actual = (serialize.to_plain, deserialize.from_plain)
-    if any(found is not wanted for found, wanted in zip(actual, expected, strict=True)):
+    # Functions compare by identity, so this asks whether treekle runs them.
+    if (serialize.to_plain, deserialize.from_plain) != expected:
         raise SystemExit(f"treekle does not run its {sys.argv[1]} implementation")
+    # pragma: no mutate start -- any values round-trip; only their shape matters.
     shape = _Shape("square", (_Point(0, 0.0), _Point(1, 0.5)))
+    # pragma: no mutate end
     if deserialize.from_plain(serialize.to_plain(shape), _Shape) != shape:
         raise SystemExit("a dataclass does not round-trip")
     print(f"{sys.argv[1]}: {core.origin if core else serialize.__file__}")
