@@ -240,6 +240,52 @@ fn member_offset(class: *mut ffi::PyTypeObject, name: &Bound<'_, PyString>) -> O
     }
 }
 
+/// Each field slot's member offset in ``kind``, where storing through it is
+/// what ``object.__setattr__`` would do: ``kind`` is a plain-``type`` class
+/// whose ``__setattr__`` is ``object``'s, and the name finds a writable
+/// object member of ``kind``'s own layout. Stamped before it is read.
+fn store_offsets(kind: &B<'_>, info: &DcInfo) -> (Stamp, Vec<Option<isize>>) {
+    let py = kind.py();
+    let stamp = Stamp::always(kind);
+    let class = kind.as_ptr().cast::<ffi::PyTypeObject>();
+    let generic = unsafe {
+        ob_type(kind.as_ptr()) == &raw mut ffi::PyType_Type
+            && (*class).tp_setattro.map(|f| f as usize)
+                == ffi::PyBaseObject_Type.tp_setattro.map(|f| f as usize)
+    };
+    let Some(names) = info.names.as_ref().filter(|_| generic) else {
+        return (stamp, Vec::new());
+    };
+    let offsets = names
+        .iter()
+        .map(|name| {
+            let name = PyString::new(py, std::str::from_utf8(name).ok()?);
+            writable_offset(class, &name)
+        })
+        .collect();
+    (stamp, offsets)
+}
+
+/// The offset of ``name``'s object member, when ``_PyType_Lookup`` finds it
+/// first and it is writable: ``object.__setattr__`` then stores through it.
+fn writable_offset(class: *mut ffi::PyTypeObject, name: &Bound<'_, PyString>) -> Option<isize> {
+    unsafe {
+        let found = _PyType_Lookup(class, name.as_ptr());
+        if found.is_null() || ob_type(found) != &raw mut ffi::PyMemberDescr_Type {
+            return None;
+        }
+        let descriptor = found.cast::<ffi::PyMemberDescrObject>();
+        if ffi::PyType_IsSubtype(class, (*descriptor).d_common.d_type) == 0 {
+            return None;
+        }
+        let member = (*descriptor).d_member.cast::<ffi::PyMemberDef>();
+        if (*member).type_code != ffi::Py_T_OBJECT_EX || (*member).flags & ffi::Py_READONLY != 0 {
+            return None;
+        }
+        Some((*member).offset)
+    }
+}
+
 fn item<'py>(module: &Bound<'py, PyDict>, name: &str) -> PyResult<B<'py>> {
     module
         .get_item(name)?
@@ -384,9 +430,18 @@ struct DcInfo {
     /// an exact str: then an exact str key matches a name exactly when its
     /// bytes do, as the index dict's own lookup would find.
     names: Option<Vec<Box<[u8]>>>,
+    /// ``names`` inverted: each name's slot.
+    slots: HashMap<Box<[u8]>, usize>,
+    /// Slots by name bytes: ``to_plain`` sorts a record's keys by default,
+    /// so a sorted record meets its fields in this order.
+    sorted: Vec<usize>,
     targets: Vec<Py<PyAny>>,
     plans: Vec<RefCell<Option<Rc<Plan>>>>,
     persistent: bool,
+    /// Per field slot, the offset ``object.__setattr__`` writes when it stores
+    /// into an instance of exactly the class these facts were read from;
+    /// filled on first use, ``None`` where only ``setattr`` itself will do.
+    stores: OnceCell<(Stamp, Vec<Option<isize>>)>,
 }
 
 impl DcInfo {
@@ -396,15 +451,19 @@ impl DcInfo {
     /// that name, or names are not all exact strs (the dict decides then).
     fn slot_of(&self, key: &[u8], cursor: &mut usize) -> Option<usize> {
         let names = self.names.as_ref()?;
-        let count = names.len();
-        for step in 0..count {
-            let slot = (*cursor + step) % count;
-            if *names[slot] == *key {
-                *cursor = slot + 1;
-                return Some(slot);
-            }
+        if let Some(&slot) = self.sorted.get(*cursor)
+            && *names[slot] == *key
+        {
+            *cursor += 1;
+            return Some(slot);
         }
-        None
+        let slot = *self.slots.get(key)?;
+        *cursor = self
+            .sorted
+            .iter()
+            .position(|each| *each == slot)
+            .map_or(0, |at| at + 1);
+        Some(slot)
     }
 }
 
@@ -770,9 +829,44 @@ pub struct Decoder<'py, 'g> {
     /// address and held so neither address is reused.
     unread: HashMap<(usize, usize), (B<'py>, B<'py>)>,
     reading: HashSet<usize>,
+    /// How many containers ``quick`` is reading on the Rust stack now.
+    quick_depth: u32,
 }
 
 type Mark = (usize, usize, usize);
+
+/// How deep ``quick`` recurses before handing nodes to the frames, which
+/// keep the Rust stack flat however deep the tree is.
+const QUICK_DEPTH: u32 = 24;
+
+/// What ``start`` would make of an exact dict, judged by its keys alone.
+enum DictShape<'py> {
+    /// Exact str keys, none a tag, reference or escaped key.
+    Plain,
+    /// ``{"py/tuple": payload}``.
+    Tuple(B<'py>),
+    /// Anything else, left to the frames.
+    Other,
+}
+
+fn dict_shape<'py>(dict: &Bound<'py, PyDict>) -> DictShape<'py> {
+    let entries = dict_entries(dict);
+    if let [(key, payload)] = entries.as_slice()
+        && tp(key) == t_str()
+        && utf8(key) == Some(b"py/tuple".as_slice())
+    {
+        return DictShape::Tuple(payload.clone());
+    }
+    for (key, _) in &entries {
+        let Some(text) = (tp(key) == t_str()).then(|| utf8(key)).flatten() else {
+            return DictShape::Other;
+        };
+        if text.starts_with(b"py/") || text.starts_with(b"json://") {
+            return DictShape::Other;
+        }
+    }
+    DictShape::Plain
+}
 
 impl<'py, 'g> Decoder<'py, 'g> {
     // ------------------------------------------------------------ helpers --
@@ -810,6 +904,7 @@ impl<'py, 'g> Decoder<'py, 'g> {
             references: 0,
             unread: HashMap::new(),
             reading: HashSet::new(),
+            quick_depth: 0,
         })
     }
 
@@ -1055,6 +1150,44 @@ impl<'py, 'g> Decoder<'py, 'g> {
         self.b(&self.g.object_setattr)
             .call1((value, name, member))?;
         Ok(())
+    }
+
+    /// ``object.__setattr__(value, name, member)`` for a dataclass field.
+    ///
+    /// When ``value``'s class is exactly ``kind``, which is unchanged since
+    /// ``info.stores`` was read, uses ``object``'s ``__setattr__``, and finds a
+    /// plain object slot for the field, the store is that slot's write:
+    /// ``PyMember_SetOne`` for ``Py_T_OBJECT_EX`` swaps the pointer.
+    fn store(
+        &self,
+        info: &DcInfo,
+        kind: &B<'py>,
+        value: &B<'py>,
+        slot: usize,
+        name: &B<'py>,
+        member: &B<'py>,
+    ) -> PyResult<()> {
+        if tp(value) == kind.as_ptr().cast() {
+            let (stamp, offsets) = info.stores.get_or_init(|| store_offsets(kind, info));
+            if stamp.holds(kind)
+                && let Some(Some(offset)) = offsets.get(slot)
+            {
+                unsafe {
+                    let field = value
+                        .as_ptr()
+                        .cast::<u8>()
+                        .offset(*offset)
+                        .cast::<*mut ffi::PyObject>();
+                    let old = *field;
+                    *field = member.clone().into_ptr();
+                    if !old.is_null() {
+                        ffi::Py_DECREF(old);
+                    }
+                }
+                return Ok(());
+            }
+        }
+        self.setattr(value, name, member)
     }
 
     fn allocate(&self, kind: &B<'py>) -> PyResult<B<'py>> {
@@ -1335,14 +1468,27 @@ impl<'py, 'g> Decoder<'py, 'g> {
         }
         // A repeated name keeps only its last slot in ``index``.
         let names = names.filter(|names| names.len() == index.len());
+        let slots = names
+            .iter()
+            .flatten()
+            .enumerate()
+            .map(|(slot, name)| (name.clone(), slot))
+            .collect();
+        let mut sorted: Vec<usize> = (0..names.as_ref().map_or(0, Vec::len)).collect();
+        if let Some(names) = &names {
+            sorted.sort_by(|a, b| names[*a].cmp(&names[*b]));
+        }
         let persistent = self.b(&g.field_types_cache).contains(target)?;
         let plans = (0..targets.len()).map(|_| RefCell::new(None)).collect();
         let info = Rc::new(DcInfo {
             index: index.unbind(),
             names,
+            slots,
+            sorted,
             targets,
             plans,
             persistent,
+            stores: OnceCell::new(),
         });
         if persistent && plan.persistent {
             let _ = plan.info.set(info.clone());
@@ -1405,6 +1551,9 @@ impl<'py, 'g> Decoder<'py, 'g> {
         let persistent =
             kind.is(self.b(&self.g.union_type)) || kind.is(self.b(&self.g.generic_alias));
         let plan = self.plan_for(target, persistent)?;
+        if let Some(value) = self.quick(data, target, &plan, Loc::At(ROOT))? {
+            return Ok(value);
+        }
         self.walk(data, target, &plan, Loc::At(ROOT))
     }
 
@@ -1579,6 +1728,15 @@ impl<'py, 'g> Decoder<'py, 'g> {
         plan: &Rc<Plan>,
         at: Loc<'_, 'py>,
     ) -> DR<Start<'py>> {
+        match self.quick(raw, target, plan, at) {
+            Ok(Some(value)) => return Ok(Start::Value(value)),
+            Ok(None) => {}
+            Err(error) if self.is_read(&error) => {
+                let reason = self.message(&error)?;
+                return Ok(Start::Value(self.invalid(raw, &reason, at)?));
+            }
+            Err(error) => return Err(error),
+        }
         match self.start(raw, target, plan, at) {
             Err(error) if self.is_read(&error) => {
                 let reason = self.message(&error)?;
@@ -1817,6 +1975,393 @@ impl<'py, 'g> Decoder<'py, 'g> {
             Tag::Reduce => return self.decode_reduce(data, target, plan, at),
         };
         Ok(Start::Value(value))
+    }
+
+    // -------------------------------------------------------------- quick --
+
+    // The frames exist so a tree of any depth reads with a flat Rust stack.
+    // Most trees are shallow and regular, so ``quick`` reads the common nodes
+    // by recursion instead, taking each step ``start`` and the frames would
+    // take, in the same order. It answers ``None`` before any effect for a
+    // node it does not read that way; past that point every part reads as
+    // ``_start_part`` would, through ``part``.
+    /// A node read at once, recursively, else ``None`` for the frames.
+    fn quick(
+        &mut self,
+        raw: &B<'py>,
+        target: &B<'py>,
+        plan: &Rc<Plan>,
+        at: Loc<'_, 'py>,
+    ) -> DR<Option<B<'py>>> {
+        let kind = tp(raw);
+        let object = plan.is_object && target.is(self.b(&self.g.object));
+        if is_leaf_kind(kind) {
+            let own = target.as_ptr() == kind.cast::<ffi::PyObject>();
+            return Ok((own || object).then(|| raw.clone()));
+        }
+        // ``start`` refuses a container already being read only after
+        // starting it; the frames reproduce that.
+        if self.quick_depth >= QUICK_DEPTH || self.reading.contains(&(raw.as_ptr() as usize)) {
+            return Ok(None);
+        }
+        if kind == t_dict() {
+            let dict = unsafe { raw.cast_unchecked::<PyDict>() }.clone();
+            if object {
+                if self.untagged {
+                    return Ok(None);
+                }
+                let any = self.object_plan.clone();
+                return match dict_shape(&dict) {
+                    DictShape::Plain => {
+                        let pair = (target.clone(), any);
+                        self.quick_entries(raw, &dict, pair.clone(), pair, at)
+                    }
+                    DictShape::Tuple(payload) => {
+                        self.quick_tuple(raw, &payload, target, &any, false, at)
+                    }
+                    DictShape::Other => Ok(None),
+                };
+            }
+            if plan.resolved.is_some() {
+                return Ok(None);
+            }
+            if plan.kind == Kind::Object && plan.is_dataclass && is_class(target) {
+                return self.quick_record(raw, &dict, target, plan, at);
+            }
+            return match (plan.kind, dict_shape(&dict)) {
+                (Kind::Dict, DictShape::Plain) => {
+                    let args = plan.args.bind(self.py).clone();
+                    let (key, value) = if args.len() == 2 {
+                        let (key, value) = (args.get_item(0)?, args.get_item(1)?);
+                        let key_plan = self.plan_for(&key, plan.persistent)?;
+                        let value_plan = self.plan_for(&value, plan.persistent)?;
+                        ((key, key_plan), (value, value_plan))
+                    } else {
+                        let any = (self.b(&self.g.object).clone(), self.object_plan.clone());
+                        (any.clone(), any)
+                    };
+                    self.quick_entries(raw, &dict, key, value, at)
+                }
+                (Kind::Tuple, DictShape::Tuple(payload)) => {
+                    self.quick_tuple(raw, &payload, target, plan, true, at)
+                }
+                _ => Ok(None),
+            };
+        }
+        if kind == t_list() {
+            if object {
+                if self.untagged {
+                    return Ok(None);
+                }
+                let any = self.object_plan.clone();
+                return self.quick_items(raw, target, &any, at);
+            }
+            if plan.resolved.is_some() {
+                return Ok(None);
+            }
+            return match plan.kind {
+                Kind::List => {
+                    let (item, item_plan) = self.element(plan)?;
+                    self.quick_items(raw, &item, &item_plan, at)
+                }
+                Kind::Tuple => self.quick_tuple(raw, raw, target, plan, false, at),
+                _ => Ok(None),
+            };
+        }
+        Ok(None)
+    }
+
+    /// ``_start_part``, run to its value: a part that does not read is
+    /// recorded and becomes its ``Invalid``.
+    fn part(
+        &mut self,
+        raw: &B<'py>,
+        target: &B<'py>,
+        plan: &Rc<Plan>,
+        at: Loc<'_, 'py>,
+    ) -> DR<B<'py>> {
+        let read = match self.quick(raw, target, plan, at) {
+            Ok(Some(value)) => return Ok(value),
+            Ok(None) => self.walk(raw, target, plan, at),
+            Err(error) => Err(error),
+        };
+        match read {
+            Err(error) if self.is_read(&error) => {
+                let reason = self.message(&error)?;
+                self.invalid(raw, &reason, at)
+            }
+            read => read,
+        }
+    }
+
+    #[inline]
+    fn enter(&mut self, raw: &B<'py>) {
+        self.reading.insert(raw.as_ptr() as usize);
+        self.quick_depth += 1;
+    }
+
+    #[inline]
+    fn leave(&mut self, raw: &B<'py>) {
+        self.reading.remove(&(raw.as_ptr() as usize));
+        self.quick_depth -= 1;
+    }
+
+    /// ``decode_exact_object`` and the ``_Object`` frame it starts, at once.
+    fn quick_record(
+        &mut self,
+        raw: &B<'py>,
+        dict: &Bound<'py, PyDict>,
+        target: &B<'py>,
+        plan: &Rc<Plan>,
+        at: Loc<'_, 'py>,
+    ) -> DR<Option<B<'py>>> {
+        let py = self.py;
+        if !matches!(self.allow_imports, Flag::Known(_)) {
+            return Ok(None);
+        }
+        let info = self.dc_info(target, plan)?;
+        if info.names.is_none() {
+            return Ok(None);
+        }
+        let own = plan
+            .import_name
+            .as_ref()
+            .expect("classes have import names")
+            .bind(py);
+        let Some(own) = (tp(own) == t_str()).then(|| utf8(own)).flatten() else {
+            return Ok(None);
+        };
+        let mut entries = Vec::with_capacity(dict.len());
+        let mut stored = false;
+        let mut cursor = 0;
+        for (key, value) in dict_entries(dict) {
+            let Some(text) = (tp(&key) == t_str()).then(|| utf8(&key)).flatten() else {
+                return Ok(None);
+            };
+            if text == b"py/object" {
+                if (tp(&value) == t_str()).then(|| utf8(&value)).flatten() != Some(own) {
+                    return Ok(None);
+                }
+                stored = true;
+                continue;
+            }
+            match info.slot_of(text, &mut cursor) {
+                Some(slot) => entries.push((key, value, slot)),
+                None => return Ok(None),
+            }
+        }
+        let position = self.built.len();
+        let frame = self.frame(at)?;
+        let reserved = if stored {
+            self.allocate(target)?
+        } else {
+            self.pending()
+        };
+        self.place(frame, &reserved)?;
+        let before = self.bad_len();
+        self.enter(raw);
+        let built = match self.quick_fields(&info, frame, entries) {
+            Ok(members) => self.build_object(
+                frame, &info, target, stored, reserved, position, before, members,
+            ),
+            Err(error) => Err(error),
+        };
+        self.leave(raw);
+        built.map(Some)
+    }
+
+    /// The ``_Object`` frame's ``step``: each field read as its declared type.
+    #[allow(clippy::type_complexity)]
+    fn quick_fields(
+        &mut self,
+        info: &DcInfo,
+        frame: u32,
+        entries: Vec<(B<'py>, B<'py>, usize)>,
+    ) -> DR<Vec<(B<'py>, B<'py>, usize)>> {
+        let object = self.b(&self.g.object).clone();
+        let mut members = Vec::with_capacity(entries.len());
+        for (name, raw, slot) in entries {
+            let target = info.targets[slot].bind(self.py).clone();
+            if is_leaf_kind(tp(&raw)) && target.is(&object) {
+                members.push((name, raw, slot));
+                continue;
+            }
+            let plan = self.field_plan(info, slot)?;
+            let member = self.part(&raw, &target, &plan, Loc::Child(frame, StepRef::Key(&name)))?;
+            members.push((name, member, slot));
+        }
+        Ok(members)
+    }
+
+    /// ``decode_items`` and its list's frame, at once.
+    fn quick_items(
+        &mut self,
+        raw: &B<'py>,
+        item: &B<'py>,
+        plan: &Rc<Plan>,
+        at: Loc<'_, 'py>,
+    ) -> DR<Option<B<'py>>> {
+        let py = self.py;
+        let frame = self.frame(at)?;
+        if item.is(self.b(&self.g.object)) && self.all_leaves(raw)? {
+            let leaves =
+                unsafe { Bound::from_owned_ptr_or_err(py, ffi::PySequence_List(raw.as_ptr()))? };
+            self.place(frame, &leaves)?;
+            return Ok(Some(leaves));
+        }
+        let result = PyList::empty(py);
+        self.place(frame, result.as_any())?;
+        let mut built = Built::List(result.clone());
+        let types = Types::Repeat(item.clone(), plan.clone());
+        self.enter(raw);
+        let read = self.quick_seq(raw, frame, &types, &mut built);
+        self.leave(raw);
+        read.map(|()| Some(result.into_any()))
+    }
+
+    /// ``decode_tuple`` and its frame, at once, checked against ``target``
+    /// when a tag decoded it.
+    fn quick_tuple(
+        &mut self,
+        raw: &B<'py>,
+        payload: &B<'py>,
+        target: &B<'py>,
+        plan: &Rc<Plan>,
+        check: bool,
+        at: Loc<'_, 'py>,
+    ) -> DR<Option<B<'py>>> {
+        let py = self.py;
+        let kind = tp(payload);
+        if kind != t_list() && kind != t_tuple() {
+            return Ok(None);
+        }
+        let args = plan.args.bind(py).clone();
+        let types = if !plan.origin_is_tuple {
+            let (item, item_plan) = self.element(plan)?;
+            Types::Repeat(item, item_plan)
+        } else if args.len() == 2 && args.get_item(1)?.is(py.Ellipsis()) {
+            let first = args.get_item(0)?;
+            let first_plan = self.plan_for(&first, plan.persistent)?;
+            Types::Repeat(first, first_plan)
+        } else {
+            if args.len() != payload.len()? {
+                return Ok(None);
+            }
+            Types::Fixed(args, plan.persistent)
+        };
+        let frame = self.frame(at)?;
+        let mut built = Built::Tuple(Vec::new());
+        self.enter(raw);
+        let read = self.quick_seq(payload, frame, &types, &mut built);
+        self.leave(raw);
+        read?;
+        let Built::Tuple(values) = built else {
+            unreachable!("a tuple's items");
+        };
+        let value = PyTuple::new(py, values)?.into_any();
+        if check && !self.fits(&value, target, plan)? {
+            return fail(format!(
+                "cannot read {} as {}",
+                self.shown(&value)?,
+                self.target_text(target)?
+            ));
+        }
+        Ok(Some(value))
+    }
+
+    /// The ``_Items`` frame's ``step``, run to the end.
+    fn quick_seq(
+        &mut self,
+        data: &B<'py>,
+        frame: u32,
+        types: &Types<'py>,
+        built: &mut Built<'py>,
+    ) -> DR<()> {
+        let object = self.b(&self.g.object).clone();
+        let mut raws = SeqItems::new(data)?;
+        let mut index = 0;
+        while let Some(raw) = raws.next_item()? {
+            let here = index;
+            let fixed: (B<'py>, Rc<Plan>);
+            let (target, plan) = match types {
+                Types::Repeat(target, plan) => (target, plan),
+                Types::Fixed(types, persistent) => {
+                    if here >= types.len() {
+                        break;
+                    }
+                    let target = types.get_item(here)?;
+                    let plan = self.plan_for(&target, *persistent)?;
+                    fixed = (target, plan);
+                    (&fixed.0, &fixed.1)
+                }
+            };
+            index += 1;
+            if is_leaf_kind(tp(&raw)) && target.is(&object) {
+                self.put(built, raw)?;
+                continue;
+            }
+            let value = self.part(&raw, target, plan, Loc::Child(frame, StepRef::Index(here)))?;
+            self.put(built, value)?;
+        }
+        Ok(())
+    }
+
+    /// ``decode_entries_typed`` and its frame, at once.
+    fn quick_entries(
+        &mut self,
+        raw: &B<'py>,
+        dict: &Bound<'py, PyDict>,
+        key: (B<'py>, Rc<Plan>),
+        value: (B<'py>, Rc<Plan>),
+        at: Loc<'_, 'py>,
+    ) -> DR<Option<B<'py>>> {
+        let plain_keys = key.1.is_object || key.0.is(self.b(&self.g.str_type));
+        if !plain_keys {
+            return Ok(None);
+        }
+        let frame = self.frame(at)?;
+        let result = PyDict::new(self.py);
+        self.place(frame, result.as_any())?;
+        self.enter(raw);
+        let read = self.quick_pairs(dict, frame, &key, &value, &result);
+        self.leave(raw);
+        read.map(|()| Some(result.into_any()))
+    }
+
+    /// The ``_Entries`` frame's ``step``, run to the end.
+    fn quick_pairs(
+        &mut self,
+        dict: &Bound<'py, PyDict>,
+        frame: u32,
+        key: &(B<'py>, Rc<Plan>),
+        value: &(B<'py>, Rc<Plan>),
+        result: &Bound<'py, PyDict>,
+    ) -> DR<()> {
+        let object = self.b(&self.g.object).clone();
+        let mut items = DictItems::new(dict)?;
+        while let Some((name, raw)) = items.next_item()? {
+            let here = Loc::Child(frame, StepRef::Key(&name));
+            let decoded = if tp(&name) == t_str() && !str_starts(&name, "json://")? {
+                name.clone()
+            } else {
+                match self.decode_key(&name, &key.0, &key.1, here) {
+                    Ok(decoded) => decoded,
+                    Err(error) if self.is_read(&error) => {
+                        let reason = self.message(&error)?;
+                        self.invalid(&name, &reason, here)?;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
+            };
+            if is_leaf_kind(tp(&raw)) && value.0.is(&object) {
+                result.set_item(decoded, raw)?;
+                continue;
+            }
+            let member = self.part(&raw, &value.0, &value.1, here)?;
+            result.set_item(decoded, member)?;
+        }
+        Ok(())
     }
 
     // ------------------------------------------------------------- frames --
@@ -2233,6 +2778,7 @@ impl<'py, 'g> Decoder<'py, 'g> {
             Body::Entries { result, .. } => Ok(result.into_any()),
             Body::Fields { members, .. } => Ok(members.into_any()),
             Body::Object {
+                info,
                 target,
                 stored,
                 value,
@@ -2240,7 +2786,7 @@ impl<'py, 'g> Decoder<'py, 'g> {
                 before,
                 members,
                 ..
-            } => self.build_object(at, &target, stored, value, index, before, members),
+            } => self.build_object(at, &info, &target, stored, value, index, before, members),
             Body::Stored { value, members, .. } => {
                 for (attribute, member) in members {
                     self.setattr(&value, &attribute, &member)?;
@@ -3396,6 +3942,7 @@ impl<'py, 'g> Decoder<'py, 'g> {
     fn build_object(
         &mut self,
         at: u32,
+        info: &DcInfo,
         target: &B<'py>,
         stored: bool,
         reserved: B<'py>,
@@ -3411,10 +3958,11 @@ impl<'py, 'g> Decoder<'py, 'g> {
                 self.allocate(target)?
             };
             let rest = if self.declares_exactly(target, &members) {
-                members
-                    .into_iter()
-                    .map(|(key, member, _)| (key, member))
-                    .collect()
+                for (key, member, slot) in &members {
+                    self.store(info, target, &value, *slot, key, member)?;
+                }
+                self.replace(position, at, &value)?;
+                return Ok(value);
             } else {
                 self.with_defaults(members, target)?
             };
@@ -3855,27 +4403,9 @@ impl<'py, 'g> Decoder<'py, 'g> {
         self.decode_items(data, &target, &object, at)
     }
 
-    /// ``_decode_union``: the member the data's kind selects, else the first that fits.
-    fn decode_union(
-        &mut self,
-        data: &B<'py>,
-        target: &B<'py>,
-        plan: &Rc<Plan>,
-        at: Loc<'_, 'py>,
-    ) -> DR<Start<'py>> {
+    /// The order ``_decode_union`` tries ``plan``'s members in for ``data``.
+    fn union_members(&mut self, data: &B<'py>, plan: &Rc<Plan>) -> DR<Vec<usize>> {
         let py = self.py;
-        // Each member a parent union tries reaches this node again; remembering
-        // the failure keeps nested unions linear instead of exponential in
-        // depth. A read that resolved a reference may succeed elsewhere, where
-        // it names another value, so it is never remembered.
-        let key = (data.as_ptr() as usize, target.as_ptr() as usize);
-        if self.unread.contains_key(&key) {
-            return fail(format!(
-                "cannot read {} as {}",
-                self.shown(data)?,
-                self.target_text(target)?
-            ));
-        }
         let members = plan.args.bind(py).clone();
         let info = plan.union.as_ref().expect("unions compile their members");
         let tagged = self.is_mapping(data)? && self.has_tag_key(data)?;
@@ -3926,6 +4456,30 @@ impl<'py, 'g> Decoder<'py, 'g> {
                 None => self.union_order(data, &members)?,
             }
         };
+        Ok(order)
+    }
+
+    /// ``_decode_union``: the member the data's kind selects, else the first that fits.
+    fn decode_union(
+        &mut self,
+        data: &B<'py>,
+        target: &B<'py>,
+        plan: &Rc<Plan>,
+        at: Loc<'_, 'py>,
+    ) -> DR<Start<'py>> {
+        // Each member a parent union tries reaches this node again; remembering
+        // the failure keeps nested unions linear instead of exponential in
+        // depth. A read that resolved a reference may succeed elsewhere, where
+        // it names another value, so it is never remembered.
+        let key = (data.as_ptr() as usize, target.as_ptr() as usize);
+        if self.unread.contains_key(&key) {
+            return fail(format!(
+                "cannot read {} as {}",
+                self.shown(data)?,
+                self.target_text(target)?
+            ));
+        }
+        let order = self.union_members(data, plan)?;
         let frame = self.frame(at)?;
         let mark = self.mark();
         Ok(Start::Frame(Frame::new(

@@ -135,56 +135,72 @@ def test_every_library_round_trips_the_analogue(
     assert "skipped broken: exp000 raised" in out
     encode, rest = out.split("**Decode (analogue)**")
     decode, summary = rest.split("**Summary**")
-    header = "| config | msgspec | msgspec-dataclass | treekle-rust | treekle-python | pickle | jsonpickle | msgspec-dataclass vs msgspec | treekle-rust vs msgspec | treekle-python vs msgspec | pickle vs msgspec | jsonpickle vs msgspec |"
-    assert header in encode
-    assert header in decode
-    toy = next(line for line in decode.splitlines() if line.startswith("| toy |"))
+    header = [
+        "config",
+        "msgspec",
+        "msgspec-dataclass",
+        "treekle-rust",
+        "treekle-python",
+        "pickle",
+        "jsonpickle",
+        "msgspec-dataclass vs msgspec",
+        "treekle-rust vs msgspec",
+        "treekle-python vs msgspec",
+        "pickle vs msgspec",
+        "jsonpickle vs msgspec",
+    ]
+    assert _rows(encode)[0] == header
+    assert _rows(decode)[0] == header
+    decoded = {row[0]: row for row in _rows(decode)}
     # Without tags, a dataclass among dicts under ``object`` decodes as a dict.
-    assert toy.count("❌") == 2
-    assert toy.split(" | ")[2] == "❌"
-    assert toy.endswith("% |")
-    nan = next(line for line in decode.splitlines() if line.startswith("| nan |"))
+    assert decoded["toy"].count("❌") == 2
+    assert decoded["toy"][2] == "❌"
     # The msgspec stand-ins hand back the same float object, which equals itself.
-    assert nan.count("❌") == 8
-    twins = next(line for line in decode.splitlines() if line.startswith("| twins |"))
-    assert twins.count("❌") == 2
-    assert twins.split(" | ")[2] == "❌"
-    total = next(line for line in decode.splitlines() if "**total**" in line)
-    assert total.count("❌") == 10
+    assert decoded["nan"].count("❌") == 8
+    assert decoded["twins"].count("❌") == 2
+    assert decoded["twins"][2] == "❌"
+    assert decoded["**total**"].count("❌") == 10
     assert "❌" not in encode
-    assert (
-        "| library | encode (ms) | encode (%) | decode (ms) | decode (%) |" in summary
-    )
-    rows = {
-        line.split(" | ")[0]: line
-        for line in summary.splitlines()
-        if line.startswith("| ")
-    }
-    assert rows["| msgspec"].split(" | ")[2] == "+0%"
-    assert rows["| msgspec"].endswith("| +0% |")
-    assert rows["| pickle"].endswith("| ❌ | ❌ |")
-    assert rows["| pickle"].count("%") == 1
+    table = _rows(summary)
+    assert table[0] == [
+        "library",
+        "encode (ms)",
+        "encode (×)",
+        "decode (ms)",
+        "decode (×)",
+    ]
+    rows = {row[0]: row for row in table}
+    assert rows["msgspec"][2] == "1.0"
+    assert rows["msgspec"][4] == "1.0"
+    assert rows["pickle"][3:] == ["❌", "❌"]
+    assert rows["pickle"][2].replace(".", "").isdigit()
     # Rows run fastest encode first, by the totals the encode table prints.
-    totals = next(line for line in encode.splitlines() if "**total**" in line)
-    names = [str(name) for name in header.split(" | ")[1:7]]
-    by_name = dict(zip(names, totals.split(" | ")[1:7], strict=True))
-    order = [line.split(" | ")[0].removeprefix("| ") for line in summary.splitlines()]
-    order = [name for name in order if name in by_name]
+    by_name = dict(zip(header[1:7], _rows(encode)[-1][1:7], strict=True))
+    order = [row[0] for row in table[1:]]
     assert len(order) == 6
     assert [float(by_name[name]) for name in order] == sorted(
         float(by_name[name]) for name in order
     )
+    # Every line of a table is as wide as its header, so the raw text aligns.
+    for block in (encode, decode, summary):
+        lines = [line for line in block.splitlines() if line.startswith("|")]
+        assert len({len(line) for line in lines}) == 1
 
 
-def test_without_msgspec_the_tables_have_no_percent_columns(
+def test_without_msgspec_the_tables_have_no_ratio_columns(
     bench: Callable[..., None],
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     bench("treekle-rust", "pickle")
     out = capsys.readouterr().out
-    assert "| config | treekle-rust | pickle |\n" in out
-    assert "| library | encode (ms) | decode (ms) |\n" in out
-    assert "%" not in out
+    tables = [rows for block in out.split("**") if (rows := _rows(block))]
+    assert [rows[0] for rows in tables] == [
+        ["config", "treekle-rust", "pickle"],
+        ["config", "treekle-rust", "pickle"],
+        ["library", "encode (ms)", "decode (ms)"],
+    ]
+    assert "(×)" not in out
+    assert "vs msgspec" not in out
 
 
 def test_the_flags_default_to_every_library_on_installed_priml() -> None:
@@ -215,6 +231,15 @@ def test_treekle_decodes_into_the_analogue_type() -> None:
     assert decode() == "3"
     assert calls == [("3", int, True)]
     assert check(3)
+
+
+def _rows(block: str) -> list[list[str]]:
+    """Return the cells of each line of a markdown table, the rule left out."""
+    return [
+        [cell.strip() for cell in line.strip("|").split("|")]
+        for line in block.splitlines()
+        if line.startswith("|") and not line.startswith("|-")
+    ]
 
 
 def _fake_jsonpickle() -> SimpleNamespace:

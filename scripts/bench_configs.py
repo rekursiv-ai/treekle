@@ -167,7 +167,7 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
         nargs="+",
         choices=list(_CODECS),
         default=list(_CODECS),
-        help="Libraries to time; percent columns are relative to msgspec.",
+        help="Libraries to time; ratio columns are relative to msgspec.",
     )
     parser.add_argument(
         "--budget-sec",
@@ -352,19 +352,16 @@ def _render(
 ) -> str:
     """Render one markdown table: microseconds, then each time vs msgspec's."""
     relative = [n for n in names if n != "msgspec"] if "msgspec" in names else []
-    header = [*names, *(f"{name} vs msgspec" for name in relative)]
-    lines = [
-        f"**{title}** (µs per call)\n",
-        "| config | " + " | ".join(header) + " |",
-        "|---|" + "---:|" * len(header),
-    ]
-    for label, row in cells.items():
-        values = [_cell(row[n], "{:.1f}") for n in names]
-        percents = [
-            _cell(_slower(row[n], row["msgspec"]), "{:+.0f}%") for n in relative
+    header = ["config", *names, *(f"{name} vs msgspec" for name in relative)]
+    rows = [
+        [
+            label,
+            *(_cell(row[n], "{:.1f}") for n in names),
+            *(_cell(_ratio(row[n], row["msgspec"]), "{:.1f}") for n in relative),
         ]
-        lines.append(f"| {label} | " + " | ".join([*values, *percents]) + " |")
-    return "\n".join(lines) + "\n"
+        for label, row in cells.items()
+    ]
+    return f"**{title}** (µs per call)\n\n" + _table(header, rows)
 
 
 def _summary(
@@ -376,33 +373,53 @@ def _summary(
     """Render the totals: one row per library, with each time vs msgspec's."""
     base = "msgspec" in names
     header = (
-        ["encode (ms)", "encode (%)", "decode (ms)", "decode (%)"]
+        ["library", "encode (ms)", "encode (×)", "decode (ms)", "decode (×)"]
         if base
-        else ["encode (ms)", "decode (ms)"]
+        else ["library", "encode (ms)", "decode (ms)"]
     )
-    lines = [
-        "**Summary** (total ms over every config)\n",
-        "| library | " + " | ".join(header) + " |",
-        "|---|" + "---:|" * len(header),
-    ]
     totals = [encode["**total**"], decode["**total**"]]
     fastest = sorted(names, key=lambda name: totals[0][name] or float("inf"))
+    rows: list[list[str]] = []
     for name in fastest:
-        values: list[str] = []
+        row = [name]
         for total in totals:
             us = total[name]
-            values.append(_cell(None if us is None else us / 1000, "{:.2f}"))
+            row.append(_cell(None if us is None else us / 1000, "{:.2f}"))
             if base:
-                values.append(_cell(_slower(total[name], total["msgspec"]), "{:+.0f}%"))
-        lines.append(f"| {name} | " + " | ".join(values) + " |")
-    return "\n".join(lines) + "\n"
+                row.append(_cell(_ratio(total[name], total["msgspec"]), "{:.1f}"))
+        rows.append(row)
+    return "**Summary** (total ms over every config)\n\n" + _table(header, rows)
 
 
-def _slower(value: float | None, base: float | None) -> float | None:
-    """Return how much longer ``value`` takes than ``base``, in percent."""
+# The first column is left-aligned and the rest, numbers, right-aligned; each column is
+# as wide as its widest cell.
+def _table(header: list[str], rows: list[list[str]]) -> str:
+    """Render a markdown table padded to read aligned as raw text."""
+    widths = [max(map(len, column)) for column in zip(header, *rows, strict=True)]
+
+    def line(cells: list[str]) -> str:
+        padded = [
+            cell.ljust(width) if index == 0 else cell.rjust(width)
+            for index, (cell, width) in enumerate(zip(cells, widths, strict=True))
+        ]
+        return "| " + " | ".join(padded) + " |"
+
+    rule = (
+        "|"
+        + "|".join(
+            "-" * (width + 2) if index == 0 else "-" * (width + 1) + ":"
+            for index, width in enumerate(widths)
+        )
+        + "|"
+    )
+    return "\n".join([line(header), rule, *map(line, rows)]) + "\n"
+
+
+def _ratio(value: float | None, base: float | None) -> float | None:
+    """Return how many times ``base`` ``value`` takes."""
     if value is None or base is None or base == 0:
         return None
-    return 100 * (value / base - 1)
+    return value / base
 
 
 def _cell(value: float | None, spec: str) -> str:

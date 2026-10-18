@@ -348,16 +348,16 @@ type.
 
 Times are totals over the `exp000` config of each of 43
 [priml](https://github.com/rekursiv-ai/priml) baselines, in ms, with each
-library's time as a percent more than msgspec's:
+library's time as a multiple of msgspec's:
 
-| library | encode (ms) | encode (%) | decode (ms) | decode (%) |
-|---|---:|---:|---:|---:|
-| msgspec | 0.50 | +0% | 0.15 | +0% |
-| msgspec-dataclass | 0.50 | +1% | ❌ | ❌ |
-| treekle-rust | 0.63 | +27% | 0.86 | +493% |
-| pickle | 2.32 | +369% | 0.95 | +555% |
-| treekle-python | 3.68 | +641% | 14.32 | +9787% |
-| jsonpickle | 20.61 | +4057% | 10.18 | +6930% |
+| library           | encode (ms) | encode (×) | decode (ms) | decode (×) |
+|-------------------|------------:|-----------:|------------:|-----------:|
+| msgspec           |        0.47 |        1.0 |        0.14 |        1.0 |
+| msgspec-dataclass |        0.48 |        1.0 |          ❌ |         ❌ |
+| treekle-rust      |        0.60 |        1.3 |        0.56 |        3.9 |
+| pickle            |        2.27 |        4.8 |        0.92 |        6.5 |
+| treekle-python    |        3.51 |        7.4 |       13.86 |       97.5 |
+| jsonpickle        |       19.44 |       41.1 |       10.02 |       70.5 |
 
 - **encode:** each library on the config itself. msgspec is given
   `enc_hook=repr`, its only way past the callables a config holds, and writes
