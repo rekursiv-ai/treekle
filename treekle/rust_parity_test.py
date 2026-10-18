@@ -32,6 +32,7 @@ from zoneinfo import ZoneInfo
 
 import datetime as dt
 import gc
+import importlib
 import inspect
 import math
 import os
@@ -62,6 +63,15 @@ needs_rust = pytest.mark.skipif(
     or deserialize.from_plain is deserialize._python_from_plain,
     reason="the Rust core is not built, or TREEKLE_PURE_PYTHON is set",
 )
+
+
+class _Core(Protocol):
+    def setup_decode(self, module: dict[str, object], /) -> None: ...
+
+
+def _core() -> _Core:
+    """Import the built core by name; CI type-checks without building it."""
+    return cast("_Core", importlib.import_module("treekle._rust"))
 
 
 class Color(Enum):
@@ -1866,7 +1876,7 @@ def test_a_cycle_is_refused_after_its_container_is_numbered() -> None:
 def test_a_nested_union_reads_its_innermost_node_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from treekle import _rust  # noqa: PLC0415 -- Absent in a pure-Python run.
+    _rust = _core()
 
     depth = 12
     data: object = "bad"
@@ -1904,7 +1914,7 @@ def test_a_nested_union_reads_its_innermost_node_once(
 def test_repeated_top_level_union_reuses_its_plan(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from treekle import _rust  # noqa: PLC0415 -- Absent in a pure-Python run.
+    _rust = _core()
 
     original = deserialize._union_candidates
     calls = 0
@@ -1984,7 +1994,7 @@ def _nested_dataclass(module: ModuleType, **annotations: object) -> type[object]
 def test_a_nested_dataclass_keeps_its_field_types_across_reads(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from treekle import _rust  # noqa: PLC0415 -- Absent in a pure-Python run.
+    _rust = _core()
 
     module = ModuleType("treekle_parity_nested")
     monkeypatch.setitem(sys.modules, module.__name__, module)

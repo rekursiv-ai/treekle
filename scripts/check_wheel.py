@@ -10,7 +10,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from importlib import util
+from typing import Protocol, cast
 
+import importlib
 import sys
 
 from treekle import deserialize, serialize
@@ -39,9 +41,10 @@ def main() -> int:
     if native != (core is not None):
         raise SystemExit(f"treekle._rust is {'missing' if native else 'present'}")
     if native:
-        from treekle import _rust  # noqa: PLC0415 -- Only a native wheel has it.
-
-        expected = (_rust.to_plain, _rust.from_plain)
+        # Imported by name: a checkout that never built the core has only its
+        # stub, which a static import reports as missing source.
+        built = cast("_Core", importlib.import_module("treekle._rust"))
+        expected = (built.to_plain, built.from_plain)
     else:
         expected = (serialize._python_to_plain, deserialize._python_from_plain)  # noqa: SLF001 -- The Python walker has no public name.
     actual = (serialize.to_plain, deserialize.from_plain)
@@ -52,6 +55,11 @@ def main() -> int:
         raise SystemExit("a dataclass does not round-trip")
     print(f"{sys.argv[1]}: {core.origin if core else serialize.__file__}")
     return 0
+
+
+class _Core(Protocol):
+    to_plain: object
+    from_plain: object
 
 
 @dataclass(
