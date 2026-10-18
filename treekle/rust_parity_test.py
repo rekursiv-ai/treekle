@@ -40,6 +40,7 @@ import subprocess
 import sys
 import textwrap
 import threading
+import tracemalloc
 import weakref
 
 import pytest
@@ -1957,6 +1958,26 @@ def test_nonclass_type_plan_does_not_keep_its_target_alive() -> None:
     del target
     gc.collect()
     assert weak() is None
+
+
+@needs_rust
+def test_a_dead_targets_plan_leaves_the_cache() -> None:
+    # ``list[int]`` is a new alias each time it is written, so a caller that
+    # writes it in place plans a new target on every call. The cache kept each
+    # dead target's entry until it filled, so memory grew with the number of
+    # calls rather than with the targets still alive.
+    _core().setup_decode(deserialize.__dict__)
+    targets = [list[int] for _ in range(500)]
+    gc.collect()
+    tracemalloc.start()
+    try:
+        while targets:
+            assert deserialize.from_plain([1], targets.pop()) == [1]
+        gc.collect()
+        kept, _ = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert kept < 4_096
 
 
 @needs_rust

@@ -6,6 +6,7 @@
 
 use std::cell::{OnceCell, RefCell};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use hashbrown::{HashMap, HashSet};
 use pyo3::exceptions::{
@@ -15,7 +16,8 @@ use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
 use pyo3::types::{
-    PyDict, PyFrozenSet, PyIterator, PyList, PySet, PyString, PyTuple, PyWeakrefReference,
+    PyCFunction, PyDict, PyFrozenSet, PyIterator, PyList, PySet, PyString, PyTuple,
+    PyWeakrefReference,
 };
 
 use crate::common::*;
@@ -732,6 +734,25 @@ static CACHES: GilCell<Option<Caches>> = GilCell::new(None);
 const CLASS_LIMIT: usize = 1 << 14;
 const OBJECT_LIMIT: usize = 1 << 10;
 
+/// How many cached targets have died since the maps were last swept, counted
+/// by the callback on each entry's weak reference. ``list[str]`` is a new
+/// alias each time it is written, so a caller writing it in place leaves a
+/// dead entry per call; uncounted, they filled the maps until the limit.
+static DIED: AtomicUsize = AtomicUsize::new(0);
+
+/// A weak reference to ``target`` that counts its death in ``DIED``.
+fn counted_weak<'py>(target: &B<'py>) -> PyResult<Bound<'py, PyWeakrefReference>> {
+    static ON_DEATH: PyOnceLock<Py<PyCFunction>> = PyOnceLock::new();
+    let py = target.py();
+    let callback = ON_DEATH.get_or_try_init(py, || {
+        PyCFunction::new_closure(py, None, None, |_, _| {
+            DIED.fetch_add(1, Ordering::Relaxed);
+        })
+        .map(Bound::unbind)
+    })?;
+    PyWeakrefReference::new_with(target, callback.bind(py))
+}
+
 impl Caches {
     /// Empty maps around an existing ``object`` plan.
     fn around(object: Rc<Plan>) -> Self {
@@ -740,6 +761,21 @@ impl Caches {
             classes: HashMap::new(),
             objects: HashMap::new(),
         }
+    }
+
+    /// Move the entries whose targets have died into ``stale``, once as many
+    /// have died as half the entries: a sweep reads every entry, so it waits
+    /// until it frees about as many as it reads.
+    fn sweep(&mut self, py: Python<'_>, stale: &mut Vec<(Py<PyWeakrefReference>, Rc<Plan>)>) {
+        if DIED.load(Ordering::Relaxed) * 2 <= self.classes.len() + self.objects.len() {
+            return;
+        }
+        DIED.store(0, Ordering::Relaxed);
+        let dead = |_: &usize, (weak, _): &mut (Py<PyWeakrefReference>, Rc<Plan>)| {
+            weak.bind(py).upgrade().is_none()
+        };
+        stale.extend(self.classes.extract_if(dead).map(|(_, entry)| entry));
+        stale.extend(self.objects.extract_if(dead).map(|(_, entry)| entry));
     }
 }
 
@@ -1232,8 +1268,9 @@ impl<'py, 'g> Decoder<'py, 'g> {
             }
             let plan = Rc::new(self.compile(target, true)?);
             let mut stale = Vec::new();
-            if let Ok(weak) = PyWeakrefReference::new(target) {
+            if let Ok(weak) = counted_weak(target) {
                 let cache = &mut self.caches;
+                cache.sweep(py, &mut stale);
                 if cache.classes.len() >= CLASS_LIMIT {
                     stale.extend(cache.classes.drain().map(|(_, entry)| entry));
                 }
@@ -1259,7 +1296,7 @@ impl<'py, 'g> Decoder<'py, 'g> {
             }
             let plan = Rc::new(self.compile(target, true)?);
             let mut stale = Vec::new();
-            let Ok(weak) = PyWeakrefReference::new(target) else {
+            let Ok(weak) = counted_weak(target) else {
                 // Without a weak reference the plan cannot outlast the call
                 // safely, but it still serves every use within it.
                 self.unweakable.insert(key, (target.clone(), plan.clone()));
@@ -1267,6 +1304,7 @@ impl<'py, 'g> Decoder<'py, 'g> {
             };
             {
                 let cache = &mut self.caches;
+                cache.sweep(py, &mut stale);
                 if cache.objects.len() >= OBJECT_LIMIT {
                     stale.extend(cache.objects.drain().map(|(_, entry)| entry));
                 }
