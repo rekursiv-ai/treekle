@@ -8,7 +8,6 @@ description = "Pickle semantics as plain python trees."
 readme = "README.md"
 requires-python = ">=3.12"
 license = "Apache-2.0"
-license-files = ["LICENSE"]
 authors = [{name = "rekursiv.ai", email = "hello@rekursiv.ai"}]
 keywords = ["serialization", "json", "pickle", "dataclasses", "configuration"]
 classifiers = [
@@ -26,6 +25,7 @@ classifiers = [
 dependencies = [
     # Prefer https://awesome-python.com deps over alternatives.
 ]
+license-files = ["LICENSE"]
 
 [dependency-groups]
 # NEVER ADD MORE DEPENDENCIES!
@@ -37,10 +37,6 @@ debug = [
 lint = [
     "codespell>=2.2.4",
     "ruff",
-]
-publish = [
-    "build",
-    "twine",
 ]
 test = [
     "pytest-timeout>=2.4.0",
@@ -69,6 +65,10 @@ dev = [
     {include-group = "debug"},
     {include-group = "publish"},
 ]
+publish = [
+    "build",
+    "twine",
+]
 
 # NEVER ADD MORE DEPENDENCY GROUPS!
 
@@ -83,36 +83,11 @@ Changelog = "https://github.com/rekursiv-ai/treekle/releases"
 requires = ["maturin>=1.9,<2"]
 build-backend = "maturin"
 
-# Tool settings: single source of truth.
-# Preferred location for any tool setting, in order:
-#   pyproject.toml  >  .pre-commit-config.yaml  >  .github/workflows/ci.yml
-# Put a setting as high in this chain as the tool allows. Only drop to a lower
-# file when the higher one cannot express it (e.g. a CLI-only flag with no
-# config key). pyproject.toml holds tool config; .pre-commit-config.yaml is the
-# sole source for how hooks run (thread/worker counts, heap caps);
-# .github/workflows/ci.yml only invokes the hooks and must not redefine any
-# of these.
-
-[tool.maturin]
-# The Rust core builds into treekle/_rust; treekle falls back to Python without it.
-manifest-path = "rust/Cargo.toml"
-module-name = "treekle._rust"
-python-source = "."
-profile = "release"
-features = ["pyo3/extension-module"]
-include = [{path = "CHANGELOG.md", format = "sdist"}]
-exclude = [
-    {path = "**/*_test.py", format = "wheel"},
-    {path = "**/conftest.py", format = "wheel"},
-    {path = ".github/**", format = "sdist"},
-    {path = ".codespell-ignore", format = "sdist"},
-]
-
 # The Python-only universal wheel, which scripts/build_pure_wheel.py builds with
 # hatchling. Maturin builds everything else and ignores this table.
 [tool.hatch.build.targets.wheel]
 packages = ["treekle"]
-exclude = ["*_test.py", "conftest.py", "*.so", "*.pyd"]
+exclude = ["*_test.py", "conftest.py", "*.so", "*.pyd", "treekle/lib/testing/**"]
 # Maturin's version, so every release file declares the same one. Hatchling
 # 1.32 defaults to 2.5, which PyPI uploads have rejected.
 core-metadata-version = "2.4"
@@ -225,9 +200,6 @@ do_not_mutate_patterns = [
 # 43 s untraced, past the 60 s test timeout. COVERAGE_CORE still overrides it,
 # as the testmon hooks' ctrace does.
 core = "sysmon"
-# Tests run the fallback wiring and the release scripts in child processes;
-# measure those too, or the lines they cover count as missed.
-patch = ["subprocess"]
 omit = [
     "*_test.py",
     "test_*.py",
@@ -239,6 +211,9 @@ omit = [
     # Wheels the tests extract to tmp_path and run in a subprocess.
     "*/pytest-of-*/*",
 ]
+# Tests run the fallback wiring and the release scripts in child processes;
+# measure those too, or the lines they cover count as missed.
+patch = ["subprocess"]
 
 [tool.coverage.report]
 exclude_lines = [
@@ -258,9 +233,9 @@ exclude_lines = [
     # callers' results, not by line coverage.
     "^def \\w+_numba\\(",
 ]
-fail_under = 98
 show_missing = true
 skip_covered = true
+fail_under = 98
 
 [tool.ruff]
 show-fixes = true
@@ -387,6 +362,22 @@ extend-safe-fixes = [
     # NEVER ADD MORE SUPPRESSIONS! SUPPRESS IN FILE!
 ]
 
+
+"*.ipynb" = [
+    "ARG001",  # Unused function argument (callbacks).
+    "BLE001",  # Blind exception (sandboxed exec).
+    "E402",    # Module level import not at top of file.
+    "F811",    # Redefinition across cells.
+    "F821",    # Undefined name (e.g., `display` from IPython).
+    "INP001",  # Implicit namespace package.
+    "PLC0415", # Import not at top level.
+    "RUF100",  # Preserve noqa for jupytext-synced .py files.
+    "S102",    # Use of exec.
+    "S301",    # Pickle usage.
+    "T201",    # Print found.
+    # NEVER ADD MORE SUPPRESSIONS! SUPPRESS IN FILE!
+]
+
 # Stub generation workflow:
 #    basedpyright --createstub
 #    uv --quiet run --frozen ruff check typings --fix --unsafe-fixes
@@ -443,27 +434,12 @@ extend-safe-fixes = [
     "TID251",  # Banned API.
     # NEVER ADD MORE SUPPRESSIONS! SUPPRESS IN FILE!
 ]
-
-"*.ipynb" = [
-    "ARG001",  # Unused function argument (callbacks).
-    "BLE001",  # Blind exception (sandboxed exec).
-    "E402",    # Module level import not at top of file.
-    "F811",    # Redefinition across cells.
-    "F821",    # Undefined name (e.g., `display` from IPython).
-    "INP001",  # Implicit namespace package.
-    "PLC0415", # Import not at top level.
-    "RUF100",  # Preserve noqa for jupytext-synced .py files.
-    "S102",    # Use of exec.
-    "S301",    # Pickle usage.
-    "T201",    # Print found.
-    # NEVER ADD MORE SUPPRESSIONS! SUPPRESS IN FILE!
-]
-
 "{**/docs/**,**/scripts/**}" = [
     "INP001",  # Standalone example scripts.
     "T201",    # Print found. (Eval scripts use print for output.)
     # NEVER ADD MORE SUPPRESSIONS! SUPPRESS IN FILE!
 ]
+
 
 # NEVER ADD MORE SUPPRESSIONS! SUPPRESS IN FILE!
 
@@ -573,8 +549,8 @@ exclude = [
     "build/",
     "dist/",
     "**/third_party/",
-    "**/typings/",
     # NEVER ADD MORE EXCLUSIONS! SUPPRESS IN FILE!
+    "**/typings/",
 ]
 ignore = [
     "**/.venv/",
@@ -586,8 +562,8 @@ ignore = [
     "build/",
     "dist/",
     "**/third_party/",
-    "**/typings/",
     # NEVER ADD MORE IGNORES! SUPPRESS IN FILE!
+    "**/typings/",
 ]
 pythonPlatform = "Linux"
 pythonVersion = "3.12"  # Intentional; test at 3.12 for exports.
@@ -601,6 +577,7 @@ reportUnsafeMultipleInheritance = false    # Mixin patterns are intentional.
 reportUnusedCallResult = false             # Discarding return values is idiomatic Python.
 reportInvalidCast = false                  # All cast() calls are intentional.
 # NEVER ADD MORE SUPPRESSIONS! SUPPRESS IN FILE!
+
 
 [tool.ty.environment]
 python-version = "3.12"  # Intentional; test at 3.12 for exports.
@@ -620,8 +597,8 @@ exclude = [
     "build/",
     "dist/",
     "**/third_party/",
-    "**/typings/",
     # NEVER ADD MORE EXCLUSIONS! SUPPRESS IN FILE!
+    "**/typings/",
 ]
 
 [tool.ty.rules]
@@ -629,6 +606,7 @@ all = "warn"
 
 [[tool.ty.overrides]]
 include = ["*_test.py"]
+
 [tool.ty.overrides.rules]
 invalid-key = "ignore"
 
@@ -654,14 +632,6 @@ formats = "ipynb,py:percent"
 
 [tool.uv]
 package = true
-# Rebuild the Rust core when its sources change, not only pyproject.toml.
-cache-keys = [
-    {file = "pyproject.toml"},
-    {file = "rust/Cargo.toml"},
-    {file = "rust/Cargo.lock"},
-    {file = "rust/build.rs"},
-    {file = "rust/src/**/*.rs"},
-]
 environments = [
     "sys_platform == 'linux'",
     "sys_platform == 'darwin'",
@@ -670,6 +640,14 @@ required-environments = [
     "sys_platform == 'linux' and platform_machine == 'x86_64'",
     "sys_platform == 'linux' and platform_machine == 'aarch64'",
     "sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
+# Rebuild the Rust core when its sources change, not only pyproject.toml.
+cache-keys = [
+    {file = "pyproject.toml"},
+    {file = "rust/Cargo.toml"},
+    {file = "rust/Cargo.lock"},
+    {file = "rust/build.rs"},
+    {file = "rust/src/**/*.rs"},
 ]
 
 [tool.uv.extra-build-dependencies]
@@ -684,3 +662,30 @@ compile-bytecode = true
 [tool.uv.sources]
 rekursiv-ai-typeshed = { git = "https://github.com/rekursiv-ai/typings", subdirectory = "typeshed", branch = "main" }
 rekursiv-ai-typings = { git = "https://github.com/rekursiv-ai/typings", branch = "main" }
+
+# Tool settings: single source of truth.
+# Preferred location for any tool setting, in order:
+#   pyproject.toml  >  .pre-commit-config.yaml  >  .github/workflows/ci.yml
+# Put a setting as high in this chain as the tool allows. Only drop to a lower
+# file when the higher one cannot express it (e.g. a CLI-only flag with no
+# config key). pyproject.toml holds tool config; .pre-commit-config.yaml is the
+# sole source for how hooks run (thread/worker counts, heap caps);
+# .github/workflows/ci.yml only invokes the hooks and must not redefine any
+# of these.
+
+[tool.maturin]
+# The Rust core builds into treekle/_rust; treekle falls back to Python without it.
+manifest-path = "rust/Cargo.toml"
+module-name = "treekle._rust"
+python-source = "."
+profile = "release"
+features = ["pyo3/extension-module"]
+include = [{path = "CHANGELOG.md", format = "sdist"}]
+exclude = [
+    {path = "**/*_test.py", format = "wheel"},
+    {path = "**/conftest.py", format = "wheel"},
+    # The vendored pytest harness imports pytest, a test-group dependency.
+    {path = "treekle/lib/testing/**", format = "wheel"},
+    {path = ".github/**", format = "sdist"},
+    {path = ".codespell-ignore", format = "sdist"},
+]
