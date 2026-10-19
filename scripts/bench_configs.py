@@ -5,15 +5,16 @@ priml, msgspec and jsonpickle are not treekle dependencies, so run this in an
 environment that has all three:
 
   python scripts/bench_configs.py
-  python scripts/bench_configs.py --priml my.vendored.priml --columns msgspec pickle
+  python scripts/bench_configs.py --priml my.vendored.priml --columns msgspec-struct pickle
 
 Encode times each library on the config itself; msgspec's ``to_builtins`` takes
 ``enc_hook=repr``, its only way past the callables the configs hold. msgspec
 cannot decode the configs at all: its unions may not mix a custom type with
 anything but None. So decode times the closest analogue: each config rebuilt as
 generated dataclasses holding only plain leaves (a callable, type or dtype
-becomes its repr). ``msgspec`` decodes it into a tagged ``msgspec.Struct`` twin,
-``msgspec-dataclass`` into the dataclasses themselves. A decode that raises or
+becomes its repr). ``msgspec-struct`` decodes it into a tagged ``msgspec.Struct``
+twin, the reference every ratio is taken against; ``msgspec-dataclass`` into the
+dataclasses themselves. A decode that raises or
 does not equal its input prints as ❌, as does a total that includes one;
 msgspec-dataclass raises wherever a union holds two dataclasses, which it cannot
 tell apart.
@@ -186,7 +187,7 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
         nargs="+",
         choices=list(_CODECS),
         default=list(_CODECS),
-        help="Libraries to time; ratio columns are relative to msgspec.",
+        help="Libraries to time; ratio columns are relative to msgspec-struct.",
     )
     parser.add_argument(
         "--budget-sec",
@@ -428,14 +429,16 @@ def _render(
     title: str,
     names: list[str],
 ) -> str:
-    """Render one markdown table: microseconds, then each time vs msgspec's."""
-    relative = [n for n in names if n != "msgspec"] if "msgspec" in names else []
-    header = ["config", *names, *(f"{name} vs msgspec" for name in relative)]
+    """Render one markdown table: microseconds, then each time vs the reference's."""
+    relative = (
+        [n for n in names if n != "msgspec-struct"] if "msgspec-struct" in names else []
+    )
+    header = ["config", *names, *(f"{name} vs msgspec-struct" for name in relative)]
     rows = [
         [
             label,
             *(_cell(row[n], "{:.1f}") for n in names),
-            *(_cell(_ratio(row[n], row["msgspec"]), "{:.1f}") for n in relative),
+            *(_cell(_ratio(row[n], row["msgspec-struct"]), "{:.1f}") for n in relative),
         ]
         for label, row in cells.items()
     ]
@@ -447,23 +450,23 @@ def _summary(
     *,
     names: list[str],
 ) -> str:
-    """Render the totals: one row per library, ms then each time vs msgspec's."""
-    base = "msgspec" in names
+    """Render the totals: one row per library, ms then each time vs the reference's."""
+    base = "msgspec-struct" in names
     header = ["library"]
     for kind in totals:
         header += [f"{kind} (ms)", "×"] if base else [f"{kind} (ms)"]
     rows: list[list[str]] = []
     for name in sorted(names, key=list(_CODECS).index):
-        row = [f"{name} (reference)" if base and name == "msgspec" else name]
+        row = [f"{name} (reference)" if base and name == "msgspec-struct" else name]
         for cells in totals.values():
             total = cells["**total**"]
             us = total[name]
             row.append(_cell(None if us is None else us / 1000, "{:.2f}"))
             if base:
-                multiple = _ratio(us, total["msgspec"])
+                multiple = _ratio(us, total["msgspec-struct"])
                 row.append("" if multiple is None else f"{multiple:.1f}")
         rows.append(row)
-    note = "; × is the multiple of msgspec's" if base else ""
+    note = "; × is the multiple of msgspec-struct's" if base else ""
     title = f"**Summary** (total over every config{note})"
     return f"{title}\n\n" + _table(header, rows)
 
@@ -553,7 +556,7 @@ def _prepare_jsonpickle(analogue: object, *, library: _Jsonpickle) -> _Prepared:
 def _msgspec_codec() -> _Codec:
     library = cast("_Msgspec", cast("object", importlib.import_module("msgspec")))
     return _Codec(
-        name="msgspec",
+        name="msgspec-struct",
         encode=lambda config: library.to_builtins(config, enc_hook=repr),
         prepare=functools.partial(_prepare_msgspec, library=library, structs={}),
     )
@@ -634,10 +637,10 @@ def _struct(
     return cast("object", annotation)
 
 
-# Listed in the order the summary tables print them.
+# Listed in the order the summary tables print them, the reference first.
 _CODECS: dict[str, Callable[[], _Codec]] = {
+    "msgspec-struct": _msgspec_codec,
     "msgspec-dataclass": _msgspec_dataclass_codec,
-    "msgspec": _msgspec_codec,
     "treekle-rust": functools.partial(
         _treekle_codec,
         "treekle-rust",

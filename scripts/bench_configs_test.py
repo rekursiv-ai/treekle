@@ -127,8 +127,8 @@ def test_every_library_round_trips_the_analogue(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     bench(
-        "msgspec",
         "msgspec-dataclass",
+        "msgspec-struct",
         "treekle-rust",
         "treekle-python",
         "pickle",
@@ -140,28 +140,28 @@ def test_every_library_round_trips_the_analogue(
     decode, summary = rest.split("**Summary**")
     header = [
         "config",
-        "msgspec",
         "msgspec-dataclass",
+        "msgspec-struct",
         "treekle-rust",
         "treekle-python",
         "pickle",
         "jsonpickle",
-        "msgspec-dataclass vs msgspec",
-        "treekle-rust vs msgspec",
-        "treekle-python vs msgspec",
-        "pickle vs msgspec",
-        "jsonpickle vs msgspec",
+        "msgspec-dataclass vs msgspec-struct",
+        "treekle-rust vs msgspec-struct",
+        "treekle-python vs msgspec-struct",
+        "pickle vs msgspec-struct",
+        "jsonpickle vs msgspec-struct",
     ]
     assert _rows(encode)[0] == header
     assert _rows(decode)[0] == header
     decoded = {row[0]: row for row in _rows(decode)}
     # Without tags, a dataclass among dicts under ``object`` decodes as a dict.
     assert decoded["toy"].count("❌") == 2
-    assert decoded["toy"][2] == "❌"
+    assert decoded["toy"][1] == "❌"
     # The msgspec stand-ins hand back the same float object, which equals itself.
     assert decoded["nan"].count("❌") == 8
     assert decoded["twins"].count("❌") == 2
-    assert decoded["twins"][2] == "❌"
+    assert decoded["twins"][1] == "❌"
     assert decoded["**total**"].count("❌") == 10
     assert "❌" not in encode
     table = _rows(summary)
@@ -177,24 +177,24 @@ def test_every_library_round_trips_the_analogue(
         "×",
     ]
     rows = {row[0]: row for row in table[1:]}
-    assert rows["msgspec (reference)"][2::2] == ["1.0"] * 4
-    # Decode fails alike cold as warm; only msgspec's stand-in reads every
-    # config back, so every other decode total is ❌, with no multiple.
+    assert rows["msgspec-struct (reference)"][2::2] == ["1.0"] * 4
+    # Decode fails alike cold as warm; only msgspec-struct's stand-in reads
+    # every config back, so every other decode total is ❌, with no multiple.
     failed = {name: row[3:5] for name, row in rows.items() if row[3] == "❌"}
     assert failed == {
-        name: ["❌", ""] for name in rows if name != "msgspec (reference)"
+        name: ["❌", ""] for name in rows if name != "msgspec-struct (reference)"
     }
     assert {name: row[7:9] == ["❌", ""] for name, row in rows.items()} == {
         name: name in failed for name in rows
     }
-    # Every encode total is a time, with its multiple of msgspec's.
+    # Every encode total is a time, with its multiple of msgspec-struct's.
     for row in rows.values():
         for cell in (*row[1:3], *row[5:7]):
             assert float(cell) >= 0
     # Rows run in one fixed order, whatever order the columns were asked in.
     assert [row[0] for row in table[1:]] == [
+        "msgspec-struct (reference)",
         "msgspec-dataclass",
-        "msgspec (reference)",
         "treekle-rust",
         "pickle",
         "treekle-python",
@@ -225,7 +225,7 @@ def test_without_msgspec_the_tables_have_no_ratio_columns(
         ],
     ]
     assert "×" not in out
-    assert "vs msgspec" not in out
+    assert "vs msgspec-struct" not in out
 
 
 def test_the_flags_default_to_every_library_on_installed_priml() -> None:

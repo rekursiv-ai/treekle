@@ -348,29 +348,30 @@ type.
 
 Times are totals over the `exp000` config of each of 43
 [priml](https://github.com/rekursiv-ai/priml) baselines, with each library's
-time as a multiple of msgspec's under ×.
+time as a multiple of msgspec-struct's under ×.
 
 - **warm:** repeat calls on classes each library has already seen.
 - **cold:** the first call on classes no library has seen.
 
-| library             | warm encode (ms) |    × | warm decode (ms) |    × | cold encode (ms) |    × | cold decode (ms) |   × |
-|---------------------|-----------------:|-----:|-----------------:|-----:|-----------------:|-----:|-----------------:|----:|
-| msgspec-dataclass   |             0.52 |  1.0 |                ❌ |      |             0.82 |  1.0 |                ❌ |     |
-| msgspec (reference) |             0.53 |  1.0 |             0.16 |  1.0 |             0.82 |  1.0 |            10.05 | 1.0 |
-| treekle-rust        |             0.49 |  0.9 |             0.16 |  1.0 |             1.08 |  1.3 |            10.26 | 1.0 |
-| pickle              |             2.54 |  4.8 |             1.02 |  6.5 |             3.61 |  4.4 |             1.97 | 0.2 |
-| treekle-python      |             3.88 |  7.3 |            15.19 | 96.3 |             8.98 | 10.9 |            29.29 | 2.9 |
-| jsonpickle          |            21.63 | 40.7 |            10.91 | 69.2 |            15.98 | 19.5 |            14.03 | 1.4 |
+| library                    | warm encode (ms) |    × | warm decode (ms) |    × | cold encode (ms) |    × | cold decode (ms) |   × |
+|----------------------------|-----------------:|-----:|-----------------:|-----:|-----------------:|-----:|-----------------:|----:|
+| msgspec-struct (reference) |             0.53 |  1.0 |             0.16 |  1.0 |             0.83 |  1.0 |            10.21 | 1.0 |
+| msgspec-dataclass          |             0.53 |  1.0 |                ❌ |      |             0.82 |  1.0 |                ❌ |     |
+| treekle-rust               |             0.49 |  0.9 |             0.16 |  1.0 |             1.14 |  1.4 |            10.76 | 1.1 |
+| pickle                     |             2.51 |  4.8 |             1.01 |  6.5 |             3.65 |  4.4 |             2.05 | 0.2 |
+| treekle-python             |             3.83 |  7.3 |            15.31 | 98.4 |             9.16 | 11.1 |            29.82 | 2.9 |
+| jsonpickle                 |            21.62 | 41.1 |            10.87 | 69.9 |            16.00 | 19.4 |            14.13 | 1.4 |
 
 - **encode:** each library on the config itself. msgspec is given
   `enc_hook=repr`, its only way past the callables a config holds, and writes
-  no class names or shared references, so it writes less than treekle.
+  no class names or shared references, so it writes less than treekle. Both
+  msgspec rows encode alike.
 - **decode:** msgspec cannot decode the configs: its unions may not mix a class
   with anything but `None`. So decode times the closest thing every library
-  reads: each config rebuilt as dataclasses holding only plain values. msgspec
-  reads it into tagged `msgspec.Struct` twins; msgspec-dataclass into the
-  dataclasses themselves, which fails (❌) on 14 configs whose unions hold two
-  dataclasses it cannot tell apart.
+  reads: each config rebuilt as dataclasses holding only plain values.
+  msgspec-struct reads it into tagged `msgspec.Struct` twins; msgspec-dataclass
+  into the dataclasses themselves, which fails (❌) on 14 configs whose unions
+  hold two dataclasses it cannot tell apart.
 - **treekle-rust**, **treekle-python:** the compiled core, and the Python
   fallback a platform without a wheel gets.
 
