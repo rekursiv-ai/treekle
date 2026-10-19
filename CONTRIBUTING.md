@@ -19,6 +19,9 @@ uv sync --all-groups
 uv run pytest
 ```
 
+Release wheels are profile-guided (see `RELEASING.md`), so a local build runs
+slower than a published wheel. Measure speed against a published wheel.
+
 Before opening a pull request, run:
 
 ```bash

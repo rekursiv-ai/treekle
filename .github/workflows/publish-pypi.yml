@@ -42,14 +42,49 @@ jobs:
             3.13
             3.14
 
+      # Profile-guided: an instrumented wheel runs scripts/train_pgo.py, and the
+      # wheels that ship are built from the profile it recorded. Each runner is
+      # native to its target, so the instrumented wheel can run there.
+      - name: Install llvm-profdata
+        shell: bash
+        run: rustup component add llvm-tools
+
+      - name: Make the profile directory
+        shell: bash
+        # Made here, so the Linux build container writes into a directory this
+        # user owns.
+        run: mkdir -p "$GITHUB_WORKSPACE/pgo-profiles"
+
+      - name: Build instrumented wheel
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        with:
+          target: ${{ matrix.platform.target }}
+          manylinux: ${{ matrix.platform.manylinux }}
+          args: --release --out pgo-wheel --interpreter 3.12
+        env:
+          RUSTFLAGS: -Cprofile-generate=${{ github.workspace }}/pgo-profiles
+
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+
+      - name: Record and merge the profile
+        shell: bash
+        run: |
+          uv run --isolated --no-project --no-index --no-build --find-links pgo-wheel \
+            --python 3.12 --with treekle \
+            python -P scripts/train_pgo.py
+          sysroot=$(rustc --print sysroot)
+          host=$(rustc -vV | sed -n 's/^host: //p')
+          "$sysroot/lib/rustlib/$host/bin/llvm-profdata" merge \
+            -o "$GITHUB_WORKSPACE/pgo.profdata" "$GITHUB_WORKSPACE/pgo-profiles"
+
       - name: Build wheels
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
           target: ${{ matrix.platform.target }}
           manylinux: ${{ matrix.platform.manylinux }}
           args: --release --out dist --interpreter 3.12 3.13 3.14
-
-      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        env:
+          RUSTFLAGS: -Cprofile-use=${{ github.workspace }}/pgo.profdata
 
       # The installer picks each interpreter's wheel from dist, as pip would
       # from PyPI; a missing wheel fails instead of building from source.

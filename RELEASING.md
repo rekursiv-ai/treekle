@@ -6,6 +6,13 @@ A published GitHub Release triggers `.github/workflows/publish-pypi.yml`,
 which builds, validates, and uploads to PyPI via OIDC trusted publishing
 (no API token). Follow the steps in order.
 
+Each native wheel is profile-guided: the workflow builds an instrumented
+wheel, runs `scripts/train_pgo.py` against it, and builds the wheels it ships
+from the profile that run recorded. A local `uv build` skips that, so its
+wheel is correct but not as fast as the release's.
+
+Profiling needs `llvm-profdata`: `rustup component add llvm-tools`.
+
 ## Steps
 
 1. **(First release only) Register the trusted publisher on PyPI.**
