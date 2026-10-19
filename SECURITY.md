@@ -3,8 +3,8 @@
 ## Why this file exists
 
 treekle decodes plain trees that may come from untrusted sources. With
-`allow_imports=True` a tree can name modules to import and callables to call,
-as pickle does. Security reports need a private path so exploit details are not
+`allow_imports=True` a tree can name modules to import and callables to call.
+Security reports need a private path so exploit details are not
 published before review.
 
 ## Reporting a vulnerability

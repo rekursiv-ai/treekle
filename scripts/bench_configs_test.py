@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, cast, get_args, get_origin
 import argparse
 import dataclasses
 import functools
+import gc
 import pickle
 import sys
 import textwrap
@@ -110,6 +111,8 @@ def bench(
             "1e-4",
             "--repeat",
             "2",
+            "--cold-repeat",
+            "1",
         ]
         monkeypatch.setattr(sys, "argv", [*argv, "--columns", *columns])
         assert main() == 0
@@ -164,23 +167,39 @@ def test_every_library_round_trips_the_analogue(
     table = _rows(summary)
     assert table[0] == [
         "library",
-        "encode (ms)",
-        "encode (×)",
-        "decode (ms)",
-        "decode (×)",
+        "warm encode (ms)",
+        "×",
+        "warm decode (ms)",
+        "×",
+        "cold encode (ms)",
+        "×",
+        "cold decode (ms)",
+        "×",
     ]
-    rows = {row[0]: row for row in table}
-    assert rows["msgspec"][2] == "1.0"
-    assert rows["msgspec"][4] == "1.0"
-    assert rows["pickle"][3:] == ["❌", "❌"]
-    assert rows["pickle"][2].replace(".", "").isdigit()
-    # Rows run fastest encode first, by the totals the encode table prints.
-    by_name = dict(zip(header[1:7], _rows(encode)[-1][1:7], strict=True))
-    order = [row[0] for row in table[1:]]
-    assert len(order) == 6
-    assert [float(by_name[name]) for name in order] == sorted(
-        float(by_name[name]) for name in order
-    )
+    rows = {row[0]: row for row in table[1:]}
+    assert rows["msgspec (reference)"][2::2] == ["1.0"] * 4
+    # Decode fails alike cold as warm; only msgspec's stand-in reads every
+    # config back, so every other decode total is ❌, with no multiple.
+    failed = {name: row[3:5] for name, row in rows.items() if row[3] == "❌"}
+    assert failed == {
+        name: ["❌", ""] for name in rows if name != "msgspec (reference)"
+    }
+    assert {name: row[7:9] == ["❌", ""] for name, row in rows.items()} == {
+        name: name in failed for name in rows
+    }
+    # Every encode total is a time, with its multiple of msgspec's.
+    for row in rows.values():
+        for cell in (*row[1:3], *row[5:7]):
+            assert float(cell) >= 0
+    # Rows run in one fixed order, whatever order the columns were asked in.
+    assert [row[0] for row in table[1:]] == [
+        "msgspec-dataclass",
+        "msgspec (reference)",
+        "treekle-rust",
+        "pickle",
+        "treekle-python",
+        "jsonpickle",
+    ]
     # Every line of a table is as wide as its header, so the raw text aligns.
     for block in (encode, decode, summary):
         lines = [line for line in block.splitlines() if line.startswith("|")]
@@ -197,9 +216,15 @@ def test_without_msgspec_the_tables_have_no_ratio_columns(
     assert [rows[0] for rows in tables] == [
         ["config", "treekle-rust", "pickle"],
         ["config", "treekle-rust", "pickle"],
-        ["library", "encode (ms)", "decode (ms)"],
+        [
+            "library",
+            "warm encode (ms)",
+            "warm decode (ms)",
+            "cold encode (ms)",
+            "cold decode (ms)",
+        ],
     ]
-    assert "(×)" not in out
+    assert "×" not in out
     assert "vs msgspec" not in out
 
 
@@ -211,6 +236,7 @@ def test_the_flags_default_to_every_library_on_installed_priml() -> None:
         "columns": list(bench_configs._CODECS),
         "budget_sec": 0.002,
         "repeat": 5,
+        "cold_repeat": 3,
     }
     with pytest.raises(SystemExit):
         parser.parse_args(["--columns", "nope"])
@@ -231,6 +257,41 @@ def test_treekle_decodes_into_the_analogue_type() -> None:
     assert decode() == "3"
     assert calls == [("3", int, True)]
     assert check(3)
+
+
+def test_a_cold_call_is_timed_once_with_the_collector_held_off() -> None:
+    seen: list[bool] = []
+
+    def call() -> str:
+        seen.append(gc.isenabled())
+        return "done"
+
+    us, result = bench_configs._once(call)
+    assert result == "done"
+    assert us >= 0
+    assert seen == [False]
+    assert gc.isenabled()
+
+
+def test_a_cold_decode_that_raises_or_differs_is_refused() -> None:
+    def raises() -> object:
+        raise TypeError
+
+    assert bench_configs._cold_decode_us(raises, lambda _: True) is None
+    assert bench_configs._cold_decode_us(lambda: 1, lambda _: False) is None
+    assert bench_configs._cold_decode_us(lambda: 1, lambda _: True) is not None
+
+
+def test_each_fresh_mirror_has_classes_of_its_own() -> None:
+    @dataclasses.dataclass(kw_only=True, slots=True)
+    class Leaf:
+        x: int = 1
+
+    first, second = bench_configs._fresh(Leaf()), bench_configs._fresh(Leaf())
+    assert type(first) is not type(second)
+    assert type(first).__module__ != type(second).__module__
+    assert type(first).__name__.startswith("Leaf")
+    assert dataclasses.asdict(cast("Leaf", first)) == {"x": 1}
 
 
 def _rows(block: str) -> list[list[str]]:

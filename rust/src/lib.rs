@@ -10,16 +10,19 @@ compile_error!(
     "treekle's Rust core requires a GIL; use the pure-Python wheel on free-threaded Python"
 );
 
-mod common;
+mod class;
 mod decode;
 mod encode;
-mod paths;
-mod watch;
+mod errors;
+mod freeze;
+mod places;
+mod py;
+mod sync;
 
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
-use crate::common::{B, Flag, Maybe};
+use crate::py::{B, Flag, Maybe};
 
 /// Read the decoder's helpers and sentinels from ``treekle.deserialize``'s globals.
 #[pyfunction]

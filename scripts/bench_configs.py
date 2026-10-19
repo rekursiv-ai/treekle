@@ -17,6 +17,12 @@ becomes its repr). ``msgspec`` decodes it into a tagged ``msgspec.Struct`` twin,
 does not equal its input prints as ❌, as does a total that includes one;
 msgspec-dataclass raises wherever a union holds two dataclasses, which it cannot
 tell apart.
+
+Warm times repeat calls on classes each library has already seen, keeping the
+fastest. Cold times each library's first call on classes built afresh for that
+call, which is where per-class setup (type hints, field layouts, import paths)
+is paid; since a config's own classes cannot be rebuilt, cold encode also runs
+on the analogue.
 """
 
 from __future__ import annotations
@@ -30,10 +36,12 @@ from typing import Protocol, cast, get_args, get_origin
 import argparse
 import dataclasses
 import functools
+import gc
 import importlib
 import operator
 import pickle
 import sys
+import time
 import timeit
 import uuid
 
@@ -62,7 +70,7 @@ def main() -> int:
     sys.modules[module.__name__] = module
     classes: dict[tuple[str, tuple[tuple[str, object], ...]], type] = {}
     codecs = [_CODECS[name]() for name in flags.columns]
-    rows = {
+    warm = {
         label: _row(
             config,
             _mirror(config, module=module, classes=classes),
@@ -72,11 +80,21 @@ def main() -> int:
         )
         for label, config in configs
     }
-    encode = _cells(rows, names=flags.columns, index=0)
-    decode = _cells(rows, names=flags.columns, index=1)
+    cold = {
+        label: _cold_row(config, codecs=codecs, repeat=flags.cold_repeat)
+        for label, config in configs
+    }
+    encode = _cells(warm, names=flags.columns, index=0)
+    decode = _cells(warm, names=flags.columns, index=1)
     print(_render(encode, title="Encode", names=flags.columns))
     print(_render(decode, title="Decode (analogue)", names=flags.columns))
-    print(_summary(encode, decode, names=flags.columns))
+    totals = {
+        "warm encode": encode,
+        "warm decode": decode,
+        "cold encode": _cells(cold, names=flags.columns, index=0),
+        "cold decode": _cells(cold, names=flags.columns, index=1),
+    }
+    print(_summary(totals, names=flags.columns))
     return 0
 
 
@@ -87,6 +105,7 @@ class Flags(Protocol):
     columns: list[str]
     budget_sec: float
     repeat: int
+    cold_repeat: int
 
 
 type _Times = dict[str, tuple[float | None, float | None]]
@@ -180,6 +199,12 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
         type=int,
         default=5,
         help="Repeats; the fastest counts.",
+    )
+    parser.add_argument(
+        "--cold-repeat",
+        type=int,
+        default=3,
+        help="Cold samples per config and library, each on fresh classes; the fastest counts.",
     )
 
 
@@ -307,6 +332,59 @@ def _row(
     return times
 
 
+def _cold_row(config: object, *, codecs: list[_Codec], repeat: int) -> _Times:
+    """Time each codec's first encode and first decode on freshly built classes."""
+    times: _Times = {}
+    for codec in codecs:
+        encodes: list[float] = []
+        decodes: list[float | None] = []
+        for _ in range(repeat):
+            encode_us, _ = _once(functools.partial(codec.encode, _fresh(config)))
+            encodes.append(encode_us)
+            decode, check = codec.prepare(_fresh(config))
+            decodes.append(_cold_decode_us(decode, check))
+        failed = any(us is None for us in decodes)
+        times[codec.name] = (
+            min(encodes),
+            None if failed else min(us for us in decodes if us is not None),
+        )
+    return times
+
+
+def _fresh(config: object) -> object:
+    """Mirror ``config`` into classes no library has seen, in a module of its own."""
+    module = ModuleType(f"treekle_bench_cold_{uuid.uuid4().hex}")
+    sys.modules[module.__name__] = module
+    return _mirror(config, module=module, classes={})
+
+
+def _cold_decode_us(
+    decode: Callable[[], object],
+    check: Callable[[object], bool],
+) -> float | None:
+    """Time one ``decode``; ``None`` if it raises or does not reproduce its input."""
+    try:
+        us, result = _once(decode)
+        return us if check(result) else None
+    except TypeError:
+        return None
+
+
+# A collection triggered by the call's own allocations would charge it for every
+# object the run has built so far, so the collector waits until the call ends.
+def _once(fn: Callable[[], object]) -> tuple[float, object]:
+    """Return the microseconds one call to ``fn`` takes, and its result."""
+    enabled = gc.isenabled()
+    gc.disable()
+    try:
+        start = time.perf_counter()
+        result = fn()
+        return (time.perf_counter() - start) * 1e6, result
+    finally:
+        if enabled:
+            gc.enable()
+
+
 def _decodes(decode: Callable[[], object], check: Callable[[object], bool]) -> bool:
     """Return whether ``decode`` runs and reproduces its input."""
     try:
@@ -365,30 +443,29 @@ def _render(
 
 
 def _summary(
-    encode: dict[str, dict[str, float | None]],
-    decode: dict[str, dict[str, float | None]],
+    totals: dict[str, dict[str, dict[str, float | None]]],
     *,
     names: list[str],
 ) -> str:
-    """Render the totals: one row per library, with each time vs msgspec's."""
+    """Render the totals: one row per library, ms then each time vs msgspec's."""
     base = "msgspec" in names
-    header = (
-        ["library", "encode (ms)", "encode (×)", "decode (ms)", "decode (×)"]
-        if base
-        else ["library", "encode (ms)", "decode (ms)"]
-    )
-    totals = [encode["**total**"], decode["**total**"]]
-    fastest = sorted(names, key=lambda name: totals[0][name] or float("inf"))
+    header = ["library"]
+    for kind in totals:
+        header += [f"{kind} (ms)", "×"] if base else [f"{kind} (ms)"]
     rows: list[list[str]] = []
-    for name in fastest:
-        row = [name]
-        for total in totals:
+    for name in sorted(names, key=list(_CODECS).index):
+        row = [f"{name} (reference)" if base and name == "msgspec" else name]
+        for cells in totals.values():
+            total = cells["**total**"]
             us = total[name]
             row.append(_cell(None if us is None else us / 1000, "{:.2f}"))
             if base:
-                row.append(_cell(_ratio(total[name], total["msgspec"]), "{:.1f}"))
+                multiple = _ratio(us, total["msgspec"])
+                row.append("" if multiple is None else f"{multiple:.1f}")
         rows.append(row)
-    return "**Summary** (total ms over every config)\n\n" + _table(header, rows)
+    note = "; × is the multiple of msgspec's" if base else ""
+    title = f"**Summary** (total over every config{note})"
+    return f"{title}\n\n" + _table(header, rows)
 
 
 # The first column is left-aligned and the rest, numbers, right-aligned; each column is
@@ -557,22 +634,23 @@ def _struct(
     return cast("object", annotation)
 
 
+# Listed in the order the summary tables print them.
 _CODECS: dict[str, Callable[[], _Codec]] = {
-    "msgspec": _msgspec_codec,
     "msgspec-dataclass": _msgspec_dataclass_codec,
+    "msgspec": _msgspec_codec,
     "treekle-rust": functools.partial(
         _treekle_codec,
         "treekle-rust",
         to_plain=serialize.to_plain,
         from_plain=deserialize.from_plain,
     ),
+    "pickle": _pickle_codec,
     "treekle-python": functools.partial(
         _treekle_codec,
         "treekle-python",
         to_plain=serialize._python_to_plain,  # noqa: SLF001 -- The Python walker has no public name.
         from_plain=deserialize._python_from_plain,  # noqa: SLF001 -- The Python walker has no public name.
     ),
-    "pickle": _pickle_codec,
     "jsonpickle": _jsonpickle_codec,
 }
 

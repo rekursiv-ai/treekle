@@ -211,6 +211,25 @@ class LocalReduce:
         return (rebuild, ())
 
 
+class LocalOnly:
+    """Reduces through a local callable and has no state to fall back on."""
+
+    @override
+    def __reduce_ex__(self, protocol: SupportsIndex) -> str | tuple[object, ...]:
+        def rebuild() -> None:
+            pass
+
+        return (rebuild, ())
+
+
+class Carrier(list[int]):
+    """A list whose reduce state holds what only its own reduce could write."""
+
+    def __init__(self, items: list[int], *, cargo: object) -> None:
+        super().__init__(items)
+        self.cargo = cargo
+
+
 class Level(IntEnum):
     LOW = 1
 
@@ -620,13 +639,16 @@ class TestToPlain:
         self,
         value: object,
         expected: MutablePlainTree,
+        implementation: str,
     ) -> None:
         kind = type(value)
 
         tree = to_plain(value)
 
         assert tree == expected
-        assert serialize._ENCODER_CACHE[kind] is serialize._encoder_for(kind)
+        # The Rust core keeps what it chose with its own class facts.
+        if implementation == "python":
+            assert serialize._ENCODER_CACHE[kind] is serialize._encoder_for(kind)
 
     def test_object_attributes_sort_by_name_but_can_keep_declaration_order(
         self,
@@ -1102,6 +1124,9 @@ class TestEncodeEdges:
             {"py/hook": [f"{__name__}.Celsius", 1.5]},
         ]
 
+    def test_a_part_failing_both_ways_falls_back_to_the_outer_reduce(self) -> None:
+        assert to_plain(Carrier([1], cargo=LocalOnly())) == [1]
+
     def test_a_named_reduce_has_no_plain_form(self) -> None:
         value = NamedReduce()
 
@@ -1206,6 +1231,20 @@ class TestImportPath:
         monkeypatch.setattr(serialize, "_IMPORT_PATHS", {id(Point): (Node, "stale")})
 
         assert serialize._import_path(Point) == f"{__name__}.Point"
+
+
+class TestKeyHelpers:
+    def test_a_plain_key_is_written_as_itself(self) -> None:
+        state = serialize._Encoding(dialect="json", hooks={})
+
+        assert serialize._encode_key("name", state) == "name"
+        assert serialize._encode_key("py/x", state) == 'json://"py/x"'
+
+    def test_a_place_outside_every_key_encloses_nothing(self) -> None:
+        place: serialize._Here = (None, "a")
+
+        assert serialize._encloses(place, ((None, "b"), 0)) is False
+        assert serialize._encloses(place, (place, 0)) is True
 
 
 class Callee:

@@ -36,7 +36,7 @@ from functools import partial
 from itertools import islice, repeat
 from numbers import Real
 from pathlib import Path
-from types import MappingProxyType, SimpleNamespace, UnionType
+from types import GenericAlias, MappingProxyType, SimpleNamespace, UnionType
 from typing import (
     TYPE_CHECKING,
     Annotated,
@@ -2108,26 +2108,96 @@ def _field_types(kind: type) -> Mapping[str, object]:
     cached = _FIELD_TYPES.get(kind)
     if cached is not None:
         return cached
+    owner: type = kind
     reached = _module_reaches(kind)
-    hints, resolved = _resolvable_hints(kind, include_extras=False)
+    plain = _plain_hints(kind)
+    hints, resolved = (
+        (plain, True)
+        if plain is not None
+        else _resolvable_hints(kind, include_extras=False)
+    )
     names = (
         dict.fromkeys([item.name for item in fields(kind)] + list(slot_names(kind)))
         if is_dataclass(kind)
         else hints
     )
     result = MappingProxyType(
-        {name: _resolve_alias(hints.get(name, object)) for name in names},
+        {name: _resolved_hint(hints.get(name, object)) for name in names},
     )
     if (
         resolved
         and reached
-        and not any(
-            hint is kind or kind in cast("tuple[object, ...]", get_args(hint))
-            for hint in result.values()
-        )
+        and not any(_names(hint, owner) for hint in result.values())
     ):
         _FIELD_TYPES[kind] = result
     return result
+
+
+def _names(hint: object, kind: object) -> bool:
+    """Return whether ``hint`` is ``kind`` or holds it as an argument."""
+    if hint is kind:
+        return True
+    # A plain class has no arguments; skip asking ``get_args`` for them.
+    if type(hint) is type:
+        return False
+    return kind in cast("tuple[object, ...]", get_args(hint))
+
+
+# ``get_type_hints`` evaluates each annotation and strips ``Annotated``; for a
+# class whose annotations are all plain classes, ``X | Y`` of them, or builtin
+# generics of them, each already is its evaluated, stripped self. Reading them
+# straight off each base is about three times cheaper, and any other
+# annotation leaves the full evaluation to ``get_type_hints``.
+def _plain_hints(kind: type) -> dict[str, object] | None:
+    """Return ``kind``'s hints as ``get_type_hints`` would, if all are plain, else ``None``."""
+    if getattr(kind, "__no_type_check__", None):
+        return None
+    hints: dict[str, object] = {}
+    for base in reversed(kind.__mro__):
+        # A deferred annotation naming what does not exist yet raises here;
+        # ``get_type_hints`` decides what that means.
+        try:
+            annotations = cast("dict[str, object]", inspect.get_annotations(base))
+        except (AttributeError, NameError, TypeError):
+            return None
+        for name, hint in annotations.items():
+            if not _is_plain_hint(hint):
+                return None
+            hints[name] = _rebuilt_hint(hint)
+    return hints
+
+
+# ``get_type_hints`` hands back a builtin generic as a new alias over the same
+# arguments, and any other plain hint as itself, ``None`` as its class.
+def _rebuilt_hint(hint: object) -> object:
+    """Return ``hint`` as ``get_type_hints`` hands it back."""
+    if hint is None:
+        return type(None)
+    if isinstance(hint, GenericAlias) and type(hint) is GenericAlias:
+        origin = cast("type", hint.__origin__)
+        return GenericAlias(origin, hint.__args__)
+    return hint
+
+
+def _is_plain_hint(hint: object) -> bool:
+    """Return whether ``hint`` is its own evaluated, ``Annotated``-free form."""
+    # ``None`` reads as its class; ``...`` closes a variadic tuple's arguments.
+    if hint is None or hint is Ellipsis:
+        return True
+    if type(hint) is type:
+        return True
+    if isinstance(hint, UnionType):
+        return all(map(_is_plain_hint, cast("tuple[object, ...]", hint.__args__)))
+    if isinstance(hint, GenericAlias) and type(hint) is GenericAlias:
+        return not hint.__unpacked__ and all(
+            map(_is_plain_hint, cast("tuple[object, ...]", hint.__args__)),
+        )
+    return False
+
+
+def _resolved_hint(hint: object) -> object:
+    """``_resolve_alias``, skipped for a plain class, which is no alias."""
+    return hint if type(hint) is type else _resolve_alias(hint)
 
 
 def _module_reaches(kind: type) -> bool:

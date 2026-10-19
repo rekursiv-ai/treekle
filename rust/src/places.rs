@@ -7,7 +7,7 @@ use hashbrown::HashTable;
 use pyo3::ffi;
 use pyo3::prelude::*;
 
-use crate::common::{B, py_eq, t_int, t_str, tp};
+use crate::py::{B, py_eq, t_int, t_str, tp};
 
 pub const ROOT: u32 = 0;
 const SEED: u64 = 0x243f_6a88_85a3_08d3;
@@ -70,13 +70,12 @@ fn index_matches(index: usize, other: &B<'_>) -> PyResult<bool> {
 impl<'py> Paths<'py> {
     pub fn new(py: Python<'py>) -> Self {
         let _ = py;
-        let mut frames = Vec::with_capacity(64);
-        frames.push(Frame {
+        let frames = vec![Frame {
             parent: ROOT,
             depth: 0,
             hash: SEED,
             step: Step::Index(0),
-        });
+        }];
         Self { frames }
     }
 
@@ -194,8 +193,8 @@ pub struct PlacedTable<'py> {
 impl<'py> PlacedTable<'py> {
     pub fn new() -> Self {
         Self {
-            table: HashTable::with_capacity(64),
-            log: Vec::with_capacity(64),
+            table: HashTable::new(),
+            log: Vec::new(),
         }
     }
 

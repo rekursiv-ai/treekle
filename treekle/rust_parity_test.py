@@ -896,6 +896,40 @@ def test_planted_cache_entries_encode_as_python_does(
     assert ("a" in expected) == (planted != "slots")
 
 
+@pytest.mark.parametrize("sort", [True, False])
+@pytest.mark.parametrize("planted", ["import path", "slots", "sorted slots"])
+def test_cache_entries_planted_before_a_first_encode_win(
+    monkeypatch: pytest.MonkeyPatch,
+    planted: str,
+    sort: bool,
+) -> None:
+    from treekle import reflect  # noqa: PLC0415 -- Only this test reads it.
+
+    # A class the core never met, so nothing native was kept for it.
+    module = ModuleType(f"treekle_parity_planted_{planted[0]}{sort:d}")
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    pair = dataclass(slots=True)(_class(module.__name__, "Pair", a=int, b=int))
+    vars(module)["Pair"] = pair
+    if planted == "import path":
+        monkeypatch.setitem(serialize._IMPORT_PATHS, id(pair), (pair, "a.b"))
+    if planted == "slots":
+        monkeypatch.setitem(reflect._SLOT_NAMES, pair, ("b",))
+    if planted != "import path":
+        # Read alone when sorting: ``attribute_names`` asks it first.
+        monkeypatch.setitem(reflect._SORTED_SLOT_NAMES, pair, ("b",))
+    value = cast("Callable[..., object]", pair)(a=1, b=2)
+
+    # Native first: Python's walk would fill the other caches for ``pair``.
+    actual = serialize.to_plain(value, sort=sort)
+    expected = serialize._python_to_plain(value, sort=sort)
+
+    assert actual == expected
+    assert isinstance(expected, dict)
+    assert (expected["py/object"] == "a.b") == (planted == "import path")
+    dropped = planted == "slots" or (planted == "sorted slots" and sort)
+    assert ("a" in expected) != dropped
+
+
 @needs_rust
 @pytest.mark.parametrize("source", ["cache", "mapping"])
 def test_encoder_changes_during_walk_match_python(
@@ -1332,6 +1366,33 @@ def test_a_class_made_a_dataclass_after_a_read_reads_as_one(
 
     _assert_reads_alike(data, outer)
     _assert_reads_alike(data["inner"], inner)
+
+
+def test_cached_field_types_are_read_before_the_class_is(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Python's ``_field_types`` answers from ``_FIELD_TYPES`` first, so an
+    # entry already there decides the read, whatever the class declares.
+    # Compiled apart from this file, whose postponed annotations ``exec``
+    # would inherit: a hint left a string is never read natively.
+    module = ModuleType("treekle_parity_cached_types")
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    source = (
+        "import dataclasses\n"
+        "@dataclasses.dataclass(slots=True)\n"
+        "class Cached:\n"
+        "    x: int = 0\n"
+    )
+    exec(  # noqa: S102 -- Fixed source, for evaluated annotations.
+        compile(source, module.__name__, "exec", dont_inherit=True),
+        vars(module),
+    )
+    cached = cast("type[Point]", vars(module)["Cached"])
+    deserialize._FIELD_TYPES[cached] = MappingProxyType({"x": str})
+
+    assert deserialize.from_plain({"x": "text"}, cached).x == "text"
+    assert deserialize._python_from_plain({"x": "text"}, cached).x == "text"
+    _assert_reads_alike({"x": 1}, cached)
 
 
 def test_a_renamed_dataclass_reads_by_its_new_name() -> None:

@@ -1,4 +1,5 @@
-//! Small helpers shared by the decoder and the encoder.
+//! Python object access the decoder and encoder share: the GIL cell, option
+//! flags, recursion guards, type tests, str bytes and dict iteration.
 
 use std::cell::UnsafeCell;
 
@@ -226,81 +227,6 @@ impl Drop for Recursion {
     }
 }
 
-unsafe extern "C" {
-    fn PyUnstable_Type_AssignVersionTag(kind: *mut ffi::PyTypeObject) -> std::ffi::c_int;
-}
-
-/// What a fact learned from a class assumed about it. CPython replaces a
-/// class's version tag whenever the class or a base changes, and never reuses
-/// one; but 3.13 and later rename a class (``__qualname__``) without a new tag,
-/// so the name object is held and compared too. Immutable types never change.
-pub struct Stamp {
-    tag: u32,
-    qualname: Option<Py<PyAny>>,
-}
-
-impl Stamp {
-    /// The class's current state, or ``None`` if it cannot change.
-    pub fn of(class: &B<'_>) -> Option<Self> {
-        let kind = class.as_ptr().cast::<ffi::PyTypeObject>();
-        unsafe {
-            if ffi::PyType_HasFeature(kind, ffi::Py_TPFLAGS_IMMUTABLETYPE) != 0 {
-                return None;
-            }
-            if (*kind).tp_version_tag == 0 {
-                // A class out of tags stays at 0, which never matches.
-                PyUnstable_Type_AssignVersionTag(kind);
-            }
-            let qualname = heap_qualname(kind);
-            Some(Self {
-                tag: (*kind).tp_version_tag,
-                qualname: (!qualname.is_null())
-                    .then(|| Py::from_borrowed_ptr(class.py(), qualname)),
-            })
-        }
-    }
-
-    /// The class's current state, immutable classes included. A fact kept
-    /// across calls by class address needs this: version tags are never
-    /// reused, so a new class that takes a dead one's address never matches.
-    pub fn always(class: &B<'_>) -> Self {
-        let kind = class.as_ptr().cast::<ffi::PyTypeObject>();
-        unsafe {
-            if (*kind).tp_version_tag == 0 {
-                PyUnstable_Type_AssignVersionTag(kind);
-            }
-            let qualname = heap_qualname(kind);
-            Self {
-                tag: (*kind).tp_version_tag,
-                qualname: (!qualname.is_null())
-                    .then(|| Py::from_borrowed_ptr(class.py(), qualname)),
-            }
-        }
-    }
-
-    /// Whether ``class`` is unchanged since this stamp was taken of it.
-    #[inline]
-    pub fn holds(&self, class: &B<'_>) -> bool {
-        let kind = class.as_ptr().cast::<ffi::PyTypeObject>();
-        let qualname = self
-            .qualname
-            .as_ref()
-            .map_or(std::ptr::null_mut(), Py::as_ptr);
-        self.tag != 0
-            && unsafe { (*kind).tp_version_tag == self.tag && heap_qualname(kind) == qualname }
-    }
-}
-
-#[inline]
-unsafe fn heap_qualname(kind: *mut ffi::PyTypeObject) -> *mut ffi::PyObject {
-    unsafe {
-        if ffi::PyType_HasFeature(kind, ffi::Py_TPFLAGS_HEAPTYPE) == 0 {
-            return std::ptr::null_mut();
-        }
-        (*kind.cast::<ffi::PyHeapTypeObject>()).ht_qualname
-    }
-}
-
 #[inline(always)]
 pub fn tp(obj: &B<'_>) -> *mut ffi::PyTypeObject {
     unsafe { ob_type(obj.as_ptr()) }
@@ -437,6 +363,53 @@ unsafe fn compact_ascii(raw: *mut ffi::PyObject) -> bool {
         .cast::<ffi::Py_ssize_t>();
     let state = unsafe { *header.add(2).cast::<u32>() };
     state & (COMPACT | ASCII) == COMPACT | ASCII
+}
+
+/// Whether the exact str at ``raw`` is compact ASCII.
+///
+/// # Safety
+/// ``raw`` is a live exact ``str``.
+#[inline]
+pub unsafe fn compact_ascii_str(raw: *mut ffi::PyObject) -> bool {
+    unsafe { compact_ascii(raw) }
+}
+
+/// The bytes of a compact ASCII str.
+///
+/// # Safety
+/// ``raw`` is a live compact ASCII ``str``, held while the bytes are used.
+#[inline]
+pub unsafe fn ascii_bytes<'a>(raw: *mut ffi::PyObject) -> &'a [u8] {
+    unsafe {
+        let ascii = raw.cast::<ffi::PyASCIIObject>();
+        std::slice::from_raw_parts(ascii.add(1).cast::<u8>(), (*ascii).length as usize)
+    }
+}
+
+/// ``utf8`` for a raw str pointer, with no reference taken; the bytes live
+/// as long as the str.
+///
+/// # Safety
+/// ``raw`` is a live ``str``, held for as long as the bytes are used.
+#[inline]
+pub unsafe fn utf8_raw<'a>(raw: *mut ffi::PyObject) -> Option<&'a [u8]> {
+    unsafe {
+        if compact_ascii(raw) {
+            let ascii = raw.cast::<ffi::PyASCIIObject>();
+            let length = (*ascii).length as usize;
+            return Some(std::slice::from_raw_parts(
+                ascii.add(1).cast::<u8>(),
+                length,
+            ));
+        }
+        let mut size: ffi::Py_ssize_t = 0;
+        let data = ffi::PyUnicode_AsUTF8AndSize(raw, &mut size);
+        if data.is_null() {
+            ffi::PyErr_Clear();
+            return None;
+        }
+        Some(std::slice::from_raw_parts(data.cast::<u8>(), size as usize))
+    }
 }
 
 /// The UTF-8 bytes of a str, or ``None`` when it holds lone surrogates.
@@ -578,26 +551,21 @@ pub struct DictItems<'py> {
     /// so it is reported again, as the iterator's is.
     used: ffi::Py_ssize_t,
     left: ffi::Py_ssize_t,
-    done: bool,
 }
 
 impl<'py> DictItems<'py> {
-    pub fn new(dict: &Bound<'py, PyDict>) -> PyResult<Self> {
+    pub fn new(dict: &Bound<'py, PyDict>) -> Self {
         let used = unsafe { ffi::PyDict_Size(dict.as_ptr()) };
-        Ok(Self {
+        Self {
             dict: dict.clone(),
             position: 0,
             used,
             left: used,
-            done: false,
-        })
+        }
     }
 
     #[inline]
     pub fn next_item(&mut self) -> PyResult<Option<(B<'py>, B<'py>)>> {
-        if self.done {
-            return Ok(None);
-        }
         let dict = self.dict.as_ptr();
         if unsafe { ffi::PyDict_Size(dict) } != self.used {
             self.used = -1;
@@ -608,11 +576,9 @@ impl<'py> DictItems<'py> {
         let mut key = std::ptr::null_mut();
         let mut value = std::ptr::null_mut();
         if unsafe { ffi::PyDict_Next(dict, &mut self.position, &mut key, &mut value) } == 0 {
-            self.done = true;
             return Ok(None);
         }
         if self.left == 0 {
-            self.done = true;
             return Err(PyRuntimeError::new_err(
                 "dictionary keys changed during iteration",
             ));
@@ -630,25 +596,35 @@ impl<'py> DictItems<'py> {
     }
 }
 
+/// ``key, value = pair``, raising what that unpacking raises. A tuple or
+/// list is sized first and names its size when it is too long; anything
+/// else is iterated once, three items at most.
 fn unpack_pair<'py>(pair: B<'py>) -> PyResult<(B<'py>, B<'py>)> {
     let kind = tp(&pair);
-    if kind == t_tuple() {
-        let pair = unsafe { pair.cast_unchecked::<PyTuple>() };
-        if pair.len() == 2 {
+    if kind == t_tuple() || kind == t_list() {
+        let size = pair.len()?;
+        if size == 2 {
             return Ok((pair.get_item(0)?, pair.get_item(1)?));
         }
-    } else if kind == t_list() && pair.len()? == 2 {
-        return Ok((pair.get_item(0)?, pair.get_item(1)?));
+        // CPython names the size of a too-long sequence from 3.14 on.
+        let message = if size < 2 {
+            format!("not enough values to unpack (expected 2, got {size})")
+        } else if cfg!(Py_3_14) {
+            format!("too many values to unpack (expected 2, got {size})")
+        } else {
+            "too many values to unpack (expected 2)".to_owned()
+        };
+        return Err(PyValueError::new_err(message));
     }
     let mut iter = pair.try_iter()?;
-    let first = iter
-        .next()
-        .transpose()?
-        .ok_or_else(|| PyValueError::new_err("not enough values to unpack (expected 2, got 0)"))?;
-    let second = iter
-        .next()
-        .transpose()?
-        .ok_or_else(|| PyValueError::new_err("not enough values to unpack (expected 2, got 1)"))?;
+    let mut next = |got: usize| {
+        iter.next().transpose()?.ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "not enough values to unpack (expected 2, got {got})"
+            ))
+        })
+    };
+    let (first, second) = (next(0)?, next(1)?);
     if iter.next().transpose()?.is_some() {
         return Err(PyValueError::new_err(
             "too many values to unpack (expected 2)",
@@ -668,7 +644,7 @@ impl<'py> MapItems<'py> {
         if tp(mapping) == t_dict() {
             return Ok(Self::Dict(DictItems::new(unsafe {
                 mapping.cast_unchecked::<PyDict>()
-            })?));
+            })));
         }
         let items = mapping.call_method0(pyo3::intern!(mapping.py(), "items"))?;
         Ok(Self::Iter(items.try_iter()?))

@@ -20,8 +20,10 @@ use pyo3::types::{
     PyWeakrefReference,
 };
 
-use crate::common::*;
-use crate::paths::{Loc, Paths, PlacedTable, ROOT, StepRef};
+use crate::class::{_PyType_Lookup, Stamp, object_new, own_namespace, slot_offset, store_offsets};
+use crate::errors::*;
+use crate::places::{Loc, Paths, PlacedTable, ROOT, StepRef};
+use crate::py::*;
 
 // ---------------------------------------------------------------- globals --
 
@@ -101,6 +103,17 @@ fn tag_text(tag: Tag) -> &'static str {
 
 pub struct DecGlobals {
     module: Py<PyDict>,
+    /// ``_field_types``, ``_plain_hints`` and ``slot_names`` as the module
+    /// defines them, so a class's field types may be read natively.
+    field_types_own: [Py<PyAny>; 3],
+    /// ``types.UnionType``, ``types.GenericAlias``, ``types.ModuleType``,
+    /// ``weakref.WeakKeyDictionary`` and ``sys.modules``, held from setup.
+    native_types: [Py<PyAny>; 5],
+    /// The module's own ``_resolve_alias``, ``get_origin``, ``_decoder_for``,
+    /// ``get_args``, ``_import_name``, ``is_dataclass``, ``_is_any``,
+    /// ``is_typeddict``, ``_is_protocol`` and ``_DECODERS``: while each is
+    /// in place, a plain dataclass's plan is compiled natively.
+    compile_own: Vec<(&'static str, Py<PyAny>)>,
     read_error: Py<PyAny>,
     invalid: Py<PyAny>,
     pending: Py<PyAny>,
@@ -203,14 +216,13 @@ struct FieldLayout {
 fn field_layout(kind: &B<'_>) -> Option<FieldLayout> {
     let class = kind.as_ptr().cast::<ffi::PyTypeObject>();
     // A class whose attribute lookup is not ``object``'s could answer
-    // ``getattr`` without its slots; and an immutable type cannot change them.
-    let generic = unsafe { (*class).tp_getattro }.map(|f| f as usize) == generic_getattr_slot();
-    if !generic {
+    // ``getattr`` without its slots.
+    if unsafe { (*class).tp_getattro }.map(|f| f as usize) != generic_getattr_slot() {
         return None;
     }
     let py = kind.py();
     let stamp = Stamp::always(kind);
-    let offsets = FIELD_SLOTS.map(|slot| member_offset(class, slot.name(py)));
+    let offsets = FIELD_SLOTS.map(|slot| slot_offset(class, slot.name(py).as_any()));
     Some(FieldLayout {
         kind: kind.clone().unbind(),
         stamp,
@@ -218,73 +230,12 @@ fn field_layout(kind: &B<'_>) -> Option<FieldLayout> {
     })
 }
 
-unsafe extern "C" {
-    fn _PyType_Lookup(kind: *mut ffi::PyTypeObject, name: *mut ffi::PyObject)
-    -> *mut ffi::PyObject;
-}
-
-fn member_offset(class: *mut ffi::PyTypeObject, name: &Bound<'_, PyString>) -> Option<isize> {
-    const PY_AUDIT_READ: std::ffi::c_int = 2;
-    unsafe {
-        let found = _PyType_Lookup(class, name.as_ptr());
-        if found.is_null() || ob_type(found) != &raw mut ffi::PyMemberDescr_Type {
-            return None;
-        }
-        let descriptor = found.cast::<ffi::PyMemberDescrObject>();
-        if ffi::PyType_IsSubtype(class, (*descriptor).d_common.d_type) == 0 {
-            return None;
-        }
-        let member = (*descriptor).d_member.cast::<ffi::PyMemberDef>();
-        if (*member).type_code != ffi::Py_T_OBJECT_EX || (*member).flags & PY_AUDIT_READ != 0 {
-            return None;
-        }
-        Some((*member).offset)
-    }
-}
-
-/// Each field slot's member offset in ``kind``, where storing through it is
-/// what ``object.__setattr__`` would do: ``kind`` is a plain-``type`` class
-/// whose ``__setattr__`` is ``object``'s, and the name finds a writable
-/// object member of ``kind``'s own layout. Stamped before it is read.
-fn store_offsets(kind: &B<'_>, info: &DcInfo) -> (Stamp, Vec<Option<isize>>) {
-    let py = kind.py();
-    let stamp = Stamp::always(kind);
-    let class = kind.as_ptr().cast::<ffi::PyTypeObject>();
-    let generic = unsafe {
-        ob_type(kind.as_ptr()) == &raw mut ffi::PyType_Type
-            && (*class).tp_setattro.map(|f| f as usize)
-                == ffi::PyBaseObject_Type.tp_setattro.map(|f| f as usize)
-    };
-    let Some(names) = info.names.as_ref().filter(|_| generic) else {
-        return (stamp, Vec::new());
-    };
-    let offsets = names
-        .iter()
-        .map(|name| {
-            let name = PyString::new(py, std::str::from_utf8(name).ok()?);
-            writable_offset(class, &name)
-        })
-        .collect();
-    (stamp, offsets)
-}
-
-/// The offset of ``name``'s object member, when ``_PyType_Lookup`` finds it
-/// first and it is writable: ``object.__setattr__`` then stores through it.
-fn writable_offset(class: *mut ffi::PyTypeObject, name: &Bound<'_, PyString>) -> Option<isize> {
-    unsafe {
-        let found = _PyType_Lookup(class, name.as_ptr());
-        if found.is_null() || ob_type(found) != &raw mut ffi::PyMemberDescr_Type {
-            return None;
-        }
-        let descriptor = found.cast::<ffi::PyMemberDescrObject>();
-        if ffi::PyType_IsSubtype(class, (*descriptor).d_common.d_type) == 0 {
-            return None;
-        }
-        let member = (*descriptor).d_member.cast::<ffi::PyMemberDef>();
-        if (*member).type_code != ffi::Py_T_OBJECT_EX || (*member).flags & ffi::Py_READONLY != 0 {
-            return None;
-        }
-        Some((*member).offset)
+/// ``store_offsets`` for a dataclass's fields; empty unless every field name
+/// is an exact str.
+fn field_stores(kind: &B<'_>, info: &DcInfo) -> (Stamp, Vec<Option<isize>>) {
+    match &info.names {
+        Some(names) => store_offsets(kind, names),
+        None => (Stamp::always(kind), Vec::new()),
     }
 }
 
@@ -350,6 +301,36 @@ pub fn setup(module: &Bound<'_, PyDict>) -> PyResult<()> {
     }
     let globals = DecGlobals {
         module: module.clone().unbind(),
+        field_types_own: [
+            get("_field_types")?,
+            get("_plain_hints")?,
+            get("slot_names")?,
+        ],
+        compile_own: [
+            "_resolve_alias",
+            "get_origin",
+            "_decoder_for",
+            "get_args",
+            "_import_name",
+            "is_dataclass",
+            "_is_any",
+            "is_typeddict",
+            "_is_protocol",
+            "_DECODERS",
+        ]
+        .into_iter()
+        .map(|name| Ok((name, get(name)?)))
+        .collect::<PyResult<_>>()?,
+        native_types: {
+            let types = py.import("types")?;
+            [
+                types.getattr("UnionType")?.unbind(),
+                types.getattr("GenericAlias")?.unbind(),
+                types.getattr("ModuleType")?.unbind(),
+                py.import("weakref")?.getattr("WeakKeyDictionary")?.unbind(),
+                py.import("sys")?.getattr("modules")?.unbind(),
+            ]
+        },
         read_error: get("ReadError")?,
         invalid: get("Invalid")?,
         pending: get("PENDING")?,
@@ -437,6 +418,11 @@ struct DcInfo {
     /// Slots by name bytes: ``to_plain`` sorts a record's keys by default,
     /// so a sorted record meets its fields in this order.
     sorted: Vec<usize>,
+    /// Per key position in a record, the key str last found there and its
+    /// slot: records ``to_plain`` writes list the same interned keys in the
+    /// same order, so the same object names the same slot with no byte
+    /// compare. Held, so no other str can take its address.
+    seen: RefCell<Vec<Option<SeenKey>>>,
     targets: Vec<Py<PyAny>>,
     plans: Vec<RefCell<Option<Rc<Plan>>>>,
     persistent: bool,
@@ -444,9 +430,35 @@ struct DcInfo {
     /// into an instance of exactly the class these facts were read from;
     /// filled on first use, ``None`` where only ``setattr`` itself will do.
     stores: OnceCell<(Stamp, Vec<Option<isize>>)>,
+    /// Whether ``__dataclass_fields__`` holds exactly the fields in ``names``,
+    /// found with no Python code run, read under the stamp it holds for. A
+    /// record reading every slot then declares exactly what it holds.
+    complete: OnceCell<(Stamp, bool)>,
 }
 
+/// A key str a record held at one position, and the slot it named.
+type SeenKey = (Py<PyAny>, usize);
+
 impl DcInfo {
+    /// The slot of the exact str ``key`` at position ``at`` of a record:
+    /// the slot last found for this very str there, else by its bytes.
+    #[inline]
+    fn slot_at(&self, at: usize, key: *mut ffi::PyObject, py: Python<'_>) -> Option<usize> {
+        if let Some(Some((seen, slot))) = self.seen.borrow().get(at)
+            && seen.as_ptr() == key
+        {
+            return Some(*slot);
+        }
+        let key = unsafe { Bound::from_borrowed_ptr(py, key) };
+        let slot = *self.slots.get(utf8(&key)?)?;
+        if let Some(entry) = self.seen.borrow_mut().get_mut(at) {
+            // A str's deallocation runs no Python code.
+            let stale = entry.replace((key.unbind(), slot));
+            drop(stale);
+        }
+        Some(slot)
+    }
+
     /// The slot of the field named ``key``, searched from ``cursor``, which
     /// moves past the match: records list fields in order, so each key is
     /// usually found at the first slot tried. ``None`` where no field has
@@ -488,6 +500,8 @@ struct Plan {
     own: Option<Stamp>,
     /// Every other class the plan's facts were read from.
     deps: Vec<(Py<PyAny>, Stamp)>,
+    /// The compiled reader for this target, once tried.
+    program: RefCell<Compiled>,
 }
 
 impl Plan {
@@ -740,9 +754,11 @@ const OBJECT_LIMIT: usize = 1 << 10;
 /// dead entry per call; uncounted, they filled the maps until the limit.
 static DIED: AtomicUsize = AtomicUsize::new(0);
 
+/// The callback ``counted_weak`` gives each of its weak references.
+static ON_DEATH: PyOnceLock<Py<PyCFunction>> = PyOnceLock::new();
+
 /// A weak reference to ``target`` that counts its death in ``DIED``.
 fn counted_weak<'py>(target: &B<'py>) -> PyResult<Bound<'py, PyWeakrefReference>> {
-    static ON_DEATH: PyOnceLock<Py<PyCFunction>> = PyOnceLock::new();
     let py = target.py();
     let callback = ON_DEATH.get_or_try_init(py, || {
         PyCFunction::new_closure(py, None, None, |_, _| {
@@ -796,40 +812,8 @@ fn new_caches(py: Python<'_>) -> Caches {
         info: OnceCell::new(),
         own: None,
         deps: Vec::new(),
+        program: RefCell::new(Compiled::Untried),
     }))
-}
-
-// ----------------------------------------------------------------- errors --
-
-pub enum DErr {
-    Read(String, Option<PyErr>),
-    Py(PyErr),
-}
-
-impl From<PyErr> for DErr {
-    fn from(error: PyErr) -> Self {
-        Self::Py(error)
-    }
-}
-
-type DR<T> = Result<T, DErr>;
-
-fn fail<T>(message: String) -> DR<T> {
-    Err(DErr::Read(message, None))
-}
-
-fn fail_from<T>(message: String, cause: PyErr) -> DR<T> {
-    Err(DErr::Read(message, Some(cause)))
-}
-
-/// Link ``cause`` to ``error`` as Python's ``raise error from cause`` does
-/// inside ``except``: as both its ``__cause__`` and its ``__context__``.
-fn chain(py: Python<'_>, error: &PyErr, cause: PyErr) {
-    let cause = cause.into_value(py);
-    unsafe {
-        ffi::PyException_SetContext(error.value(py).as_ptr(), cause.clone_ref(py).into_ptr());
-        ffi::PyException_SetCause(error.value(py).as_ptr(), cause.into_ptr());
-    }
 }
 
 // ---------------------------------------------------------------- decoder --
@@ -865,44 +849,9 @@ pub struct Decoder<'py, 'g> {
     /// address and held so neither address is reused.
     unread: HashMap<(usize, usize), (B<'py>, B<'py>)>,
     reading: HashSet<usize>,
-    /// How many containers ``quick`` is reading on the Rust stack now.
-    quick_depth: u32,
 }
 
 type Mark = (usize, usize, usize);
-
-/// How deep ``quick`` recurses before handing nodes to the frames, which
-/// keep the Rust stack flat however deep the tree is.
-const QUICK_DEPTH: u32 = 24;
-
-/// What ``start`` would make of an exact dict, judged by its keys alone.
-enum DictShape<'py> {
-    /// Exact str keys, none a tag, reference or escaped key.
-    Plain,
-    /// ``{"py/tuple": payload}``.
-    Tuple(B<'py>),
-    /// Anything else, left to the frames.
-    Other,
-}
-
-fn dict_shape<'py>(dict: &Bound<'py, PyDict>) -> DictShape<'py> {
-    let entries = dict_entries(dict);
-    if let [(key, payload)] = entries.as_slice()
-        && tp(key) == t_str()
-        && utf8(key) == Some(b"py/tuple".as_slice())
-    {
-        return DictShape::Tuple(payload.clone());
-    }
-    for (key, _) in &entries {
-        let Some(text) = (tp(key) == t_str()).then(|| utf8(key)).flatten() else {
-            return DictShape::Other;
-        };
-        if text.starts_with(b"py/") || text.starts_with(b"json://") {
-            return DictShape::Other;
-        }
-    }
-    DictShape::Plain
-}
 
 impl<'py, 'g> Decoder<'py, 'g> {
     // ------------------------------------------------------------ helpers --
@@ -916,7 +865,11 @@ impl<'py, 'g> Decoder<'py, 'g> {
         untagged: bool,
         caches: Caches,
     ) -> PyResult<Self> {
-        let resolved = item(g.module.bind(py), "_RESOLVED")?
+        let resolved = g
+            .module
+            .bind(py)
+            .get_item(pyo3::intern!(py, "_RESOLVED"))?
+            .ok_or_else(|| PyAttributeError::new_err("treekle.deserialize has no _RESOLVED"))?
             .cast_into::<PyDict>()
             .map_err(PyErr::from)?;
         Ok(Self {
@@ -926,7 +879,7 @@ impl<'py, 'g> Decoder<'py, 'g> {
             allow_imports,
             strict,
             untagged,
-            built: Vec::with_capacity(64),
+            built: Vec::new(),
             paths: Paths::new(py),
             placed: PlacedTable::new(),
             bad: None,
@@ -940,7 +893,6 @@ impl<'py, 'g> Decoder<'py, 'g> {
             references: 0,
             unread: HashMap::new(),
             reading: HashSet::new(),
-            quick_depth: 0,
         })
     }
 
@@ -1204,7 +1156,7 @@ impl<'py, 'g> Decoder<'py, 'g> {
         member: &B<'py>,
     ) -> PyResult<()> {
         if tp(value) == kind.as_ptr().cast() {
-            let (stamp, offsets) = info.stores.get_or_init(|| store_offsets(kind, info));
+            let (stamp, offsets) = info.stores.get_or_init(|| field_stores(kind, info));
             if stamp.holds(kind)
                 && let Some(Some(offset)) = offsets.get(slot)
             {
@@ -1228,22 +1180,11 @@ impl<'py, 'g> Decoder<'py, 'g> {
 
     fn allocate(&self, kind: &B<'py>) -> PyResult<B<'py>> {
         let py = self.py;
-        // ``kind.__new__(kind)`` is ``object.__new__(kind)`` when a plain
-        // ``type`` metaclass finds ``object``'s own ``__new__`` and ``kind``
-        // inherits its slot; that call is the slot with no arguments.
-        unsafe {
+        // ``object.__new__(kind)`` is its slot called with no arguments.
+        if let Some(new) = object_new(kind) {
             let class = kind.as_ptr().cast::<ffi::PyTypeObject>();
-            let name = pyo3::intern!(py, "__new__").as_ptr();
-            let base = &raw mut ffi::PyBaseObject_Type;
-            if ob_type(kind.as_ptr()) == &raw mut ffi::PyType_Type
-                && (*class).tp_new.map(|f| f as usize) == (*base).tp_new.map(|f| f as usize)
-                && let Some(new) = (*base).tp_new
-                && !_PyType_Lookup(class, name).is_null()
-                && _PyType_Lookup(class, name) == _PyType_Lookup(base, name)
-            {
-                let made = new(class, PyTuple::empty(py).as_ptr(), std::ptr::null_mut());
-                return Bound::from_owned_ptr_or_err(py, made);
-            }
+            let made = unsafe { new(class, PyTuple::empty(py).as_ptr(), std::ptr::null_mut()) };
+            return unsafe { Bound::from_owned_ptr_or_err(py, made) };
         }
         kind.getattr(pyo3::intern!(py, "__new__"))?.call1((kind,))
     }
@@ -1324,6 +1265,9 @@ impl<'py, 'g> Decoder<'py, 'g> {
     }
 
     fn compile(&self, target: &B<'py>, persistent: bool) -> PyResult<Plan> {
+        if let Some(plan) = self.native_compile(target, persistent)? {
+            return Ok(plan);
+        }
         let py = self.py;
         let g = self.g;
         // Each class is stamped before any fact is read from it, so a change
@@ -1412,6 +1356,7 @@ impl<'py, 'g> Decoder<'py, 'g> {
             info: OnceCell::new(),
             own,
             deps,
+            program: RefCell::new(Compiled::Untried),
         })
     }
 
@@ -1490,7 +1435,10 @@ impl<'py, 'g> Decoder<'py, 'g> {
         }
         let py = self.py;
         let g = self.g;
-        let types = self.b(&g.field_types).call1((target,))?;
+        let types = match self.native_field_types(target)? {
+            Some(types) => types,
+            None => self.b(&g.field_types).call1((target,))?,
+        };
         let index = PyDict::new(py);
         let mut targets = Vec::new();
         let mut names = Some(Vec::new());
@@ -1516,10 +1464,11 @@ impl<'py, 'g> Decoder<'py, 'g> {
         if let Some(names) = &names {
             sorted.sort_by(|a, b| names[*a].cmp(&names[*b]));
         }
-        let persistent = self.b(&g.field_types_cache).contains(target)?;
+        let persistent = self.field_types_cached(target)?;
         let plans = (0..targets.len()).map(|_| RefCell::new(None)).collect();
         let info = Rc::new(DcInfo {
             index: index.unbind(),
+            seen: RefCell::new(sorted.iter().map(|_| None).collect()),
             names,
             slots,
             sorted,
@@ -1527,6 +1476,7 @@ impl<'py, 'g> Decoder<'py, 'g> {
             plans,
             persistent,
             stores: OnceCell::new(),
+            complete: OnceCell::new(),
         });
         if persistent && plan.persistent {
             let _ = plan.info.set(info.clone());
@@ -1589,7 +1539,7 @@ impl<'py, 'g> Decoder<'py, 'g> {
         let persistent =
             kind.is(self.b(&self.g.union_type)) || kind.is(self.b(&self.g.generic_alias));
         let plan = self.plan_for(target, persistent)?;
-        if let Some(value) = self.quick(data, target, &plan, Loc::At(ROOT))? {
+        if let Some(value) = self.run_program(data, target, &plan) {
             return Ok(value);
         }
         self.walk(data, target, &plan, Loc::At(ROOT))
@@ -1766,15 +1716,6 @@ impl<'py, 'g> Decoder<'py, 'g> {
         plan: &Rc<Plan>,
         at: Loc<'_, 'py>,
     ) -> DR<Start<'py>> {
-        match self.quick(raw, target, plan, at) {
-            Ok(Some(value)) => return Ok(Start::Value(value)),
-            Ok(None) => {}
-            Err(error) if self.is_read(&error) => {
-                let reason = self.message(&error)?;
-                return Ok(Start::Value(self.invalid(raw, &reason, at)?));
-            }
-            Err(error) => return Err(error),
-        }
         match self.start(raw, target, plan, at) {
             Err(error) if self.is_read(&error) => {
                 let reason = self.message(&error)?;
@@ -1915,7 +1856,7 @@ impl<'py, 'g> Decoder<'py, 'g> {
             return self.decode_stored(any, at);
         }
         if data.len() == 1 {
-            let mut items = DictItems::new(data)?;
+            let mut items = DictItems::new(data);
             if let Some((key, payload)) = items.next_item()?
                 && is_str(&key)
                 && let Some(tag) = utf8(&key).and_then(tag_named)
@@ -2013,393 +1954,6 @@ impl<'py, 'g> Decoder<'py, 'g> {
             Tag::Reduce => return self.decode_reduce(data, target, plan, at),
         };
         Ok(Start::Value(value))
-    }
-
-    // -------------------------------------------------------------- quick --
-
-    // The frames exist so a tree of any depth reads with a flat Rust stack.
-    // Most trees are shallow and regular, so ``quick`` reads the common nodes
-    // by recursion instead, taking each step ``start`` and the frames would
-    // take, in the same order. It answers ``None`` before any effect for a
-    // node it does not read that way; past that point every part reads as
-    // ``_start_part`` would, through ``part``.
-    /// A node read at once, recursively, else ``None`` for the frames.
-    fn quick(
-        &mut self,
-        raw: &B<'py>,
-        target: &B<'py>,
-        plan: &Rc<Plan>,
-        at: Loc<'_, 'py>,
-    ) -> DR<Option<B<'py>>> {
-        let kind = tp(raw);
-        let object = plan.is_object && target.is(self.b(&self.g.object));
-        if is_leaf_kind(kind) {
-            let own = target.as_ptr() == kind.cast::<ffi::PyObject>();
-            return Ok((own || object).then(|| raw.clone()));
-        }
-        // ``start`` refuses a container already being read only after
-        // starting it; the frames reproduce that.
-        if self.quick_depth >= QUICK_DEPTH || self.reading.contains(&(raw.as_ptr() as usize)) {
-            return Ok(None);
-        }
-        if kind == t_dict() {
-            let dict = unsafe { raw.cast_unchecked::<PyDict>() }.clone();
-            if object {
-                if self.untagged {
-                    return Ok(None);
-                }
-                let any = self.object_plan.clone();
-                return match dict_shape(&dict) {
-                    DictShape::Plain => {
-                        let pair = (target.clone(), any);
-                        self.quick_entries(raw, &dict, pair.clone(), pair, at)
-                    }
-                    DictShape::Tuple(payload) => {
-                        self.quick_tuple(raw, &payload, target, &any, false, at)
-                    }
-                    DictShape::Other => Ok(None),
-                };
-            }
-            if plan.resolved.is_some() {
-                return Ok(None);
-            }
-            if plan.kind == Kind::Object && plan.is_dataclass && is_class(target) {
-                return self.quick_record(raw, &dict, target, plan, at);
-            }
-            return match (plan.kind, dict_shape(&dict)) {
-                (Kind::Dict, DictShape::Plain) => {
-                    let args = plan.args.bind(self.py).clone();
-                    let (key, value) = if args.len() == 2 {
-                        let (key, value) = (args.get_item(0)?, args.get_item(1)?);
-                        let key_plan = self.plan_for(&key, plan.persistent)?;
-                        let value_plan = self.plan_for(&value, plan.persistent)?;
-                        ((key, key_plan), (value, value_plan))
-                    } else {
-                        let any = (self.b(&self.g.object).clone(), self.object_plan.clone());
-                        (any.clone(), any)
-                    };
-                    self.quick_entries(raw, &dict, key, value, at)
-                }
-                (Kind::Tuple, DictShape::Tuple(payload)) => {
-                    self.quick_tuple(raw, &payload, target, plan, true, at)
-                }
-                _ => Ok(None),
-            };
-        }
-        if kind == t_list() {
-            if object {
-                if self.untagged {
-                    return Ok(None);
-                }
-                let any = self.object_plan.clone();
-                return self.quick_items(raw, target, &any, at);
-            }
-            if plan.resolved.is_some() {
-                return Ok(None);
-            }
-            return match plan.kind {
-                Kind::List => {
-                    let (item, item_plan) = self.element(plan)?;
-                    self.quick_items(raw, &item, &item_plan, at)
-                }
-                Kind::Tuple => self.quick_tuple(raw, raw, target, plan, false, at),
-                _ => Ok(None),
-            };
-        }
-        Ok(None)
-    }
-
-    /// ``_start_part``, run to its value: a part that does not read is
-    /// recorded and becomes its ``Invalid``.
-    fn part(
-        &mut self,
-        raw: &B<'py>,
-        target: &B<'py>,
-        plan: &Rc<Plan>,
-        at: Loc<'_, 'py>,
-    ) -> DR<B<'py>> {
-        let read = match self.quick(raw, target, plan, at) {
-            Ok(Some(value)) => return Ok(value),
-            Ok(None) => self.walk(raw, target, plan, at),
-            Err(error) => Err(error),
-        };
-        match read {
-            Err(error) if self.is_read(&error) => {
-                let reason = self.message(&error)?;
-                self.invalid(raw, &reason, at)
-            }
-            read => read,
-        }
-    }
-
-    #[inline]
-    fn enter(&mut self, raw: &B<'py>) {
-        self.reading.insert(raw.as_ptr() as usize);
-        self.quick_depth += 1;
-    }
-
-    #[inline]
-    fn leave(&mut self, raw: &B<'py>) {
-        self.reading.remove(&(raw.as_ptr() as usize));
-        self.quick_depth -= 1;
-    }
-
-    /// ``decode_exact_object`` and the ``_Object`` frame it starts, at once.
-    fn quick_record(
-        &mut self,
-        raw: &B<'py>,
-        dict: &Bound<'py, PyDict>,
-        target: &B<'py>,
-        plan: &Rc<Plan>,
-        at: Loc<'_, 'py>,
-    ) -> DR<Option<B<'py>>> {
-        let py = self.py;
-        if !matches!(self.allow_imports, Flag::Known(_)) {
-            return Ok(None);
-        }
-        let info = self.dc_info(target, plan)?;
-        if info.names.is_none() {
-            return Ok(None);
-        }
-        let own = plan
-            .import_name
-            .as_ref()
-            .expect("classes have import names")
-            .bind(py);
-        let Some(own) = (tp(own) == t_str()).then(|| utf8(own)).flatten() else {
-            return Ok(None);
-        };
-        let mut entries = Vec::with_capacity(dict.len());
-        let mut stored = false;
-        let mut cursor = 0;
-        for (key, value) in dict_entries(dict) {
-            let Some(text) = (tp(&key) == t_str()).then(|| utf8(&key)).flatten() else {
-                return Ok(None);
-            };
-            if text == b"py/object" {
-                if (tp(&value) == t_str()).then(|| utf8(&value)).flatten() != Some(own) {
-                    return Ok(None);
-                }
-                stored = true;
-                continue;
-            }
-            match info.slot_of(text, &mut cursor) {
-                Some(slot) => entries.push((key, value, slot)),
-                None => return Ok(None),
-            }
-        }
-        let position = self.built.len();
-        let frame = self.frame(at)?;
-        let reserved = if stored {
-            self.allocate(target)?
-        } else {
-            self.pending()
-        };
-        self.place(frame, &reserved)?;
-        let before = self.bad_len();
-        self.enter(raw);
-        let built = match self.quick_fields(&info, frame, entries) {
-            Ok(members) => self.build_object(
-                frame, &info, target, stored, reserved, position, before, members,
-            ),
-            Err(error) => Err(error),
-        };
-        self.leave(raw);
-        built.map(Some)
-    }
-
-    /// The ``_Object`` frame's ``step``: each field read as its declared type.
-    #[allow(clippy::type_complexity)]
-    fn quick_fields(
-        &mut self,
-        info: &DcInfo,
-        frame: u32,
-        entries: Vec<(B<'py>, B<'py>, usize)>,
-    ) -> DR<Vec<(B<'py>, B<'py>, usize)>> {
-        let object = self.b(&self.g.object).clone();
-        let mut members = Vec::with_capacity(entries.len());
-        for (name, raw, slot) in entries {
-            let target = info.targets[slot].bind(self.py).clone();
-            if is_leaf_kind(tp(&raw)) && target.is(&object) {
-                members.push((name, raw, slot));
-                continue;
-            }
-            let plan = self.field_plan(info, slot)?;
-            let member = self.part(&raw, &target, &plan, Loc::Child(frame, StepRef::Key(&name)))?;
-            members.push((name, member, slot));
-        }
-        Ok(members)
-    }
-
-    /// ``decode_items`` and its list's frame, at once.
-    fn quick_items(
-        &mut self,
-        raw: &B<'py>,
-        item: &B<'py>,
-        plan: &Rc<Plan>,
-        at: Loc<'_, 'py>,
-    ) -> DR<Option<B<'py>>> {
-        let py = self.py;
-        let frame = self.frame(at)?;
-        if item.is(self.b(&self.g.object)) && self.all_leaves(raw)? {
-            let leaves =
-                unsafe { Bound::from_owned_ptr_or_err(py, ffi::PySequence_List(raw.as_ptr()))? };
-            self.place(frame, &leaves)?;
-            return Ok(Some(leaves));
-        }
-        let result = PyList::empty(py);
-        self.place(frame, result.as_any())?;
-        let mut built = Built::List(result.clone());
-        let types = Types::Repeat(item.clone(), plan.clone());
-        self.enter(raw);
-        let read = self.quick_seq(raw, frame, &types, &mut built);
-        self.leave(raw);
-        read.map(|()| Some(result.into_any()))
-    }
-
-    /// ``decode_tuple`` and its frame, at once, checked against ``target``
-    /// when a tag decoded it.
-    fn quick_tuple(
-        &mut self,
-        raw: &B<'py>,
-        payload: &B<'py>,
-        target: &B<'py>,
-        plan: &Rc<Plan>,
-        check: bool,
-        at: Loc<'_, 'py>,
-    ) -> DR<Option<B<'py>>> {
-        let py = self.py;
-        let kind = tp(payload);
-        if kind != t_list() && kind != t_tuple() {
-            return Ok(None);
-        }
-        let args = plan.args.bind(py).clone();
-        let types = if !plan.origin_is_tuple {
-            let (item, item_plan) = self.element(plan)?;
-            Types::Repeat(item, item_plan)
-        } else if args.len() == 2 && args.get_item(1)?.is(py.Ellipsis()) {
-            let first = args.get_item(0)?;
-            let first_plan = self.plan_for(&first, plan.persistent)?;
-            Types::Repeat(first, first_plan)
-        } else {
-            if args.len() != payload.len()? {
-                return Ok(None);
-            }
-            Types::Fixed(args, plan.persistent)
-        };
-        let frame = self.frame(at)?;
-        let mut built = Built::Tuple(Vec::new());
-        self.enter(raw);
-        let read = self.quick_seq(payload, frame, &types, &mut built);
-        self.leave(raw);
-        read?;
-        let Built::Tuple(values) = built else {
-            unreachable!("a tuple's items");
-        };
-        let value = PyTuple::new(py, values)?.into_any();
-        if check && !self.fits(&value, target, plan)? {
-            return fail(format!(
-                "cannot read {} as {}",
-                self.shown(&value)?,
-                self.target_text(target)?
-            ));
-        }
-        Ok(Some(value))
-    }
-
-    /// The ``_Items`` frame's ``step``, run to the end.
-    fn quick_seq(
-        &mut self,
-        data: &B<'py>,
-        frame: u32,
-        types: &Types<'py>,
-        built: &mut Built<'py>,
-    ) -> DR<()> {
-        let object = self.b(&self.g.object).clone();
-        let mut raws = SeqItems::new(data)?;
-        let mut index = 0;
-        while let Some(raw) = raws.next_item()? {
-            let here = index;
-            let fixed: (B<'py>, Rc<Plan>);
-            let (target, plan) = match types {
-                Types::Repeat(target, plan) => (target, plan),
-                Types::Fixed(types, persistent) => {
-                    if here >= types.len() {
-                        break;
-                    }
-                    let target = types.get_item(here)?;
-                    let plan = self.plan_for(&target, *persistent)?;
-                    fixed = (target, plan);
-                    (&fixed.0, &fixed.1)
-                }
-            };
-            index += 1;
-            if is_leaf_kind(tp(&raw)) && target.is(&object) {
-                self.put(built, raw)?;
-                continue;
-            }
-            let value = self.part(&raw, target, plan, Loc::Child(frame, StepRef::Index(here)))?;
-            self.put(built, value)?;
-        }
-        Ok(())
-    }
-
-    /// ``decode_entries_typed`` and its frame, at once.
-    fn quick_entries(
-        &mut self,
-        raw: &B<'py>,
-        dict: &Bound<'py, PyDict>,
-        key: (B<'py>, Rc<Plan>),
-        value: (B<'py>, Rc<Plan>),
-        at: Loc<'_, 'py>,
-    ) -> DR<Option<B<'py>>> {
-        let plain_keys = key.1.is_object || key.0.is(self.b(&self.g.str_type));
-        if !plain_keys {
-            return Ok(None);
-        }
-        let frame = self.frame(at)?;
-        let result = PyDict::new(self.py);
-        self.place(frame, result.as_any())?;
-        self.enter(raw);
-        let read = self.quick_pairs(dict, frame, &key, &value, &result);
-        self.leave(raw);
-        read.map(|()| Some(result.into_any()))
-    }
-
-    /// The ``_Entries`` frame's ``step``, run to the end.
-    fn quick_pairs(
-        &mut self,
-        dict: &Bound<'py, PyDict>,
-        frame: u32,
-        key: &(B<'py>, Rc<Plan>),
-        value: &(B<'py>, Rc<Plan>),
-        result: &Bound<'py, PyDict>,
-    ) -> DR<()> {
-        let object = self.b(&self.g.object).clone();
-        let mut items = DictItems::new(dict)?;
-        while let Some((name, raw)) = items.next_item()? {
-            let here = Loc::Child(frame, StepRef::Key(&name));
-            let decoded = if tp(&name) == t_str() && !str_starts(&name, "json://")? {
-                name.clone()
-            } else {
-                match self.decode_key(&name, &key.0, &key.1, here) {
-                    Ok(decoded) => decoded,
-                    Err(error) if self.is_read(&error) => {
-                        let reason = self.message(&error)?;
-                        self.invalid(&name, &reason, here)?;
-                        continue;
-                    }
-                    Err(error) => return Err(error),
-                }
-            };
-            if is_leaf_kind(tp(&raw)) && value.0.is(&object) {
-                result.set_item(decoded, raw)?;
-                continue;
-            }
-            let member = self.part(&raw, &value.0, &value.1, here)?;
-            result.set_item(decoded, member)?;
-        }
-        Ok(())
     }
 
     // ------------------------------------------------------------- frames --
@@ -2959,7 +2513,7 @@ impl<'py, 'g> Decoder<'py, 'g> {
 
     fn has_tag_key(&self, data: &B<'py>) -> PyResult<bool> {
         if tp(data) == t_dict() {
-            let mut items = DictItems::new(unsafe { data.cast_unchecked::<PyDict>() })?;
+            let mut items = DictItems::new(unsafe { data.cast_unchecked::<PyDict>() });
             while let Some((key, _)) = items.next_item()? {
                 if str_starts(&key, "py/")? {
                     return Ok(true);
@@ -3995,7 +3549,7 @@ impl<'py, 'g> Decoder<'py, 'g> {
             } else {
                 self.allocate(target)?
             };
-            let rest = if self.declares_exactly(target, &members) {
+            let rest = if self.covers(info, target, &members) {
                 for (key, member, slot) in &members {
                     self.store(info, target, &value, *slot, key, member)?;
                 }
@@ -4144,6 +3698,35 @@ impl<'py, 'g> Decoder<'py, 'g> {
     /// ``__dataclass_fields__``, found as ``getattr`` would with no Python code
     /// run: then ``with_defaults`` fills nothing and keeps ``members``' order.
     /// Read without iterating the fields, which is what makes it cheap.
+    /// ``declares_exactly``, answered once per class for a record that read
+    /// every one of ``info``'s slots, each once.
+    fn covers(&self, info: &DcInfo, target: &B<'py>, members: &[(B<'py>, B<'py>, usize)]) -> bool {
+        let count = info.names.as_ref().map_or(usize::MAX, Vec::len);
+        if members.len() == count {
+            let (stamp, complete) = info.complete.get_or_init(|| {
+                let stamp = Stamp::always(target);
+                let keys = info
+                    .names
+                    .iter()
+                    .flatten()
+                    .map(|name| {
+                        let text = std::str::from_utf8(name).unwrap_or_default();
+                        (
+                            PyString::new(self.py, text).into_any(),
+                            self.py.None().into_bound(self.py),
+                            0,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                (stamp, self.declares_exactly(target, &keys))
+            });
+            if stamp.holds(target) {
+                return *complete;
+            }
+        }
+        self.declares_exactly(target, members)
+    }
+
     fn declares_exactly(&self, target: &B<'py>, members: &[(B<'py>, B<'py>, usize)]) -> bool {
         let py = self.py;
         if self.g.field_kind.is_none() {
@@ -4597,10 +4180,1194 @@ fn getattr_or_none<'py>(obj: &B<'py>, name: &Bound<'py, PyString>) -> PyResult<O
     }
 }
 
+// --------------------------------------------------------------- program --
+
+// A compiled reader for the trees ``to_plain`` writes most: tagged records of
+// plain dataclasses, lists, tuples, str-keyed dicts, unions and leaves.
+//
+// A target's ``Program`` is compiled once, from the same plans the frames
+// read by, and kept on its plan. Reading with it runs no Python code: it
+// allocates objects and fills their slots, lists, tuples and dicts directly.
+// Wherever a node would need anything else (a reference, a hook, a default,
+// a conversion, a part that does not read, a class changed since compiling)
+// the program stops and the whole call is read by the frames instead, which
+// is safe because nothing it built was seen by any Python code.
+/// Whether a plan's program has been compiled, and what it is.
+enum Compiled {
+    Untried,
+    No,
+    Yes(Rc<Program>),
+}
+
+struct Program {
+    recs: Vec<Rec>,
+    root: Node,
+}
+
+/// A plain dataclass read straight into its slots: its field facts are the
+/// frames' own ``DcInfo``, and each field's offset and node follow them.
+struct Rec {
+    class: Py<PyAny>,
+    stamp: Stamp,
+    /// The ``py/object`` path its records carry.
+    own: Box<[u8]>,
+    /// ``object.__new__``'s slot, which ``allocate`` would call.
+    new: ffi::newfunc,
+    info: Rc<DcInfo>,
+    fields: Vec<Field>,
+}
+
+struct Field {
+    offset: isize,
+    node: Node,
+}
+
+enum Node {
+    Any,
+    Int,
+    Float,
+    Str,
+    Bool,
+    NoneType,
+    Record(usize),
+    List(Box<Node>),
+    TupleVar(Box<Node>),
+    TupleFixed(Vec<Node>),
+    /// Exact str keys, read as themselves, or as ints (``Keys::Int``).
+    Dict(Keys, Box<Node>),
+    Union(Box<Union>),
+}
+
+/// How a compiled dict reads its keys.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Keys {
+    /// Plain str keys, read as themselves.
+    Str,
+    /// ``int`` keys, each written ``json://`` and a JSON integer.
+    Int,
+}
+
+/// The int a ``json://`` key holds, when its text is an integer exactly as
+/// ``json.dumps`` writes one, which ``json.loads`` reads back as that int.
+fn int_key<'py>(py: Python<'py>, text: &[u8]) -> Option<B<'py>> {
+    let digits = text.strip_prefix(b"json://")?;
+    let body = digits.strip_prefix(b"-").unwrap_or(digits);
+    let canonical = match body {
+        [b'0'] => true,
+        [b'1'..=b'9', rest @ ..] => rest.iter().all(u8::is_ascii_digit),
+        _ => false,
+    };
+    // Past CPython's int string limit ``int()`` raises; leave those to Python.
+    if !canonical || digits.len() > 4000 {
+        return None;
+    }
+    let text = std::ffi::CString::new(digits).ok()?;
+    let made = unsafe { ffi::PyLong_FromString(text.as_ptr(), std::ptr::null_mut(), 10) };
+    match unsafe { Bound::from_owned_ptr_or_opt(py, made) } {
+        Some(made) => Some(made),
+        None => {
+            drop(PyErr::fetch(py));
+            None
+        }
+    }
+}
+
+struct Union {
+    members: Vec<Node>,
+    /// The union's plan, whose per-kind member orders ``union_members`` fills
+    /// as each kind of data first arrives.
+    plan: Rc<Plan>,
+    /// Each member's import name, when it is a class.
+    names: Vec<Option<Box<[u8]>>>,
+}
+
+enum Stop {
+    /// The frames read this node; the call starts over there.
+    Abort,
+    /// A class changed since compiling; compile again next call.
+    Stale,
+}
+
+type FR<'py> = Result<B<'py>, Stop>;
+
+/// How deep the program recurses before leaving the tree to the frames.
+const FAST_DEPTH: usize = 192;
+
+#[inline(always)]
+fn exact_str(obj: *mut ffi::PyObject) -> bool {
+    unsafe { ob_type(obj) == t_str() }
+}
+
+#[inline(always)]
+fn text_of<'a>(obj: &'a B<'_>) -> Option<&'a [u8]> {
+    (tp(obj) == t_str()).then(|| utf8(obj)).flatten()
+}
+
+struct Exec<'a, 'py> {
+    py: Python<'py>,
+    prog: &'a Program,
+    untagged: bool,
+    stack: Vec<usize>,
+}
+
+impl<'py> Exec<'_, 'py> {
+    #[inline]
+    fn enter(&mut self, raw: &B<'py>) -> Result<(), Stop> {
+        let address = raw.as_ptr() as usize;
+        if self.stack.len() >= FAST_DEPTH || self.stack.contains(&address) {
+            return Err(Stop::Abort);
+        }
+        self.stack.push(address);
+        Ok(())
+    }
+
+    fn read(&mut self, raw: &B<'py>, node: &Node) -> FR<'py> {
+        let kind = tp(raw);
+        match node {
+            Node::Any => self.any(raw),
+            Node::Int if kind == t_int() => Ok(raw.clone()),
+            Node::Float if kind == t_float() => Ok(raw.clone()),
+            // Re-read in the body: an `if let` guard needs Rust 1.95, above the 1.88 floor.
+            Node::Float if kind == t_dict() && special_float(raw).is_some() => {
+                special_float(raw).ok_or(Stop::Abort)
+            }
+            Node::Float if kind == t_int() => unsafe {
+                Bound::from_owned_ptr_or_err(self.py, ffi::PyNumber_Float(raw.as_ptr()))
+                    .map_err(|_| Stop::Abort)
+            },
+            Node::Str if kind == t_str() => Ok(raw.clone()),
+            Node::Bool if kind == t_bool() => Ok(raw.clone()),
+            Node::NoneType if kind == t_none() => Ok(raw.clone()),
+            Node::Record(index) => self.record(raw, *index),
+            Node::List(item) if kind == t_list() => {
+                self.enter(raw)?;
+                let read = self.list(raw, item);
+                self.stack.pop();
+                read
+            }
+            Node::TupleVar(_) | Node::TupleFixed(_) => {
+                let Some(items) = tuple_items(raw) else {
+                    return Err(Stop::Abort);
+                };
+                self.enter(raw)?;
+                let read = self.tuple(&items, node);
+                self.stack.pop();
+                read
+            }
+            Node::Dict(keys, value) if kind == t_dict() => {
+                self.enter(raw)?;
+                let read = self.dict(raw, *keys, value);
+                self.stack.pop();
+                read
+            }
+            Node::Union(union) => match self.first(raw, union)? {
+                Some(first) => self.read(raw, &union.members[first]),
+                None => Err(Stop::Abort),
+            },
+            _ => Err(Stop::Abort),
+        }
+    }
+
+    /// ``object``: a leaf as itself; an untagged tree as itself; else a copy.
+    fn any(&mut self, raw: &B<'py>) -> FR<'py> {
+        let kind = tp(raw);
+        if kind == t_str()
+            || kind == t_int()
+            || kind == t_float()
+            || kind == t_bool()
+            || kind == t_none()
+        {
+            return Ok(raw.clone());
+        }
+        if kind != t_list() && kind != t_dict() {
+            return Err(Stop::Abort);
+        }
+        if self.untagged {
+            return Ok(raw.clone());
+        }
+        if kind == t_dict()
+            && let Some(special) = special_float(raw)
+        {
+            return Ok(special);
+        }
+        self.enter(raw)?;
+        let read = if kind == t_list() {
+            self.list(raw, &Node::Any)
+        } else if let Some(items) = tuple_items(raw) {
+            self.tuple(&items, &Node::TupleVar(Box::new(Node::Any)))
+        } else {
+            self.dict(raw, Keys::Str, &Node::Any)
+        };
+        self.stack.pop();
+        read
+    }
+
+    fn list(&mut self, raw: &B<'py>, item: &Node) -> FR<'py> {
+        let py = self.py;
+        let size = unsafe { ffi::PyList_GET_SIZE(raw.as_ptr()) };
+        let out = unsafe { Bound::from_owned_ptr_or_err(py, ffi::PyList_New(size)) }
+            .map_err(|_| Stop::Abort)?;
+        for index in 0..size {
+            // No Python code runs here, so the list keeps its size.
+            let each =
+                unsafe { Bound::from_borrowed_ptr(py, ffi::PyList_GET_ITEM(raw.as_ptr(), index)) };
+            let value = self.read(&each, item)?;
+            unsafe { ffi::PyList_SET_ITEM(out.as_ptr(), index, value.into_ptr()) };
+        }
+        Ok(out)
+    }
+
+    fn tuple(&mut self, items: &B<'py>, node: &Node) -> FR<'py> {
+        let py = self.py;
+        let list = tp(items) == t_list();
+        let size = unsafe {
+            if list {
+                ffi::PyList_GET_SIZE(items.as_ptr())
+            } else {
+                ffi::PyTuple_GET_SIZE(items.as_ptr())
+            }
+        };
+        if let Node::TupleFixed(nodes) = node
+            && nodes.len() != size as usize
+        {
+            return Err(Stop::Abort);
+        }
+        let out = unsafe { Bound::from_owned_ptr_or_err(py, ffi::PyTuple_New(size)) }
+            .map_err(|_| Stop::Abort)?;
+        for index in 0..size {
+            let each = unsafe {
+                Bound::from_borrowed_ptr(
+                    py,
+                    if list {
+                        ffi::PyList_GET_ITEM(items.as_ptr(), index)
+                    } else {
+                        ffi::PyTuple_GET_ITEM(items.as_ptr(), index)
+                    },
+                )
+            };
+            let item = match node {
+                Node::TupleFixed(nodes) => &nodes[index as usize],
+                Node::TupleVar(item) => item,
+                _ => unreachable!("only tuples read here"),
+            };
+            let value = self.read(&each, item)?;
+            unsafe { ffi::PyTuple_SET_ITEM(out.as_ptr(), index, value.into_ptr()) };
+        }
+        Ok(out)
+    }
+
+    fn dict(&mut self, raw: &B<'py>, keys: Keys, value: &Node) -> FR<'py> {
+        let py = self.py;
+        let out = unsafe {
+            Bound::from_owned_ptr_or_err(py, ffi::PyDict_New()).map_err(|_| Stop::Abort)?
+        };
+        let mut position: ffi::Py_ssize_t = 0;
+        let mut key = std::ptr::null_mut();
+        let mut each = std::ptr::null_mut();
+        while unsafe { ffi::PyDict_Next(raw.as_ptr(), &mut position, &mut key, &mut each) } != 0 {
+            let key = unsafe { Bound::from_borrowed_ptr(py, key) };
+            let each = unsafe { Bound::from_borrowed_ptr(py, each) };
+            let Some(text) = text_of(&key) else {
+                return Err(Stop::Abort);
+            };
+            let key = match keys {
+                Keys::Str if text.starts_with(b"py/") || text.starts_with(b"json://") => {
+                    return Err(Stop::Abort);
+                }
+                Keys::Str => key,
+                Keys::Int => int_key(py, text).ok_or(Stop::Abort)?,
+            };
+            let read = self.read(&each, value)?;
+            if unsafe { ffi::PyDict_SetItem(out.as_ptr(), key.as_ptr(), read.as_ptr()) } < 0 {
+                drop(PyErr::fetch(py));
+                return Err(Stop::Abort);
+            }
+        }
+        Ok(out)
+    }
+
+    fn record(&mut self, raw: &B<'py>, index: usize) -> FR<'py> {
+        let py = self.py;
+        let rec = &self.prog.recs[index];
+        let class = rec.class.bind(py);
+        if !rec.stamp.holds(class) {
+            return Err(Stop::Stale);
+        }
+        if tp(raw) != t_dict() {
+            return Err(Stop::Abort);
+        }
+        self.enter(raw)?;
+        let made = unsafe {
+            (rec.new)(
+                class.as_ptr().cast(),
+                PyTuple::empty(py).as_ptr(),
+                std::ptr::null_mut(),
+            )
+        };
+        let Some(value) = (unsafe { Bound::from_owned_ptr_or_opt(py, made) }) else {
+            drop(PyErr::fetch(py));
+            self.stack.pop();
+            return Err(Stop::Abort);
+        };
+        let filled = self.fill(raw, rec, &value);
+        self.stack.pop();
+        filled.map(|()| value)
+    }
+
+    fn fill(&mut self, raw: &B<'py>, rec: &Rec, value: &B<'py>) -> Result<(), Stop> {
+        let py = self.py;
+        let mut stored = false;
+        let mut count = 0;
+        let mut at = 0;
+        let mut position: ffi::Py_ssize_t = 0;
+        let mut key = std::ptr::null_mut();
+        let mut each = std::ptr::null_mut();
+        while unsafe { ffi::PyDict_Next(raw.as_ptr(), &mut position, &mut key, &mut each) } != 0 {
+            if !exact_str(key) {
+                return Err(Stop::Abort);
+            }
+            if !stored && key == pyo3::intern!(py, "py/object").as_ptr() {
+                let path = unsafe { Bound::from_borrowed_ptr(py, each) };
+                if text_of(&path) != Some(&*rec.own) {
+                    return Err(Stop::Abort);
+                }
+                stored = true;
+                continue;
+            }
+            let field = match rec.info.slot_at(at, key, py) {
+                Some(field) => field,
+                // ``py/object`` as a str not interned; no field has that name.
+                None if unsafe { utf8_raw(key) } == Some(b"py/object".as_slice()) && !stored => {
+                    let path = unsafe { Bound::from_borrowed_ptr(py, each) };
+                    if text_of(&path) != Some(&*rec.own) {
+                        return Err(Stop::Abort);
+                    }
+                    stored = true;
+                    continue;
+                }
+                None => return Err(Stop::Abort),
+            };
+            at += 1;
+            let each = unsafe { Bound::from_borrowed_ptr(py, each) };
+            let field = &rec.fields[field];
+            let member = self.read(&each, &field.node)?;
+            unsafe {
+                let slot = value
+                    .as_ptr()
+                    .cast::<u8>()
+                    .offset(field.offset)
+                    .cast::<*mut ffi::PyObject>();
+                let old = std::mem::replace(&mut *slot, member.into_ptr());
+                if !old.is_null() {
+                    // Distinct keys name distinct fields; a slot set twice
+                    // means the record is not one the program reads.
+                    ffi::Py_DECREF(old);
+                    return Err(Stop::Abort);
+                }
+            }
+            count += 1;
+        }
+        if !stored || count != rec.fields.len() {
+            return Err(Stop::Abort);
+        }
+        Ok(())
+    }
+
+    /// The member ``union_members`` tries first for ``raw``, if known: a
+    /// kind's order is asked of Python once, by the frames, then kept.
+    fn first(&self, raw: &B<'py>, union: &Union) -> Result<Option<usize>, Stop> {
+        let py = self.py;
+        let kind = tp(raw);
+        let slot = if kind == t_none() {
+            0
+        } else if kind == t_bool() {
+            1
+        } else if kind == t_int() {
+            2
+        } else if kind == t_float() {
+            3
+        } else if kind == t_str() {
+            4
+        } else if kind == t_list() {
+            6
+        } else if kind == t_dict() {
+            let mut tagged = false;
+            let mut path = None;
+            let mut position: ffi::Py_ssize_t = 0;
+            let mut key = std::ptr::null_mut();
+            let mut each = std::ptr::null_mut();
+            while unsafe { ffi::PyDict_Next(raw.as_ptr(), &mut position, &mut key, &mut each) } != 0
+            {
+                let key = unsafe { Bound::from_borrowed_ptr(py, key) };
+                let Some(text) = text_of(&key) else {
+                    return Err(Stop::Abort);
+                };
+                if text.starts_with(b"py/") {
+                    tagged = true;
+                    if text == b"py/object" {
+                        path = Some(unsafe { Bound::from_borrowed_ptr(py, each) });
+                    }
+                }
+            }
+            if !tagged {
+                5
+            } else {
+                // Members whose name matches the path first, as ``union_members``
+                // sorts them; with no path, the members that are not classes.
+                return Ok(Some(match path {
+                    Some(path) => {
+                        let Some(path) = text_of(&path) else {
+                            return Err(Stop::Abort);
+                        };
+                        union
+                            .names
+                            .iter()
+                            .position(|name| name.as_deref() == Some(path))
+                            .unwrap_or(0)
+                    }
+                    None => union.names.iter().position(Option::is_none).unwrap_or(0),
+                }));
+            }
+        } else {
+            return Err(Stop::Abort);
+        };
+        let info = union.plan.union.as_ref().ok_or(Stop::Abort)?;
+        Ok(info.orders[slot]
+            .get()
+            .and_then(|order| order.first().copied()))
+    }
+}
+
+/// ``{"py/float": "inf" | "-inf" | "nan"}``, the forms ``to_plain`` writes
+/// for non-finite floats, as the float they name.
+fn special_float<'py>(raw: &B<'py>) -> Option<B<'py>> {
+    if unsafe { ffi::PyDict_Size(raw.as_ptr()) } != 1 {
+        return None;
+    }
+    let mut position: ffi::Py_ssize_t = 0;
+    let mut key = std::ptr::null_mut();
+    let mut each = std::ptr::null_mut();
+    unsafe { ffi::PyDict_Next(raw.as_ptr(), &mut position, &mut key, &mut each) };
+    let py = raw.py();
+    let key = unsafe { Bound::from_borrowed_ptr(py, key) };
+    if text_of(&key) != Some(b"py/float".as_slice()) {
+        return None;
+    }
+    let each = unsafe { Bound::from_borrowed_ptr(py, each) };
+    let value = match text_of(&each)? {
+        b"inf" => f64::INFINITY,
+        b"-inf" => f64::NEG_INFINITY,
+        b"nan" => f64::NAN,
+        _ => return None,
+    };
+    unsafe { Bound::from_owned_ptr_or_opt(py, ffi::PyFloat_FromDouble(value)) }
+}
+
+/// A tuple's items: a list as written untagged, or a ``py/tuple`` payload.
+fn tuple_items<'py>(raw: &B<'py>) -> Option<B<'py>> {
+    let kind = tp(raw);
+    if kind == t_list() {
+        return Some(raw.clone());
+    }
+    if kind != t_dict() || unsafe { ffi::PyDict_Size(raw.as_ptr()) } != 1 {
+        return None;
+    }
+    let mut position: ffi::Py_ssize_t = 0;
+    let mut key = std::ptr::null_mut();
+    let mut each = std::ptr::null_mut();
+    unsafe { ffi::PyDict_Next(raw.as_ptr(), &mut position, &mut key, &mut each) };
+    let key = unsafe { Bound::from_borrowed_ptr(raw.py(), key) };
+    if text_of(&key) != Some(b"py/tuple".as_slice()) {
+        return None;
+    }
+    let payload = unsafe { Bound::from_borrowed_ptr(raw.py(), each) };
+    (tp(&payload) == t_list() || tp(&payload) == t_tuple()).then_some(payload)
+}
+
+/// What compiling has built so far.
+struct Compiling {
+    recs: Vec<Rec>,
+    memo: HashMap<usize, usize>,
+}
+
+impl<'py> Decoder<'py, '_> {
+    /// The value the compiled program reads, or ``None`` for the frames.
+    fn run_program(&mut self, data: &B<'py>, target: &B<'py>, plan: &Rc<Plan>) -> Option<B<'py>> {
+        if !plan.persistent
+            || !matches!(self.allow_imports, Flag::Known(_))
+            || !matches!(self.strict, Flag::Known(_))
+        {
+            return None;
+        }
+        let state = std::mem::replace(&mut *plan.program.borrow_mut(), Compiled::No);
+        let program = match state {
+            Compiled::Yes(program) => program,
+            Compiled::No => return None,
+            Compiled::Untried => Rc::new(self.compile_program(target, plan)?),
+        };
+        *plan.program.borrow_mut() = Compiled::Yes(program.clone());
+        let mut exec = Exec {
+            py: self.py,
+            prog: &program,
+            untagged: self.untagged,
+            stack: Vec::new(),
+        };
+        match exec.read(data, &program.root) {
+            Ok(value) => Some(value),
+            Err(Stop::Abort) => None,
+            Err(Stop::Stale) => {
+                *plan.program.borrow_mut() = Compiled::Untried;
+                None
+            }
+        }
+    }
+
+    fn compile_program(&mut self, target: &B<'py>, plan: &Rc<Plan>) -> Option<Program> {
+        let mut compiling = Compiling {
+            recs: Vec::new(),
+            memo: HashMap::new(),
+        };
+        let root = self
+            .program_node(&mut compiling, target, plan)
+            .ok()
+            .flatten()?;
+        Some(Program {
+            recs: compiling.recs,
+            root,
+        })
+    }
+
+    fn program_node(
+        &mut self,
+        compiling: &mut Compiling,
+        target: &B<'py>,
+        plan: &Rc<Plan>,
+    ) -> DR<Option<Node>> {
+        let py = self.py;
+        let g = self.g;
+        if plan.is_object && target.is(self.b(&g.object)) {
+            return Ok(Some(Node::Any));
+        }
+        if plan.resolved.is_some() {
+            return Ok(None);
+        }
+        let own = |builtin: &Py<PyAny>| target.is(builtin.bind(py));
+        Ok(match plan.kind {
+            Kind::Int if own(&g.int_type) => Some(Node::Int),
+            Kind::Float if own(&g.float_type) => Some(Node::Float),
+            Kind::Str if own(&g.str_type) => Some(Node::Str),
+            Kind::Bool if target.as_ptr() == t_bool().cast() => Some(Node::Bool),
+            Kind::None if target.as_ptr() == t_none().cast() || target.is_none() => {
+                Some(Node::NoneType)
+            }
+            Kind::Object if plan.is_dataclass && is_class(target) => {
+                self.program_record(compiling, target, plan)?
+            }
+            Kind::List => {
+                let (item, item_plan) = self.element(plan)?;
+                self.program_node(compiling, &item, &item_plan)?
+                    .map(|node| Node::List(Box::new(node)))
+            }
+            Kind::Tuple => {
+                let args = plan.args.bind(py).clone();
+                if !plan.origin_is_tuple {
+                    let (item, item_plan) = self.element(plan)?;
+                    self.program_node(compiling, &item, &item_plan)?
+                        .map(|node| Node::TupleVar(Box::new(node)))
+                } else if args.len() == 2 && args.get_item(1)?.is(py.Ellipsis()) {
+                    let first = args.get_item(0)?;
+                    let first_plan = self.plan_for(&first, plan.persistent)?;
+                    self.program_node(compiling, &first, &first_plan)?
+                        .map(|node| Node::TupleVar(Box::new(node)))
+                } else {
+                    let mut nodes = Vec::with_capacity(args.len());
+                    for arg in args.iter() {
+                        let arg_plan = self.plan_for(&arg, plan.persistent)?;
+                        let Some(node) = self.program_node(compiling, &arg, &arg_plan)? else {
+                            return Ok(None);
+                        };
+                        nodes.push(node);
+                    }
+                    Some(Node::TupleFixed(nodes))
+                }
+            }
+            Kind::Dict => {
+                let args = plan.args.bind(py).clone();
+                if args.len() == 2 {
+                    let (key, value) = (args.get_item(0)?, args.get_item(1)?);
+                    let key_plan = self.plan_for(&key, plan.persistent)?;
+                    let keys = if key_plan.is_object || key.is(self.b(&g.str_type)) {
+                        Keys::Str
+                    } else if key.is(self.b(&g.int_type)) && key_plan.resolved.is_none() {
+                        Keys::Int
+                    } else {
+                        return Ok(None);
+                    };
+                    let value_plan = self.plan_for(&value, plan.persistent)?;
+                    self.program_node(compiling, &value, &value_plan)?
+                        .map(|node| Node::Dict(keys, Box::new(node)))
+                } else if args.is_empty() {
+                    Some(Node::Dict(Keys::Str, Box::new(Node::Any)))
+                } else {
+                    None
+                }
+            }
+            Kind::Union => self.program_union(compiling, plan)?,
+            _ => None,
+        })
+    }
+
+    fn program_union(&mut self, compiling: &mut Compiling, plan: &Rc<Plan>) -> DR<Option<Node>> {
+        let py = self.py;
+        let members = plan.args.bind(py).clone();
+        let Some(info) = plan.union.as_ref() else {
+            return Ok(None);
+        };
+        let mut nodes = Vec::with_capacity(members.len());
+        for member in members.iter() {
+            let member_plan = self.plan_for(&member, plan.persistent)?;
+            let Some(node) = self.program_node(compiling, &member, &member_plan)? else {
+                return Ok(None);
+            };
+            nodes.push(node);
+        }
+        let mut names = Vec::with_capacity(info.import_names.len());
+        for name in &info.import_names {
+            names.push(match name {
+                None => None,
+                Some(name) => match text_of(name.bind(py)) {
+                    Some(text) => Some(Box::<[u8]>::from(text)),
+                    None => return Ok(None),
+                },
+            });
+        }
+        Ok(Some(Node::Union(Box::new(Union {
+            members: nodes,
+            plan: plan.clone(),
+            names,
+        }))))
+    }
+
+    fn program_record(
+        &mut self,
+        compiling: &mut Compiling,
+        target: &B<'py>,
+        plan: &Rc<Plan>,
+    ) -> DR<Option<Node>> {
+        let py = self.py;
+        let key = target.as_ptr() as usize;
+        if let Some(&index) = compiling.memo.get(&key) {
+            return Ok(Some(Node::Record(index)));
+        }
+        let stamp = Stamp::always(target);
+        let info = self.dc_info(target, plan)?;
+        if !(info.persistent && plan.persistent) {
+            return Ok(None);
+        }
+        let Some(names) = info.names.as_ref() else {
+            return Ok(None);
+        };
+        if names.iter().any(|name| &**name == b"py/object") {
+            return Ok(None);
+        }
+        let Some(own) = plan
+            .import_name
+            .as_ref()
+            .and_then(|name| text_of(name.bind(py)))
+        else {
+            return Ok(None);
+        };
+        let own = Box::<[u8]>::from(own);
+        // ``allocate``'s own test for ``object.__new__``, and no finalizer to
+        // run should a record the program refuses be dropped.
+        let class = target.as_ptr().cast::<ffi::PyTypeObject>();
+        let finalizes = unsafe { (*class).tp_finalize.is_some() || (*class).tp_del.is_some() };
+        let Some(new) = object_new(target).filter(|_| !finalizes) else {
+            return Ok(None);
+        };
+        let (stores, offsets) = info.stores.get_or_init(|| field_stores(target, &info));
+        if !stores.holds(target)
+            || offsets.len() != names.len()
+            || offsets.iter().any(Option::is_none)
+        {
+            return Ok(None);
+        }
+        let offsets: Vec<isize> = offsets.iter().flatten().copied().collect();
+        let index = compiling.recs.len();
+        compiling.recs.push(Rec {
+            class: target.clone().unbind(),
+            stamp,
+            own,
+            new,
+            info: info.clone(),
+            fields: Vec::new(),
+        });
+        compiling.memo.insert(key, index);
+        let mut fields = Vec::with_capacity(names.len());
+        for (slot, offset) in offsets.into_iter().enumerate() {
+            let field_target = info.targets[slot].bind(py).clone();
+            let field_plan = self.field_plan(&info, slot)?;
+            let Some(node) = self.program_node(compiling, &field_target, &field_plan)? else {
+                return Ok(None);
+            };
+            fields.push(Field { offset, node });
+        }
+        compiling.recs[index].fields = fields;
+        Ok(Some(Node::Record(index)))
+    }
+}
+
+impl<'py> Decoder<'py, '_> {
+    /// ``target in _FIELD_TYPES``. An exact ``WeakKeyDictionary`` of classes
+    /// holds ``target`` only under a weak reference to it carrying the
+    /// dictionary's removal callback, so a heap class none of whose weak
+    /// references has a callback but this module's own is answered with no
+    /// Python code run.
+    fn field_types_cached(&self, target: &B<'py>) -> PyResult<bool> {
+        let py = self.py;
+        let cache = self.g.field_types_cache.bind(py);
+        let class = target.as_ptr().cast::<ffi::PyTypeObject>();
+        if is_class(target)
+            && cache.get_type().is(self.g.native_types[3].bind(py))
+            && unsafe { ffi::PyType_HasFeature(class, ffi::Py_TPFLAGS_HEAPTYPE) } != 0
+        {
+            let ours = ON_DEATH
+                .get(py)
+                .map_or(std::ptr::null_mut(), |callback| callback.as_ptr());
+            let mut each = unsafe { (*class).tp_weaklist }.cast::<ffi::PyWeakReference>();
+            let mut keyed = false;
+            while !each.is_null() {
+                let callback = unsafe { (*each).wr_callback };
+                if !callback.is_null() && callback != ours {
+                    keyed = true;
+                    break;
+                }
+                each = unsafe { (*each).wr_next };
+            }
+            if !keyed {
+                return Ok(false);
+            }
+        }
+        cache.contains(target)
+    }
+
+    /// ``_field_types(target)`` read natively, and stored in ``_FIELD_TYPES``
+    /// as it would store it, for a slotted dataclass straight under
+    /// ``object`` whose fields all carry plain, evaluated hints held in its
+    /// own annotations, in a module that reaches it. ``None`` to ask Python.
+    fn native_field_types(&self, target: &B<'py>) -> DR<Option<B<'py>>> {
+        let py = self.py;
+        let g = self.g;
+        let module = g.module.bind(py);
+        let own = |name: &str, original: &Py<PyAny>| -> PyResult<bool> {
+            Ok(module
+                .get_item(PyString::intern(py, name))?
+                .is_some_and(|found| found.is(original.bind(py))))
+        };
+        let [field_types, plain_hints, slot_names] = &g.field_types_own;
+        if !own("_field_types", field_types)?
+            || !own("_plain_hints", plain_hints)?
+            || !own("slot_names", slot_names)?
+            || g.field_kind.is_none()
+        {
+            return Ok(None);
+        }
+        let cache = g.field_types_cache.bind(py);
+        let [union_type, alias_type, module_type, weak_dict, modules] = &g.native_types;
+        if !cache.get_type().is(weak_dict.bind(py)) {
+            return Ok(None);
+        }
+        // ``_field_types`` answers from ``_FIELD_TYPES`` first; a class it
+        // holds is left to it.
+        if self.field_types_cached(target)? {
+            return Ok(None);
+        }
+        let class = target.as_ptr().cast::<ffi::PyTypeObject>();
+        let Some(namespace) = own_namespace(target) else {
+            return Ok(None);
+        };
+        let get = |name: &Bound<'py, PyString>| namespace.get_item(name);
+        if get(pyo3::intern!(py, "__no_type_check__"))?.is_some() {
+            return Ok(None);
+        }
+        // The annotations ``inspect.get_annotations`` returns once evaluated:
+        // the class's cache, filled by the dataclass decorator.
+        let Some(hints) = get(pyo3::intern!(py, "__annotations_cache__"))? else {
+            return Ok(None);
+        };
+        let Ok(hints) = hints.cast_into_exact::<PyDict>() else {
+            return Ok(None);
+        };
+        if get(pyo3::intern!(py, "__annotations__"))?.is_some() {
+            return Ok(None);
+        }
+        let Some(declared) = get(pyo3::intern!(py, "__dataclass_fields__"))? else {
+            return Ok(None);
+        };
+        let Ok(declared) = declared.cast_into_exact::<PyDict>() else {
+            return Ok(None);
+        };
+        let Some(slots) = get(pyo3::intern!(py, "__slots__"))? else {
+            return Ok(None);
+        };
+        if tp(&slots) != t_tuple() {
+            return Ok(None);
+        }
+        // Fields, in ``fields`` order, then slots: for a slotted dataclass
+        // the slots are exactly its fields, so the names are the fields.
+        let field_kind = g.field_kind.as_ref().expect("checked above").bind(py);
+        let mut names: Vec<B<'py>> = Vec::with_capacity(declared.len());
+        for (name, field) in dict_entries(&declared) {
+            if !self.field_slot(&field, FieldSlot::Kind)?.is(field_kind) {
+                continue;
+            }
+            if tp(&name) != t_str() {
+                return Ok(None);
+            }
+            names.push(name);
+        }
+        let slots = unsafe { slots.cast_unchecked::<PyTuple>() };
+        if slots.len() != names.len()
+            || !names
+                .iter()
+                .zip(slots.iter())
+                .all(|(name, slot)| name.is(&slot) || py_eq(name, &slot).unwrap_or(false))
+        {
+            return Ok(None);
+        }
+        let result = PyDict::new(py);
+        for name in &names {
+            let Some(hint) = hints.get_item(name)? else {
+                return Ok(None);
+            };
+            let Some(hint) = plain_hint(&hint, target, union_type.bind(py), alias_type.bind(py))?
+            else {
+                return Ok(None);
+            };
+            result.set_item(name, hint)?;
+        }
+        // ``_module_reaches``: the module's own entry for the qualname.
+        let module_name = namespace.get_item(pyo3::intern!(py, "__module__"))?;
+        let qualname = unsafe { (*class.cast::<ffi::PyHeapTypeObject>()).ht_qualname };
+        let reached = match module_name {
+            Some(module_name) if !qualname.is_null() && tp(&module_name) == t_str() => {
+                let qualname = unsafe { Bound::from_borrowed_ptr(py, qualname) };
+                let modules = modules.bind(py).clone();
+                match modules
+                    .cast_into_exact::<PyDict>()
+                    .ok()
+                    .and_then(|m| m.get_item(&module_name).ok().flatten())
+                {
+                    Some(found) if found.get_type().is(module_type.bind(py)) => {
+                        let names = found.getattr("__dict__")?;
+                        utf8(&qualname).is_some_and(|text| !text.contains(&b'.'))
+                            && names
+                                .cast_into_exact::<PyDict>()
+                                .ok()
+                                .and_then(|n| n.get_item(&qualname).ok().flatten())
+                                .is_some_and(|found| found.is(target))
+                    }
+                    _ => false,
+                }
+            }
+            _ => false,
+        };
+        if !reached {
+            return Ok(None);
+        }
+        let proxy = g.mappingproxy.bind(py).call1((result,))?;
+        cache.set_item(target, &proxy)?;
+        Ok(Some(proxy))
+    }
+}
+
+/// ``_resolved_hint(_rebuilt_hint(hint))`` for a hint ``_is_plain_hint``
+/// accepts and that does not name ``owner``: an exact class, ``None``, or a
+/// union or generic alias of those. ``None`` where Python must decide.
+fn plain_hint<'py>(
+    hint: &B<'py>,
+    owner: &B<'py>,
+    union_type: &B<'py>,
+    alias_type: &B<'py>,
+) -> PyResult<Option<B<'py>>> {
+    let py = hint.py();
+    if hint.is_none() {
+        return Ok(Some(unsafe {
+            Bound::from_borrowed_ptr(py, t_none().cast())
+        }));
+    }
+    if hint.is(owner) {
+        return Ok(None);
+    }
+    if unsafe { ob_type(hint.as_ptr()) } == &raw mut ffi::PyType_Type {
+        return Ok(Some(hint.clone()));
+    }
+    let kind = hint.get_type();
+    let is_union = kind.is(union_type);
+    let is_alias = kind.is(alias_type);
+    if !is_union && !is_alias {
+        return Ok(None);
+    }
+    let args = hint.getattr("__args__")?;
+    let Ok(args) = args.cast_into_exact::<PyTuple>() else {
+        return Ok(None);
+    };
+    for arg in args.iter() {
+        if arg.is(owner) {
+            return Ok(None);
+        }
+        let leaf = arg.is_none()
+            || arg.is(py.Ellipsis())
+            || unsafe { ob_type(arg.as_ptr()) } == &raw mut ffi::PyType_Type;
+        if !leaf {
+            return Ok(None);
+        }
+    }
+    if is_alias {
+        if hint.getattr("__unpacked__")?.is_truthy()? {
+            return Ok(None);
+        }
+        // ``get_type_hints`` hands back a fresh copy of a top-level alias.
+        let origin = hint.getattr("__origin__")?;
+        return Ok(Some(alias_type.call1((origin, args))?));
+    }
+    Ok(Some(hint.clone()))
+}
+
+impl<'py> Decoder<'py, '_> {
+    /// ``compile(target)`` for a plain dataclass, read natively: a heap class
+    /// under a plain ``type`` metaclass, straight under ``object``, with its
+    /// own ``__dataclass_fields__`` and ``__module__``, no ``__value__``,
+    /// and not one of ``_DECODERS``' keys. ``_resolve_alias`` leaves such a
+    /// class as itself, ``get_origin`` gives ``None``, ``_decoder_for`` picks
+    /// ``_decode_object``, and ``get_args`` gives ``()``.
+    fn native_compile(&self, target: &B<'py>, persistent: bool) -> PyResult<Option<Plan>> {
+        let py = self.py;
+        let g = self.g;
+        let module = g.module.bind(py);
+        for (name, original) in &g.compile_own {
+            if !module
+                .get_item(PyString::intern(py, name))?
+                .is_some_and(|found| found.is(original.bind(py)))
+            {
+                return Ok(None);
+            }
+        }
+        // The plain leaf classes: ``_DECODERS`` maps each to its decoder.
+        let leaf = [
+            (t_int(), Kind::Int, "builtins.int"),
+            (t_float(), Kind::Float, "builtins.float"),
+            (t_str(), Kind::Str, "builtins.str"),
+            (t_bool(), Kind::Bool, "builtins.bool"),
+            (t_none(), Kind::None, "builtins.NoneType"),
+        ]
+        .into_iter()
+        .find(|(class, _, _)| target.as_ptr() == class.cast());
+        if let Some((_, kind, name)) = leaf {
+            return Ok(Some(Plan {
+                kind,
+                is_object: false,
+                resolved: None,
+                args: PyTuple::empty(py).unbind(),
+                origin_is_tuple: false,
+                origin_is_type: false,
+                fits: Fits::IsInstance(None),
+                persistent,
+                union: None,
+                leaf: None,
+                import_name: Some(PyString::new(py, name).into_any().unbind()),
+                is_dataclass: false,
+                info: OnceCell::new(),
+                own: Stamp::of(target),
+                deps: Vec::new(),
+                program: RefCell::new(Compiled::Untried),
+            }));
+        }
+        if let Some(plan) = self.native_alias(target, persistent)? {
+            return Ok(Some(plan));
+        }
+        let class = target.as_ptr().cast::<ffi::PyTypeObject>();
+        if unsafe { ffi::PyType_HasFeature(class, ffi::Py_TPFLAGS_HEAPTYPE) } == 0 {
+            return Ok(None);
+        }
+        let Some(namespace) = own_namespace(target) else {
+            return Ok(None);
+        };
+        let Some(declared) = namespace.get_item(pyo3::intern!(py, "__dataclass_fields__"))? else {
+            return Ok(None);
+        };
+        if tp(&declared) != t_dict()
+            || namespace
+                .get_item(pyo3::intern!(py, "__value__"))?
+                .is_some()
+            || namespace
+                .get_item(pyo3::intern!(py, "_is_protocol"))?
+                .is_some()
+            || namespace
+                .get_item(pyo3::intern!(py, "__required_keys__"))?
+                .is_some()
+        {
+            return Ok(None);
+        }
+        let decoders = g
+            .compile_own
+            .iter()
+            .find(|(name, _)| *name == "_DECODERS")
+            .map(|(_, found)| found.bind(py))
+            .expect("listed above");
+        // ``_DECODERS`` is the module's own proxy of a dict, keyed by classes
+        // whose hashes and equality are ``type``'s: no Python code runs.
+        if tp(decoders) != t_proxy() || decoders.contains(target)? {
+            return Ok(None);
+        }
+        let Some(module_name) = namespace.get_item(pyo3::intern!(py, "__module__"))? else {
+            return Ok(None);
+        };
+        let qualname = unsafe { (*class.cast::<ffi::PyHeapTypeObject>()).ht_qualname };
+        if qualname.is_null() {
+            return Ok(None);
+        }
+        let qualname = unsafe { Bound::from_borrowed_ptr(py, qualname) };
+        let (Some(module_text), Some(qual_text)) = (text_of(&module_name), text_of(&qualname))
+        else {
+            return Ok(None);
+        };
+        // ``_is_any``: a class named ``typing.Any`` reads as ``object``.
+        if module_text == b"typing" && qual_text == b"Any" {
+            return Ok(None);
+        }
+        let mut name = Vec::with_capacity(module_text.len() + 1 + qual_text.len());
+        name.extend_from_slice(module_text);
+        name.push(b'.');
+        name.extend_from_slice(qual_text);
+        let import_name = PyString::new(py, std::str::from_utf8(&name).unwrap_or_default());
+        Ok(Some(Plan {
+            kind: Kind::Object,
+            is_object: false,
+            resolved: None,
+            args: PyTuple::empty(py).unbind(),
+            origin_is_tuple: false,
+            origin_is_type: false,
+            fits: Fits::IsInstance(None),
+            persistent,
+            union: None,
+            leaf: None,
+            import_name: Some(import_name.into_any().unbind()),
+            is_dataclass: true,
+            info: OnceCell::new(),
+            own: Stamp::of(target),
+            deps: Vec::new(),
+            program: RefCell::new(Compiled::Untried),
+        }))
+    }
+}
+
+impl<'py> Decoder<'py, '_> {
+    /// ``compile(target)`` for an exact ``types.GenericAlias`` over ``list``,
+    /// ``dict`` or ``tuple``, or an exact ``types.UnionType``, read natively
+    /// (``native_compile`` checked the helpers are the module's own).
+    ///
+    /// Neither has a ``__value__`` or is ``Annotated``, so ``_resolve_alias``
+    /// leaves it as itself; ``get_origin`` is its ``__origin__`` (``Union``
+    /// for a union), ``get_args`` its ``__args__`` (an unpacked or
+    /// ``Callable``-flattened alias is left to Python), and ``_decoder_for``
+    /// reads ``_DECODERS`` at that origin. Each class it names is stamped,
+    /// as ``compile`` would through ``depend``.
+    fn native_alias(&self, target: &B<'py>, persistent: bool) -> PyResult<Option<Plan>> {
+        let py = self.py;
+        let g = self.g;
+        let kind = target.get_type();
+        let is_union = kind.is(g.union_type.bind(py));
+        if !is_union && !kind.is(g.generic_alias.bind(py)) {
+            return Ok(None);
+        }
+        let Some(args) = target
+            .getattr_opt(pyo3::intern!(py, "__args__"))?
+            .and_then(|args| args.cast_into_exact::<PyTuple>().ok())
+        else {
+            return Ok(None);
+        };
+        // ``get_origin`` of an ``X | Y`` is ``Union``, which is ``UnionType``
+        // itself from 3.14 and before that a ``typing`` special form, no class.
+        let (origin, decoder_kind) = if is_union {
+            (g.typing_union.bind(py).clone(), Kind::Union)
+        } else {
+            if target
+                .getattr_opt(pyo3::intern!(py, "__unpacked__"))?
+                .is_none_or(|unpacked| !unpacked.is(pyo3::types::PyBool::new(py, false)))
+            {
+                return Ok(None);
+            }
+            let Some(origin) = target.getattr_opt(pyo3::intern!(py, "__origin__"))? else {
+                return Ok(None);
+            };
+            let found = if origin.as_ptr() == t_list().cast() {
+                Kind::List
+            } else if origin.as_ptr() == t_dict().cast() {
+                Kind::Dict
+            } else if origin.as_ptr() == t_tuple().cast() {
+                Kind::Tuple
+            } else {
+                return Ok(None);
+            };
+            (origin, found)
+        };
+        // Each member a union is read through, and each class an alias is
+        // over, is stamped as ``depend`` stamps it.
+        let mut deps = Vec::new();
+        depend(&mut deps, target, &origin);
+        if is_union {
+            for member in args.iter() {
+                depend(&mut deps, target, &member);
+            }
+        }
+        let union = if is_union {
+            Some(self.compile_union(&args)?)
+        } else {
+            None
+        };
+        Ok(Some(Plan {
+            kind: decoder_kind,
+            is_object: false,
+            resolved: None,
+            args: args.unbind(),
+            origin_is_tuple: decoder_kind == Kind::Tuple,
+            origin_is_type: false,
+            fits: if is_union {
+                Fits::Union
+            } else {
+                Fits::IsInstance(Some(origin.unbind()))
+            },
+            persistent,
+            union,
+            leaf: None,
+            import_name: None,
+            is_dataclass: false,
+            info: OnceCell::new(),
+            own: None,
+            deps,
+            program: RefCell::new(Compiled::Untried),
+        }))
+    }
+}
+
 // ------------------------------------------------------------ holds tags --
 
 /// ``_holds_tags``: whether any mapping in ``data`` has a tag or escaped key.
 fn holds_tags<'py>(g: &DecGlobals, data: &B<'py>) -> PyResult<bool> {
+    // A record ``to_plain`` writes starts with its ``py/object`` key; the
+    // walk below is for trees with no tag near the top.
+    if tp(data) == t_dict() {
+        let mut position: ffi::Py_ssize_t = 0;
+        let mut key = std::ptr::null_mut();
+        let mut value = std::ptr::null_mut();
+        if unsafe { ffi::PyDict_Next(data.as_ptr(), &mut position, &mut key, &mut value) } != 0
+            && unsafe { ob_type(key) } == t_str()
+            && unsafe { utf8_raw(key) }.is_some_and(|text| text.starts_with(b"py/"))
+        {
+            return Ok(true);
+        }
+    }
     let py = data.py();
     let mut stack = vec![data.clone()];
     let mut seen = HashSet::new();
@@ -4619,7 +5386,7 @@ fn holds_tags<'py>(g: &DecGlobals, data: &B<'py>) -> PyResult<bool> {
         kept.push(node.clone());
         if kind == t_dict() {
             let dict = unsafe { node.cast_unchecked::<PyDict>() };
-            let mut items = DictItems::new(dict)?;
+            let mut items = DictItems::new(dict);
             while let Some((key, value)) = items.next_item()? {
                 if is_str(&key) && str_starts_any(&key, &["py/", "json://"])? {
                     return Ok(true);
@@ -4727,7 +5494,7 @@ pub fn from_plain<'py>(
     if let Some(bad) = &decoder.bad
         && !bad.is_empty()
     {
-        let mut items = DictItems::new(bad)?;
+        let mut items = DictItems::new(bad);
         let (at, first) = items.next_item()?.expect("bad is not empty");
         let at = PyList::new(py, at.try_iter()?.collect::<PyResult<Vec<_>>>()?)?;
         let message = format!(

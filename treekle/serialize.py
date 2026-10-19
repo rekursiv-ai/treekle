@@ -550,7 +550,7 @@ def _encode_hooked(value: object, state: _Encoding) -> object:
 
 
 def _encode_reduce(value: object, state: _Encoding) -> object:
-    """Encode a value by its pickle reduce recipe as ``py/reduce``."""
+    """Encode a value by its ``__reduce__`` recipe as ``py/reduce``."""
     recipe = _canonical_reduce(value)
     if recipe is None:
         return _encode_unreduced(value, state)

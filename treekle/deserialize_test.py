@@ -10,7 +10,7 @@ from decimal import Decimal
 from enum import Enum
 from fractions import Fraction
 from pathlib import Path, PurePosixPath
-from types import MappingProxyType, ModuleType, UnionType
+from types import GenericAlias, MappingProxyType, ModuleType, SimpleNamespace, UnionType
 from typing import (
     TYPE_CHECKING,
     Annotated,
@@ -36,6 +36,8 @@ from zoneinfo import ZoneInfo
 
 import datetime as dt
 import gc
+import importlib
+import inspect
 import math
 import numbers
 import sys
@@ -45,6 +47,7 @@ import pytest
 
 from treekle import deserialize
 from treekle.deserialize import from_plain
+from treekle.reflect import PENDING
 from treekle.serialize import to_plain
 from treekle.types import (
     FieldPath,
@@ -114,6 +117,19 @@ class HintedLater:
 class HintedLaterDict(TypedDict):
     point: Rational
     count: int
+
+
+class HintedLaterOptional(TypedDict):
+    point: Rational
+    count: int
+    name: NotRequired[str]
+
+
+@dataclass(kw_only=True, slots=True)
+class HintedLaterLocal:
+    Size = int  # Bound only in the class body, so only its locals name it.
+    point: "Rational"  # Bound only under ``TYPE_CHECKING``.
+    size: "Size"
 
 
 class Shape(Protocol):
@@ -2824,6 +2840,91 @@ class TestFieldTypes:
 
         assert dict(deserialize._field_types(HintedLater)) == first
 
+    def test_a_retried_hint_whose_annotation_is_gone_rereads_the_class(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        first = dict(deserialize._field_types(HintedLater))
+        stale = deserialize._PARTIAL_HINTS[HintedLater]
+        reads: list[type] = []
+
+        def without_point(base: type) -> dict[str, object]:
+            reads.append(base)
+            return {"count": int}
+
+        monkeypatch.setattr(deserialize, "_own_annotations", without_point)
+
+        # The cached entry's only failed hint is gone, so it is dropped and the
+        # class read in full again rather than served from the stale entry.
+        assert dict(deserialize._field_types(HintedLater)) == first
+        assert reads[0] is HintedLater
+        assert deserialize._PARTIAL_HINTS.get(HintedLater) is not stale
+
+    def test_an_unresolved_hint_leaves_a_class_body_name_resolvable(self) -> None:
+        assert dict(deserialize._field_types(HintedLaterLocal)) == {
+            "point": object,
+            "size": int,
+        }
+
+    def test_before_3_14_an_unresolved_hint_reads_its_string_form(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(sys, "version_info", (3, 12))
+
+        assert dict(deserialize._field_types(HintedLater)) == {
+            "point": object,
+            "count": int,
+        }
+
+    def test_from_3_14_a_class_reads_its_annotations_as_forward_refs(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Run on every interpreter, an older one with ``annotationlib`` stood in.
+        forwardref = object()
+        formats: list[object] = []
+
+        def annotations_in(base: type, *, format: object) -> dict[str, object]:
+            del base
+            formats.append(format)
+            return {"point": "Later"}
+
+        def import_module(name: str) -> SimpleNamespace:
+            assert name == "annotationlib"
+            return SimpleNamespace(Format=SimpleNamespace(FORWARDREF=forwardref))
+
+        monkeypatch.setattr(sys, "version_info", (3, 14))
+        monkeypatch.setattr(importlib, "import_module", import_module)
+        monkeypatch.setattr(inspect, "get_annotations", annotations_in)
+
+        assert deserialize._own_annotations(HintedLater) == {"point": "Later"}
+        assert formats == [forwardref]
+
+    def test_an_unresolved_hint_keeps_its_neighbour_optional(self) -> None:
+        assert from_plain({"point": 1, "count": 2}, HintedLaterOptional) == {
+            "point": 1,
+            "count": 2,
+        }
+
+    def test_a_failed_hint_since_removed_is_dropped(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        module = ModuleType("treekle_deserialize_dropped_hint")
+        monkeypatch.setitem(sys.modules, module.__name__, module)
+        annotations: dict[str, object] = {"point": "Missing", "count": int}
+        kind = type(
+            "Dropped",
+            (),
+            {"__module__": module.__name__, "__annotations__": annotations},
+        )
+        vars(module).update(Dropped=kind)
+        assert dict(deserialize._field_types(kind)) == {"point": object, "count": int}
+        del annotations["point"]
+
+        assert dict(deserialize._field_types(kind)) == {"count": int}
+
     def test_a_hint_that_resolves_later_reads_as_its_type(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -2837,6 +2938,216 @@ class TestFieldTypes:
         monkeypatch.setitem(globals(), "Rational", numbers.Rational)
 
         assert deserialize._field_types(HintedLater)["point"] is numbers.Rational
+
+
+class TestPlainHints:
+    """``_plain_hints`` reads what ``get_type_hints`` would, or leaves it to it."""
+
+    @pytest.fixture(autouse=True)
+    def cold_cache(self) -> None:
+        """Clear cached types, so each test computes the ones it checks."""
+        deserialize._FIELD_TYPES.clear()
+        deserialize._PARTIAL_HINTS.clear()
+
+    @classmethod
+    def _module(cls, source: str, monkeypatch: pytest.MonkeyPatch) -> ModuleType:
+        """Compile ``source`` as a module whose annotations are real objects."""
+        module = ModuleType("_treekle_plain_hints_test")
+        monkeypatch.setitem(sys.modules, module.__name__, module)
+        exec(  # noqa: S102 -- Real annotations need a module compiled without the test file's future import.
+            compile(source, "<treekle-plain-hints-test>", "exec", dont_inherit=True),
+            vars(module),
+        )
+        return module
+
+    def test_plain_annotations_read_as_get_type_hints_reads_them(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        module = self._module(
+            """
+from dataclasses import dataclass
+
+@dataclass
+class Base:
+    a: int
+
+@dataclass
+class Plain(Base):
+    b: list[int] | None
+    c: dict[str, tuple[int, ...]]
+    d: None
+""",
+            monkeypatch,
+        )
+        plain = cast("type", vars(module)["Plain"])
+
+        hints = deserialize._plain_hints(plain)
+        assert hints is not None
+
+        assert hints == get_type_hints(plain)
+        assert list(hints) == ["a", "b", "c", "d"]
+        assert dict(deserialize._field_types(plain)) == get_type_hints(plain)
+
+    def test_a_generic_hint_is_a_fresh_alias_as_get_type_hints_gives(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        module = self._module(
+            "from dataclasses import dataclass\n"
+            "@dataclass\n"
+            "class Listed:\n"
+            "    xs: list[int]\n",
+            monkeypatch,
+        )
+        listed = cast("type", vars(module)["Listed"])
+        annotations = cast("dict[str, object]", inspect.get_annotations(listed))
+        declared = annotations["xs"]
+
+        hints = deserialize._plain_hints(listed)
+        assert hints is not None
+
+        assert hints["xs"] == declared
+        assert hints["xs"] is not declared
+        assert (get_type_hints(listed)["xs"] is declared) is False
+
+    @pytest.mark.parametrize(
+        "annotation",
+        [
+            "Annotated[int, 'note']",
+            "'int'",
+            "Unpack[tuple[int]]",
+            "tuple[*tuple[int]]",
+            "ClassVar[int]",
+        ],
+    )
+    def test_any_other_annotation_leaves_the_read_to_get_type_hints(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        annotation: str,
+    ) -> None:
+        module = self._module(
+            "from typing import Annotated, ClassVar, Unpack\n"
+            "class Other:\n"
+            f"    x: {annotation}\n",
+            monkeypatch,
+        )
+
+        assert deserialize._plain_hints(cast("type", vars(module)["Other"])) is None
+
+    def test_an_unresolvable_deferred_annotation_leaves_the_read_to_get_type_hints(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        pytest.importorskip("annotationlib")
+        module = self._module("class Deferred:\n    x: Missing\n", monkeypatch)
+
+        assert deserialize._plain_hints(cast("type", vars(module)["Deferred"])) is None
+
+    @pytest.mark.parametrize("error", [AttributeError, NameError, TypeError])
+    def test_an_annotation_read_that_raises_leaves_the_read_to_get_type_hints(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        error: type[Exception],
+    ) -> None:
+        # Run on every interpreter: before 3.14 nothing deferred raises here.
+        def raising(base: type) -> dict[str, object]:
+            raise error(base.__name__)
+
+        monkeypatch.setattr(inspect, "get_annotations", raising)
+
+        assert deserialize._plain_hints(HintedLater) is None
+
+    def test_a_no_type_check_class_leaves_the_read_to_get_type_hints(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        module = self._module(
+            "import typing\n@typing.no_type_check\nclass Unchecked:\n    x: int\n",
+            monkeypatch,
+        )
+
+        assert deserialize._plain_hints(cast("type", vars(module)["Unchecked"])) is None
+
+    def test_a_non_plain_class_still_resolves_each_hint_by_itself(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        module = self._module(
+            "from dataclasses import dataclass\n"
+            "from typing import Annotated\n"
+            "@dataclass\n"
+            "class Noted:\n"
+            "    x: Annotated[int, 'note']\n"
+            "    y: 'Missing'\n",
+            monkeypatch,
+        )
+        noted = cast("type", vars(module)["Noted"])
+
+        assert dict(deserialize._field_types(noted)) == {"x": int, "y": object}
+
+    def test_a_class_naming_its_own_type_is_not_cached(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        module = self._module(
+            "from dataclasses import dataclass\n"
+            "@dataclass\n"
+            "class Tree:\n"
+            "    kids: list[int]\n",
+            monkeypatch,
+        )
+        tree = cast("type", vars(module)["Tree"])
+        kids = GenericAlias(list, (tree,))
+        tree.__annotations__["kids"] = kids
+
+        assert deserialize._plain_hints(tree) == {"kids": kids}
+        assert dict(deserialize._field_types(tree)) == {"kids": kids}
+        assert tree not in deserialize._FIELD_TYPES
+
+    def test_a_class_naming_itself_directly_is_not_cached(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        module = self._module(
+            "from dataclasses import dataclass\n@dataclass\nclass Link:\n    to: int\n",
+            monkeypatch,
+        )
+        link = cast("type", vars(module)["Link"])
+        link.__annotations__["to"] = link
+
+        assert dict(deserialize._field_types(link)) == {"to": link}
+        assert link not in deserialize._FIELD_TYPES
+
+
+class TestSingleHint:
+    """``_single_hint`` resolves one annotation in the namespaces given."""
+
+    def test_a_name_resolves_from_the_locals(self) -> None:
+        assert (
+            deserialize._single_hint(
+                "x",
+                "Local",
+                {},
+                {"Local": Point},
+                include_extras=False,
+            )
+            is Point
+        )
+
+    def test_extras_are_kept_only_when_asked(self) -> None:
+        noted = Annotated[int, "note"]
+
+        assert deserialize._single_hint("x", noted, {}, {}, include_extras=False) is int
+        assert (
+            deserialize._single_hint("x", noted, {}, {}, include_extras=True) == noted
+        )
+
+    def test_a_name_that_does_not_resolve_is_pending(self) -> None:
+        assert (
+            deserialize._single_hint("x", "Missing", {}, {}, include_extras=False)
+            is PENDING
+        )
 
 
 class TestUnionRetries:
@@ -2884,6 +3195,148 @@ class TestCyclicInput:
         assert isinstance(first, list)
         assert second is first
         assert first[0] is first
+
+
+class TestEdges:
+    @pytest.mark.parametrize(
+        ("data", "target"),
+        [
+            (True, Annotated[bool, "meta"]),
+            ("s", Annotated[str, "meta"]),
+            (1.5, Annotated[float, "meta"]),
+        ],
+        ids=repr,
+    )
+    def test_an_annotated_leaf_reads_as_itself(
+        self,
+        data: Plain,
+        target: object,
+    ) -> None:
+        assert from_plain(data, target) is data
+
+    def test_a_datetime_without_a_named_zone_reads(self) -> None:
+        text = "2026-01-02T00:00:00+00:00"
+
+        assert from_plain(text, dt.datetime) == dt.datetime(2026, 1, 2, tzinfo=dt.UTC)
+
+    def test_a_mappingproxy_tag_needs_a_mapping(self) -> None:
+        with pytest.raises(ReadError, match=r"^cannot read \[1\] as <class 'object'>$"):
+            from_plain({"py/mappingproxy": [1]}, object)
+
+    def test_a_non_str_key_is_not_a_dataclass_field(self) -> None:
+        with pytest.raises(ReadError) as raised:
+            from_plain(cast("PlainTree", {1: 2}), Point)
+
+        assert str(raised.value) == "Point: unknown field(s) [1]; valid: ['x', 'y']"
+
+    def test_a_field_named_like_the_object_tag_reads_as_the_tag(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        module = ModuleType("treekle_deserialize_tag_field")
+        monkeypatch.setitem(sys.modules, module.__name__, module)
+        # ``py/object`` is no identifier, so no generated method may name it.
+        named = dataclass(init=False, repr=False, eq=False)(
+            type(
+                "Named",
+                (),
+                {
+                    "__module__": module.__name__,
+                    "__annotations__": {"py/object": int},
+                    "py/object": 0,
+                },
+            ),
+        )
+        vars(module).update(Named=named)
+
+        value = from_plain({"py/object": f"{module.__name__}.Named"}, named)
+
+        assert type(value) is named
+        assert vars(value) == {"py/object": 0}
+
+    def test_a_failing_hook_payload_is_recorded_where_the_hook_sits(self) -> None:
+        hooked = {"py/hook": [f"{__name__}.Tensor", {"py/frozenset": [[1]]}]}
+
+        with pytest.raises(ReadError) as raised:
+            from_plain([hooked], object, hooks=_HOOKS)
+
+        assert raised.value.bad == {
+            (0,): Invalid(raw=hooked, reason="frozenset members [[1]] are unhashable"),
+        }
+
+    def test_an_unhashable_invalid_set_member_fails_the_set(self) -> None:
+        member = {"py/frozenset": [[1]]}
+
+        with pytest.raises(ReadError) as raised:
+            from_plain([{"py/set": [member]}], object)
+
+        bad = raised.value.bad
+        assert set(bad) == {(0, 0), (0,)}
+        assert bad[0, 0] == Invalid(
+            raw=member,
+            reason="frozenset members [[1]] are unhashable",
+        )
+        assert bad[0,].reason.startswith("set member Invalid(")
+
+    @pytest.mark.parametrize(
+        ("data", "shown"),
+        [
+            ({}, "{}"),
+            (set[int](), "set()"),
+            (frozenset[int](), "frozenset()"),
+            (frozenset({1}), "frozenset({1})"),
+            (
+                {str(index): index for index in range(101)},
+                "{"
+                + ", ".join(f"'{index}': {index}" for index in range(100))
+                + ", ...}",
+            ),
+            (
+                set(range(101)),
+                "{" + ", ".join(map(str, range(100))) + ", ...}",
+            ),
+        ],
+        ids=["dict", "set", "frozenset", "one", "long-dict", "long-set"],
+    )
+    def test_a_mismatch_shows_the_value(self, data: object, shown: str) -> None:
+        with pytest.raises(ReadError) as raised:
+            from_plain(data, int)
+
+        assert str(raised.value).startswith(f"cannot read {shown} as ")
+
+    def test_a_mismatch_elides_a_deep_set(self) -> None:
+        deep: frozenset[object] = frozenset({0})
+        for _ in range(9):
+            deep = frozenset({deep})
+
+        with pytest.raises(ReadError) as raised:
+            from_plain(deep, int)
+
+        shown = "frozenset({" * 8 + "frozenset({...})" + "})" * 8
+        assert str(raised.value) == f"cannot read {shown} as <class 'int'>"
+
+    def test_a_mismatch_elides_a_deep_dict(self) -> None:
+        deep: dict[str, object] = {"k": 0}
+        for _ in range(9):
+            deep = {"k": deep}
+
+        with pytest.raises(ReadError) as raised:
+            from_plain(deep, int)
+
+        shown = "{'k': " * 8 + "{...}" + "}" * 8
+        assert str(raised.value) == f"cannot read {shown} as int"
+
+
+class TestFrameBase:
+    def test_a_bare_frame_has_no_parts_and_cannot_take_or_finish(self) -> None:
+        state = deserialize._Decoding(hooks={}, allow_imports=False)
+        frame = deserialize._Frame(())
+
+        assert frame.step(state) is None
+        with pytest.raises(NotImplementedError):
+            frame.take(1, state)
+        with pytest.raises(NotImplementedError):
+            frame.finish(state)
 
 
 class TestCaches:
