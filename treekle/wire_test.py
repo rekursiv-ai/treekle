@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Final, cast
 
 import json
 import math
@@ -12,10 +12,13 @@ import os
 import subprocess
 import sys
 import textwrap
+import types
 
 import pytest
 
-from treekle import json_dumps, json_loads, to_plain
+from treekle import json_dumps, json_loads, to_plain, wire
+from treekle.deserialize import _python_from_plain
+from treekle.serialize import _python_to_plain
 from treekle.types import Hooks, ReadError
 
 
@@ -60,6 +63,8 @@ class TestJsonLoads:
             json_loads('["a"]', list[int])
 
     def test_options_reach_from_plain(self) -> None:
+        with pytest.raises(ReadError, match="cannot read '3' as int"):
+            json_loads('"3"', int)
         assert json_loads('"3"', int, strict=False) == 3
         with pytest.raises(ReadError, match="allow_imports"):
             json_loads('{"py/type": "pathlib.Path"}', object)
@@ -139,6 +144,111 @@ def test_json_is_used_as_it_is_at_each_call(monkeypatch: pytest.MonkeyPatch) -> 
     assert seen == ["loads", "loads", "dumps"]
 
 
+def test_the_cores_json_functions_take_every_option(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Whether a core is built decides which branch serves; both must forward
+    # every option, so this runs on any build.
+    calls: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
+
+    def recorded(name: str) -> Callable[..., object]:
+        def call(*args: object, **options: object) -> object:
+            calls.append((name, args, options))
+            return name
+
+        return call
+
+    monkeypatch.setattr(
+        wire,
+        "_CORE_JSON",
+        {
+            "loads": recorded("loads"),
+            "dumps": recorded("dumps"),
+            "typed_loads": recorded("typed_loads"),
+        },
+    )
+    assert json_loads("[1]") == "loads"
+    hooks: Hooks = {Path: (str, Path)}
+    assert (
+        json_dumps(
+            [1],
+            dialect="python",
+            hooks=hooks,
+            sort=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            indent=2,
+            sort_keys=True,
+        )
+        == "dumps"
+    )
+    assert (
+        json_loads("[1]", list[int], hooks=hooks, allow_imports=True, strict=False)
+        == "typed_loads"
+    )
+    assert calls == [
+        ("loads", ("[1]",), {}),
+        (
+            "dumps",
+            ([1],),
+            {
+                "dialect": "python",
+                "hooks": hooks,
+                "sort": False,
+                "ensure_ascii": False,
+                "separators": (",", ":"),
+                "indent": 2,
+                "sort_keys": True,
+            },
+        ),
+        (
+            "typed_loads",
+            ("[1]", list[int]),
+            {"hooks": hooks, "allow_imports": True, "strict": False},
+        ),
+    ]
+
+
+_SERVED: Final[dict[tuple[bool, bool], frozenset[str]]] = {
+    (True, True): frozenset({"loads", "dumps", "typed_loads"}),
+    (True, False): frozenset({"loads", "dumps"}),
+    (False, True): frozenset({"loads", "typed_loads"}),
+    (False, False): frozenset(),
+}
+"""The core's JSON functions that serve, by whether its writer and reader do."""
+
+
+def _walkers(monkeypatch: pytest.MonkeyPatch, *, writes: bool, reads: bool) -> None:
+    """Make ``wire`` see the core's writer and reader serving, or not."""
+    monkeypatch.setattr(wire, "to_plain", len if writes else _python_to_plain)
+    monkeypatch.setattr(wire, "from_plain", len if reads else _python_from_plain)
+
+
+@pytest.mark.parametrize(("writes", "reads"), list(_SERVED))
+def test_the_core_serves_json_only_where_its_walkers_do(
+    monkeypatch: pytest.MonkeyPatch,
+    writes: bool,
+    reads: bool,
+) -> None:
+    core = types.ModuleType("treekle._rust")
+    for name in ("json_loads_plain", "json_dumps", "json_loads_typed"):
+        setattr(core, name, len)
+    monkeypatch.setitem(sys.modules, "treekle._rust", core)
+    _walkers(monkeypatch, writes=writes, reads=reads)
+    found = wire._core_json()
+    assert set(found) == _SERVED[writes, reads]
+    assert all(function is len for function in found.values())
+
+
+def test_a_core_without_json_functions_is_left_to_json(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(sys.modules, "treekle._rust", types.ModuleType("_rust"))
+    _walkers(monkeypatch, writes=True, reads=True)
+    with pytest.warns(RuntimeWarning, match="Rust core does not match"):
+        assert wire._core_json() == {}
+
+
 def test_a_core_without_json_functions_warns_and_uses_json() -> None:
     # A core built before the JSON functions existed still sets up its walkers.
     completed = subprocess.run(  # noqa: S603 -- Runs this interpreter on the test's own script.
@@ -160,7 +270,7 @@ def test_a_core_without_json_functions_warns_and_uses_json() -> None:
                     warnings.simplefilter("always")
                     from treekle import wire
 
-                assert (wire._loads, wire._dumps, wire._typed_loads) == (None, None, None)
+                assert wire._CORE_JSON == {}
                 print(wire.json_dumps([1]), wire.json_loads("[2]"), wire.json_loads("[3]", list))
                 print(
                     [
@@ -202,9 +312,7 @@ def test_pure_python_serves_every_wire_step() -> None:
                 class Point:
                     x: int
 
-                assert wire._loads is None
-                assert wire._dumps is None
-                assert wire._typed_loads is None
+                assert wire._CORE_JSON == {}
                 text = json_dumps(Point(1))
                 assert json_loads(text, Point) == Point(1)
                 print(text)

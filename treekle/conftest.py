@@ -59,6 +59,5 @@ def implementation(
                 monkeypatch.setattr(module, name, _PYTHON[name])
     # ``wire`` also holds the core's JSON functions; without them it reads and
     # writes through ``json`` and the walkers above.
-    for name in ("_loads", "_dumps", "_typed_loads"):
-        monkeypatch.setattr(wire, name, None)
+    monkeypatch.setattr(wire, "_CORE_JSON", {})
     return param
