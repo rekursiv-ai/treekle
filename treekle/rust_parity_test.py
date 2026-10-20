@@ -72,6 +72,14 @@ needs_rust = pytest.mark.skipif(
 class _Core(Protocol):
     def setup_decode(self, module: dict[str, object], /) -> None: ...
 
+    def json_dumps_plain(
+        self,
+        tree: object,
+        *,
+        indent: int | None,
+        sort_keys: bool,
+    ) -> str: ...
+
 
 def _core() -> _Core:
     """Import the built core by name; CI type-checks without building it."""
@@ -3912,11 +3920,10 @@ def test_the_plain_tree_writer_writes_as_json_dumps_does(
     indent: int | None,
     sort_keys: bool,
 ) -> None:
-    from treekle import _rust  # noqa: PLC0415 -- Absent in a pure-Python run.
-
+    core = _core()
     tree = _plain_trees()[name]
     assert _text_outcome(
-        lambda: _rust.json_dumps_plain(tree, indent=indent, sort_keys=sort_keys),
+        lambda: core.json_dumps_plain(tree, indent=indent, sort_keys=sort_keys),
     ) == _text_outcome(lambda: json.dumps(tree, indent=indent, sort_keys=sort_keys))
 
 

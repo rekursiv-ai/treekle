@@ -119,7 +119,7 @@ def to_plain(
         cycle.
 
     """
-    if dialect not in get_args(cast("object", Dialect.__value__)):
+    if dialect not in get_args(Dialect.__value__):
         raise ValueError(f"unknown dialect {dialect!r}; expected 'json' or 'python'")
     tree = cast(
         "MutablePlainTree",
