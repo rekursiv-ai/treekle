@@ -311,7 +311,7 @@ def _reference(place: _Here) -> dict[str, object] | None:
     while place is not None:
         if place is _IN_KEY:
             return None
-        place, key = place
+        place, key = place  # pyrefly: ignore[not-iterable] -- pyrefly drops the loop's `is not None` narrowing of a recursive alias.
         keys.append(key)
     keys.reverse()
     return {"py/ref": keys}
@@ -324,7 +324,7 @@ def _encloses(place: _Here, here: _Here) -> bool:
             return True
         if here is _IN_KEY:
             return False
-        here = here[0]
+        here = here[0]  # pyrefly: ignore[unsupported-operation] -- pyrefly drops the loop's `is not None` narrowing of a recursive alias.
     return False
 
 

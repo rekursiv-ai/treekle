@@ -334,7 +334,7 @@ class Liar(Sequence[object]):
         return self.length
 
     @override
-    def __getitem__(self, index: object) -> object:  # pyright: ignore[reportIncompatibleMethodOverride] -- Accepts any index to raise IndexError as a misbehaving sequence would.  # ty: ignore[invalid-method-override] -- Same.
+    def __getitem__(self, index: object) -> object:  # pyright: ignore[reportIncompatibleMethodOverride] -- Accepts any index to raise IndexError as a misbehaving sequence would.  # ty: ignore[invalid-method-override] -- Same.  # pyrefly: ignore[bad-override] -- Accepts any index to raise IndexError as a misbehaving sequence would.
         if not isinstance(index, int) or index >= len(self.items):
             raise IndexError(index)
         return self.items[index]
@@ -363,7 +363,7 @@ class LowersToOne(str):
     __slots__ = ()
 
     @override
-    def lower(self) -> int:  # pyright: ignore[reportIncompatibleMethodOverride] -- The test needs a str whose lower() is not text.  # ty: ignore[invalid-method-override] -- Same.
+    def lower(self) -> int:  # pyright: ignore[reportIncompatibleMethodOverride] -- The test needs a str whose lower() is not text.  # ty: ignore[invalid-method-override] -- Same.  # pyrefly: ignore[bad-override] -- The test needs a str whose lower() is not text.
         return 1
 
 
@@ -678,7 +678,7 @@ def _path(place: _Place) -> list[object]:
     """Return the keys leading to ``place``."""
     keys: list[object] = []
     while place is not None:
-        place, key = place
+        place, key = place  # pyrefly: ignore[not-iterable] -- pyrefly drops the loop's `is not None` narrowing of a recursive alias.
         keys.append(key)
     return keys[::-1]
 
@@ -1307,7 +1307,7 @@ class HashHidden(metaclass=_HidesHash):
 
 
 class HashReported(metaclass=_ReportsHash):
-    __hash__ = None  # pyright: ignore[reportAssignmentType] -- An unhashable class is the case under test.
+    __hash__: ClassVar[None] = None  # pyright: ignore[reportIncompatibleMethodOverride] -- An unhashable class is the case under test.
 
     def __init__(self, n: int) -> None:
         self.n = n
@@ -1582,7 +1582,7 @@ def test_shallow_nesting_still_round_trips() -> None:
 def _deep(value: object, depth: int) -> object:
     """Return ``value`` nested ``depth`` lists down."""
     for _ in range(depth):
-        value = [value]
+        value = list[object]([value])
     return value
 
 
@@ -1698,7 +1698,8 @@ def test_rolled_back_registrations_deep_in_the_tree_match_python(
     inner = Frozen(1)
     deep: object = inner
     for _ in range(60):
-        deep = (deep,)
+        nested: tuple[object] = (deep,)
+        deep = nested
     value = [{deep}, {deep: 1}, inner, [inner]]
 
     expected = serialize._python_to_plain(value, mutable=mutable)
@@ -1977,13 +1978,13 @@ def test_a_nested_union_reads_its_innermost_node_once(
     depth = 12
     data: object = "bad"
     for _ in range(depth):
-        data = [data]
+        data = list[object]([data])
     original = deserialize._decode_uuid
     calls: list[object] = []
 
     def counted(data: PlainTree, target: object, at: object, state: object) -> object:
         calls.append(data)
-        return original(data, target, at, state)  # pyright: ignore[reportArgumentType] -- Forwards the spied decoder's arguments unchanged.  # ty: ignore[invalid-argument-type] -- Same.
+        return original(data, target, at, state)  # pyright: ignore[reportArgumentType] -- Forwards the spied decoder's arguments unchanged.  # ty: ignore[invalid-argument-type] -- Same.  # pyrefly: ignore[bad-argument-type] -- Forwards the spied decoder's arguments unchanged.
 
     counts: list[int] = []
     try:
@@ -2413,7 +2414,7 @@ class _DictReduceBase:
         self.a = 1
 
 
-def _reduce_property(error: type[Exception] | None) -> property:
+def _reduce_property(error: type[Exception] | None) -> object:
     """Return a ``__reduce__`` property that raises ``error``, or gives a recipe."""
 
     def reduce(self: object) -> object:

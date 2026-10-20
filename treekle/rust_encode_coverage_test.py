@@ -194,13 +194,13 @@ class _Shadowed:
 class _Proxied:
     @property
     @override
-    def __dict__(self) -> dict[str, object]:  # pyright: ignore[reportIncompatibleVariableOverride] -- ``object`` declares ``__dict__`` a variable; a property is the case under test.
+    def __dict__(self) -> dict[str, object]:  # pyright: ignore[reportIncompatibleVariableOverride] -- ``object`` declares ``__dict__`` a variable; a property is the case under test.  # pyrefly: ignore[bad-override] -- ``object`` declares ``__dict__`` a variable; a property is the case under test.
         return {"a": 1}
 
 
 def test_a_slotted_object_with_a_dict_and_extra_keys_matches_python() -> None:
     value = _Mixed()
-    value.b = 1
+    value.b = 1  # pyrefly: ignore[missing-attribute] -- pyrefly reads no attribute from ``__slots__``; ``b`` is one.
     vars(value).update(z=2, a=3)
 
     _assert_encodes_alike(value, sort=True)
@@ -361,7 +361,7 @@ def test_a_weak_cache_with_no_instance_dict_matches_python(
     monkeypatch.setattr(
         serialize,
         "_ENCODER_CACHE",
-        type(cache).__new__(type(cache)),
+        type(cache).__new__(type(cache)),  # pyrefly: ignore[bad-argument-count, bad-specialization] -- pyrefly resolves a generic class's ``__new__`` to ``GenericAlias.__new__``.
     )
 
     _assert_encodes_alike([_Point(1)])
@@ -508,14 +508,14 @@ class _KeyError:
 
     @property
     @override
-    def __dict__(self) -> dict[str, object]:  # pyright: ignore[reportIncompatibleVariableOverride] -- ``object`` declares ``__dict__`` a variable; a property is the case under test.
+    def __dict__(self) -> dict[str, object]:  # pyright: ignore[reportIncompatibleVariableOverride] -- ``object`` declares ``__dict__`` a variable; a property is the case under test.  # pyrefly: ignore[bad-override] -- ``object`` declares ``__dict__`` a variable; a property is the case under test.
         raise KeyError("no dict")
 
 
 def _deep(value: object, depth: int = 64) -> object:
     """Return ``value`` nested ``depth`` lists down, past the walk's in-place depth."""
     for _ in range(depth):
-        value = [value]
+        value = list[object]([value])
     return value
 
 

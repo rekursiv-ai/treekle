@@ -339,7 +339,7 @@ def _to_builtins(
         }
         tag = getattr(obj, "__struct_tag__", None)
         return fields if tag is None else {"$type": tag, **fields}
-    if isinstance(obj, list | tuple):
+    if isinstance(obj, (list, tuple)):
         items = [_to_builtins(item) for item in cast("list[object]", obj)]
         return items if isinstance(obj, list) else tuple(items)
     if isinstance(obj, dict):
