@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from types import MemberDescriptorType
 from typing import TYPE_CHECKING, Final, cast
 
 import importlib
@@ -10,7 +11,7 @@ import weakref
 
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Iterable, Mapping
 
 
 __all__ = [
@@ -85,11 +86,15 @@ def resolves_to(path: str, value: object) -> bool:
       holds: Whether ``path`` still names ``value`` itself.
 
     """
-    parts = path.split(".")
-    for split in range(len(parts) - 1, 0, -1):
-        module = sys.modules.get(".".join(parts[:split]))
+    # Perf: pure-Python _resolve and _import_path hits, timeit: 370 -> 160 ns.
+    splits = _SPLITS.get(path)
+    if splits is None:
+        splits = _SPLITS[path] = _splits(path)
+    modules = sys.modules
+    for prefix, names in splits:
+        module = modules.get(prefix)
         if module is not None:
-            return _walk(module, parts[split:]) is value
+            return _walk(module, names) is value
     return False
 
 
@@ -118,11 +123,11 @@ def slot_names(kind: type) -> tuple[str, ...]:
     names: dict[str, None] = {}
     for base in kind.__mro__:
         slots = cast("object", vars(base).get("__slots__", ()))
-        for slot in (
-            (slots,) if isinstance(slots, str) else cast("Iterable[str]", slots)
-        ):
+        declared = (slots,) if isinstance(slots, str) else cast("Iterable[str]", slots)
+        prefix = _mangling_prefix(base, declared)
+        for slot in declared:
             if slot not in SKIPPED_ATTRIBUTES:
-                names.setdefault(_mangled(slot, base))
+                names.setdefault(_mangled(slot, prefix))
     result = tuple(names)
     _SLOT_NAMES[kind] = result
     return result
@@ -162,13 +167,31 @@ def _sorted_slots(kind: type) -> tuple[str, ...]:
 
 # ``__slots__`` lists a private name as written, but CPython stores the slot,
 # as it compiles every access, under ``_<Class>__name``; read unmangled, the
-# slot looks unset and its state is silently dropped.
-def _mangled(name: str, owner: type) -> str:
-    """Return slot ``name`` as CPython names it inside class ``owner``."""
-    if not name.startswith("__") or name.endswith("__"):
-        return name
+# slot looks unset and its state is silently dropped. ``<Class>`` is the name
+# ``type`` was given, which a later ``__name__`` change does not follow.
+def _mangling_prefix(owner: type, declared: Iterable[str]) -> str:
+    """Return the ``_<Class>`` CPython put before ``owner``'s private slots."""
+    namespace = cast("Mapping[str, object]", vars(owner))
+    for slot in declared:
+        if _is_private(slot):
+            for key, entry in namespace.items():
+                if key.endswith(slot) and isinstance(entry, MemberDescriptorType):
+                    prefix = key.removesuffix(slot)
+                    if prefix.startswith("_") and not prefix.startswith("__"):
+                        return prefix
+    # Every private slot's descriptor is gone; the current name is all there is.
     stripped = owner.__name__.lstrip("_")
-    return f"_{stripped}{name}" if stripped else name
+    return f"_{stripped}" if stripped else ""
+
+
+def _mangled(name: str, prefix: str) -> str:
+    """Return slot ``name`` as CPython named it under mangling ``prefix``."""
+    return f"{prefix}{name}" if _is_private(name) else name
+
+
+def _is_private(name: str) -> bool:
+    """Return whether CPython mangles ``name`` inside a class body."""
+    return name.startswith("__") and not name.endswith("__")
 
 
 def _walk(start: object, parts: Iterable[str]) -> object:
@@ -181,6 +204,12 @@ def _walk(start: object, parts: Iterable[str]) -> object:
     return resolved
 
 
+_SPLITS: Final[dict[str, tuple[tuple[str, tuple[str, ...]], ...]]] = {}
+"""``_splits`` of each path ``resolves_to`` was asked about.
+
+One entry per distinct path asked, as the import-path caches that ask keep."""
+
+
 _SLOT_NAMES: Final[weakref.WeakKeyDictionary[type, tuple[str, ...]]] = (
     weakref.WeakKeyDictionary()
 )
@@ -189,3 +218,12 @@ _SLOT_NAMES: Final[weakref.WeakKeyDictionary[type, tuple[str, ...]]] = (
 _SORTED_SLOT_NAMES: Final[weakref.WeakKeyDictionary[type, tuple[str, ...]]] = (
     weakref.WeakKeyDictionary()
 )
+
+
+def _splits(path: str) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    """Return each module prefix of ``path``, longest first, with the names after it."""
+    parts = path.split(".")
+    return tuple(
+        (".".join(parts[:split]), tuple(parts[split:]))
+        for split in range(len(parts) - 1, 0, -1)
+    )

@@ -48,7 +48,7 @@ import weakref
 
 import pytest
 
-from treekle import deserialize, serialize, wire
+from treekle import deserialize, reflect, serialize, wire
 from treekle.types import ReadError
 
 
@@ -874,8 +874,6 @@ def test_planted_cache_entries_encode_as_python_does(
     planted: str,
     sort: bool,
 ) -> None:
-    from treekle import reflect  # noqa: PLC0415 -- Only this test reads it.
-
     value = _SlottedPair(1, 2)
     serialize._python_to_plain(value, sort=sort)
     # The native walk keeps what it read from these caches across calls.
@@ -2624,6 +2622,27 @@ def test_a_resolved_cache_replaced_many_times_is_still_read() -> None:
         """,
     )
     assert printed == "<class 'os.PathLike'>"
+
+
+@needs_rust
+def test_a_resolved_entry_is_rechecked_natively_where_it_can_be(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = f"{__name__}._SlottedPair"
+    asked: list[str] = []
+
+    def counted(asked_path: str, value: object) -> bool:
+        asked.append(asked_path)
+        return reflect.resolves_to(asked_path, value)
+
+    # Replacing either moves the generation, so no native entry survives.
+    monkeypatch.setattr(deserialize, "_RESOLVED", {path: _SlottedPair})
+    monkeypatch.setattr(deserialize, "resolves_to", counted)
+
+    found = deserialize.from_plain({"py/type": path}, object, allow_imports=True)
+
+    assert found is _SlottedPair
+    assert asked == []
 
 
 class _GcProbe:

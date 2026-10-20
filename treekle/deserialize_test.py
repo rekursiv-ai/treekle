@@ -337,6 +337,13 @@ class OtherTagged:
     name: str = ""
 
 
+class Nest:
+    """Holds a class whose name under it is later rebound."""
+
+    class Inner:
+        """A class reached through its outer class."""
+
+
 @dataclass(frozen=True, kw_only=True, slots=True)
 class Pair1:
     x: int = 0
@@ -2006,6 +2013,19 @@ class TestTypeTags:
             dict[str, object],
             allow_imports=True,
         ) == {"r": max}
+
+    def test_a_nested_path_rebound_after_a_read_resolves_to_its_new_object(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # The name is rebound on the outer class, not on the module.
+        tree: MutablePlainTree = {"py/type": f"{__name__}.Nest.Inner"}
+        for _ in range(3):
+            assert from_plain(tree, object, allow_imports=True) is Nest.Inner
+
+        monkeypatch.setattr(Nest, "Inner", Square)
+
+        assert from_plain(tree, object, allow_imports=True) is Square
 
     def test_a_path_rebound_after_a_read_resolves_to_its_new_object(
         self,

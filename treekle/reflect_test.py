@@ -61,6 +61,12 @@ Twice = type("Twice", (Repeated,), {"__slots__": ("a2",)})
 WeakSlot = type("WeakSlot", (), {"__slots__": ("__weakref__", "w")})
 Underscored = type("__Underscored", (), {"__slots__": ("__p",)})
 Underscores = type("___", (), {"__slots__": ("__p",)})
+Renamed = type("Created", (), {"__slots__": ("__p", "q")})
+Renamed.__name__ = "Renamed"
+Clashing = type("Clashing", (), {"__slots__": ("__x", "_Clashing__y", "x")})
+PrivateWeak = type("PrivateWeak", (), {"__slots__": ("__weakref__", "__p")})
+Bereft = type("Bereft", (), {"__slots__": ("__p", "q")})
+delattr(Bereft, "_Bereft__p")
 
 
 class Unslotted:
@@ -272,6 +278,34 @@ class TestResolvesTo:
         assert resolves_to("treekle_never_imported_xyz.thing", None) is False
         assert "treekle_never_imported_xyz" not in sys.modules
 
+    def test_a_name_rebound_on_an_outer_class_no_longer_holds(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        path, original = f"{__name__}.Holder.__init__", Holder.__init__
+        assert resolves_to(path, original) is True
+
+        monkeypatch.setattr(Holder, "__init__", Slotted.__init__)
+
+        assert resolves_to(path, original) is False
+
+    def test_it_agrees_with_resolve_import_on_the_longest_loaded_prefix(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # A module loaded under the whole path is never the walk's start; one
+        # loaded under a longer prefix than the class's module is.
+        path = f"{__name__}.Holder.__init__"
+        monkeypatch.setitem(sys.modules, path, types.ModuleType(path))
+        assert resolves_to(path, Holder.__init__) is (
+            resolve_import(path) is Holder.__init__
+        )
+
+        shadow = types.ModuleType(f"{__name__}.Holder")
+        monkeypatch.setitem(sys.modules, shadow.__name__, shadow)
+        assert resolve_import(path) is not Holder.__init__
+        assert resolves_to(path, Holder.__init__) is False
+
 
 class TestSlotNames:
     @pytest.fixture(autouse=True)
@@ -295,6 +329,13 @@ class TestSlotNames:
             (Twice, ("a2", "_Repeated__dict__x", "a")),
             (Underscored, ("_Underscored__p",)),
             (Underscores, ("__p",)),
+            # Mangled by the name the class was created under, not its current one.
+            (Renamed, ("_Created__p", "q")),
+            # A public slot spelled like another's mangled name stays itself.
+            (Clashing, ("_Clashing__x", "_Clashing__y", "x")),
+            (PrivateWeak, ("_PrivateWeak__p",)),
+            # With every private descriptor deleted, the current name decides.
+            (Bereft, ("_Bereft__p", "q")),
             (WeakSlot, ("w",)),
             (Unslotted, ()),
             (int, ()),

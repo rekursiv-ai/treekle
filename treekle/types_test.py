@@ -3,15 +3,11 @@
 from __future__ import annotations
 
 from types import MappingProxyType
-from typing import TYPE_CHECKING, cast
+from typing import cast
 
 import pickle
 
-from treekle.types import Invalid, ReadError
-
-
-if TYPE_CHECKING:
-    from treekle.types import FieldPath
+from treekle.types import FieldPath, Invalid, ReadError
 
 
 def test_a_read_error_holds_its_partial_value_and_bad_parts() -> None:
@@ -30,6 +26,41 @@ def test_a_read_error_defaults_to_no_partial_value_and_no_bad_parts() -> None:
 
     assert error.partial is None
     assert error.bad == {}
+
+
+class _DetailedError(ReadError):
+    """A subclass whose ``__init__`` takes a field of its own."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: int,
+        partial: object = None,
+        bad: MappingProxyType[FieldPath, Invalid] = MappingProxyType({}),
+    ) -> None:
+        super().__init__(message, partial=partial, bad=bad)
+        self.code = code
+
+
+def test_a_read_error_subclass_survives_pickling_as_itself() -> None:
+    invalid = Invalid(raw="x", reason="not an int")
+    error = _DetailedError(
+        "1 part does not read",
+        code=3,
+        partial=[invalid],
+        bad=MappingProxyType({(0,): invalid}),
+    )
+
+    restored = cast("object", pickle.loads(pickle.dumps(error)))
+
+    assert isinstance(restored, _DetailedError)
+    assert type(restored) is _DetailedError
+    assert restored.args == ("1 part does not read",)
+    assert restored.code == 3
+    assert restored.partial == [invalid]
+    assert restored.bad == {(0,): invalid}
+    assert isinstance(restored.bad, MappingProxyType)
 
 
 def test_a_read_error_survives_pickling_with_its_parts() -> None:

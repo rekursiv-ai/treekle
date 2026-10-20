@@ -2182,14 +2182,16 @@ impl<'py, 'g> Decoder<'py, 'g> {
 
     // Perf: exp000 from_plain, lockstep: 1.01-1.02x.
     /// Keep ``found``, what ``resolved`` held for ``path`` when the lookup
-    /// began at generation ``before``, once both dicts it came through are
-    /// watched. No Python code runs between that lookup and this.
+    /// began at generation ``before``, with ``check``, the native recheck
+    /// that just held, once both dicts it came through are watched. No Python
+    /// code runs between that lookup and this.
     fn remember_resolved(
         &mut self,
         before: Option<u64>,
         resolved: &Bound<'py, PyDict>,
         path: &B<'py>,
         found: &B<'py>,
+        check: PathCheck,
     ) {
         let py = self.py;
         let dict = resolved.as_ptr() as usize;
@@ -2215,10 +2217,6 @@ impl<'py, 'g> Decoder<'py, 'g> {
             self.caches.resolved_at = Some((now, dict));
             drop(stale);
         }
-        // A path the check cannot read natively is asked of Python each time.
-        let Ok(Some(check)) = PathCheck::loaded(&self.g.paths, path) else {
-            return;
-        };
         if self.caches.resolved.len() >= TABLE_LIMIT {
             let stale = std::mem::take(&mut self.caches.resolved);
             drop(stale);
@@ -2238,7 +2236,8 @@ impl<'py, 'g> Decoder<'py, 'g> {
         // While neither the module globals nor ``_RESOLVED`` has changed, the
         // two lookups below give what they gave before for the same str.
         // ``_resolve`` trusts an entry only while ``resolves_to`` says its path
-        // still names it; the check is read natively where the path allows.
+        // still names it; the check is read natively where the path allows,
+        // and a path it cannot read is asked of Python each time.
         let generation = crate::sync::DECODE.generation();
         let exact = tp(path) == t_str();
         if exact
@@ -2254,15 +2253,28 @@ impl<'py, 'g> Decoder<'py, 'g> {
         let resolved = interned_item(module, pyo3::intern!(py, "_RESOLVED"))?
             .cast_into::<PyDict>()
             .map_err(PyErr::from)?;
-        if let Some(found) = resolved.get_item(path)?
-            && interned_item(module, pyo3::intern!(py, "resolves_to"))?
-                .call1((path, &found))?
-                .is_truthy()?
-        {
-            if exact {
-                self.remember_resolved(generation, &resolved, path, &found);
+        if let Some(found) = resolved.get_item(path)? {
+            let check = if exact {
+                PathCheck::loaded(&self.g.paths, path)?
+            } else {
+                None
+            };
+            let holds = match check
+                .as_ref()
+                .map(|check| check.holds(&self.g.paths, &found))
+            {
+                Some(Ok(Some(holds))) => holds,
+                Some(Err(error)) => return Err(error.into()),
+                Some(Ok(None)) | None => interned_item(module, pyo3::intern!(py, "resolves_to"))?
+                    .call1((path, &found))?
+                    .is_truthy()?,
+            };
+            if holds {
+                if let Some(check) = check {
+                    self.remember_resolved(generation, &resolved, path, &found, check);
+                }
+                return Ok(found);
             }
-            return Ok(found);
         }
         let resolve_import = interned_item(module, pyo3::intern!(py, "resolve_import"))?;
         match resolve_import.call1((path,)) {
