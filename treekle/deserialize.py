@@ -1528,7 +1528,7 @@ class _Frame:
         self.check: object = _UNCHECKED
         self.then: Callable[[object], object] | None = None
         self.pending_raw: PlainTree = None
-        self.pending_at = at
+        self.pending_at: FieldPath = at
         self.reading: int | None = None
 
     def step(self, state: _Decoding) -> _Frame | None:

@@ -391,19 +391,19 @@ def _eager_typed_dict(
 EagerBase = _eager_typed_dict(
     "EagerBase",
     (),
-    {"a": int, "b": NotRequired[str]},
+    {"a": int, "b": NotRequired[str]},  # pyrefly: ignore[invalid-annotation] -- A runtime hint for the metaclass, not an annotation.
     total=True,
 )
 EagerMiddle = _eager_typed_dict(
     "EagerMiddle",
     (EagerBase,),
-    {"c": int, "d": Required[int]},
+    {"c": int, "d": Required[int]},  # pyrefly: ignore[invalid-annotation] -- A runtime hint for the metaclass, not an annotation.
     total=False,
 )
 EagerLeaf = _eager_typed_dict(
     "EagerLeaf",
     (EagerMiddle,),
-    {"e": int, "f": NotRequired[int]},
+    {"e": int, "f": NotRequired[int]},  # pyrefly: ignore[invalid-annotation] -- A runtime hint for the metaclass, not an annotation.
     total=True,
 )
 
@@ -2657,7 +2657,7 @@ class _FreshParts(Sequence[object]):
         return len(self.items)
 
     @override
-    def __getitem__(self, index: object) -> object:  # pyright: ignore[reportIncompatibleMethodOverride] -- Accepts any index to raise IndexError as a misbehaving sequence would.  # ty: ignore[invalid-method-override] -- Same.
+    def __getitem__(self, index: object) -> object:  # pyright: ignore[reportIncompatibleMethodOverride] -- Accepts any index to raise IndexError as a misbehaving sequence would.  # ty: ignore[invalid-method-override] -- Same.  # pyrefly: ignore[bad-override] -- Accepts any index to raise IndexError as a misbehaving sequence would.
         if not isinstance(index, int) or index >= len(self.items):
             raise IndexError(index)
         return [self.items[index]]
@@ -2886,7 +2886,7 @@ class TestFieldTypes:
 
         def counted(*args: object, **kwargs: object) -> object:
             calls.append(args[0])
-            return get_type_hints(*args, **kwargs)  # pyright: ignore[reportArgumentType] -- Forwards the spied call's arguments unchanged.  # ty: ignore[invalid-argument-type] -- Same.
+            return get_type_hints(*args, **kwargs)  # pyright: ignore[reportArgumentType] -- Forwards the spied call's arguments unchanged.  # ty: ignore[invalid-argument-type] -- Same.  # pyrefly: ignore[bad-argument-type] -- Forwards the spied call's arguments unchanged.
 
         monkeypatch.setattr(deserialize, "get_type_hints", counted)
 

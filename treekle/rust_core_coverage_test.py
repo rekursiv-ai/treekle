@@ -129,7 +129,7 @@ class _Hooks(Mapping[type, tuple[object, object]]):
         return len(self.rows)
 
     @override
-    def items(self) -> list[object]:  # ty: ignore[invalid-method-override] -- Rows are malformed on purpose, so they are no ItemsView.  # pyright: ignore[reportIncompatibleMethodOverride] -- Rows are malformed on purpose, so they are no ItemsView.
+    def items(self) -> list[object]:  # ty: ignore[invalid-method-override] -- Rows are malformed on purpose, so they are no ItemsView.  # pyright: ignore[reportIncompatibleMethodOverride] -- Rows are malformed on purpose, so they are no ItemsView.  # pyrefly: ignore[bad-override] -- Rows are malformed on purpose, so they are no ItemsView.
         return self.rows
 
 
@@ -208,7 +208,7 @@ def test_a_sort_option_that_is_not_a_bool_reaches_a_foreign_encoder(
 ) -> None:
     def encode(value: object, state: _Encoding) -> object:
         del value
-        return {"sorted": bool(state.sort)}
+        return {"sorted": bool(state.sort)}  # pyrefly: ignore[unnecessary-type-conversion] -- The stub's type hides the runtime value (numpy/torch scalar or non-str key); the conversion is load-bearing.
 
     encoders = dict(serialize._ENCODERS)
     encoders[_Foreign] = encode
@@ -229,7 +229,7 @@ def test_a_set_nested_past_the_stack_raises_as_python_does() -> None:
     # The messages name different frames, so only the type is compared.
     value: object = 0
     for _ in range(30_000):
-        value = frozenset([(value,)])
+        value = frozenset[object]([(value,)])
     raised: list[str] = []
 
     def run(function: Callable[[object], object]) -> None:

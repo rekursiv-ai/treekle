@@ -254,7 +254,7 @@ def _mirror(value: object, *, module: ModuleType, classes: _Classes) -> object:
             setattr(module, made.__name__, made)
             classes[key] = made
         return cast("object", classes[key](**fields))
-    if isinstance(value, list | tuple):
+    if isinstance(value, (list, tuple)):
         sequence = cast("list[object] | tuple[object, ...]", value)
         items = [_mirror(item, module=module, classes=classes) for item in sequence]
         return items if isinstance(sequence, list) else tuple(items)
@@ -600,7 +600,7 @@ def _tagged(value: object) -> object:
             for field in dataclasses.fields(value)
         }
         return {"$type": type(value).__name__, **fields}
-    if isinstance(value, list | tuple):
+    if isinstance(value, (list, tuple)):
         sequence = cast("list[object] | tuple[object, ...]", value)
         items = [_tagged(item) for item in sequence]
         return items if isinstance(sequence, list) else tuple(items)
@@ -634,7 +634,7 @@ def _struct(
             kw_only=True,
         )
         return structs[annotation]
-    return cast("object", annotation)
+    return cast("object", annotation)  # pyrefly: ignore[redundant-cast] -- ty or basedpyright needs this cast; pyrefly already infers it.
 
 
 # Listed in the order the summary tables print them, the reference first.

@@ -48,7 +48,7 @@ class TestImmutableMutable:
         depth = 200
         tree: object = "leaf"
         for index in range(depth):
-            tree = [tree] if index % 2 else {"k": tree}
+            tree = list[object]([tree]) if index % 2 else dict[str, object](k=tree)
 
         with recursion_headroom(100):
             node: MutablePlainTree = mutable(immutable(tree))
