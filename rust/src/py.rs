@@ -227,9 +227,55 @@ impl Drop for Recursion {
     }
 }
 
+// Perf: exp000 from_plain, paired: 1.09x over calling the exported Py_TYPE / Py*_Check.
+// On 3.14 pyo3-ffi binds ``Py_TYPE`` to libpython's exported function, a call
+// per check; CPython's own header reads the field inline, as this does. The
+// crate refuses free-threaded builds, so the field is a plain pointer.
+/// ``Py_TYPE(ptr)``.
 #[inline(always)]
-pub fn tp(obj: &B<'_>) -> *mut ffi::PyTypeObject {
-    unsafe { ob_type(obj.as_ptr()) }
+pub fn ob_type(ptr: *mut ffi::PyObject) -> *mut ffi::PyTypeObject {
+    unsafe { (*ptr).ob_type }
+}
+
+// On 3.14 pyo3-ffi also binds ``PyUnicode_KIND``/``PyUnicode_DATA`` to
+// exported calls. These read the 3.12-3.14 (GIL build) layout directly:
+// ``state`` holds interned:2, kind:3, compact:1, ascii:1 from bit 0.
+/// A compact str's ``(kind, data, length, ascii)``; ``None`` for a legacy str.
+#[inline(always)]
+pub unsafe fn str_view(op: *mut ffi::PyObject) -> Option<(u32, *const u8, usize, bool)> {
+    unsafe {
+        let ascii_obj = op.cast::<ffi::PyASCIIObject>();
+        let state = (*ascii_obj).state;
+        if state >> 5 & 1 == 0 {
+            return None;
+        }
+        let len = (*ascii_obj).length as usize;
+        let ascii = state >> 6 & 1 == 1;
+        let data = if ascii {
+            op.cast::<u8>()
+                .add(std::mem::size_of::<ffi::PyASCIIObject>())
+        } else {
+            op.cast::<u8>()
+                .add(std::mem::size_of::<ffi::PyCompactUnicodeObject>())
+        };
+        Some((state >> 2 & 7, data, len, ascii))
+    }
+}
+
+/// An exact int's value when it is compact (one 30-bit digit at most), read
+/// from the 3.12-3.14 ``lv_tag`` layout: sign in the low two bits, digit
+/// count from bit 3.
+#[inline(always)]
+pub unsafe fn compact_int(op: *mut ffi::PyObject) -> Option<i64> {
+    unsafe {
+        let base = op.cast::<u8>().add(std::mem::size_of::<ffi::PyObject>());
+        let tag = *base.cast::<usize>();
+        if tag >= 2 << 3 {
+            return None;
+        }
+        let digit = i64::from(*base.add(std::mem::size_of::<usize>()).cast::<u32>());
+        Some((1 - (tag & 3) as i64) * digit)
+    }
 }
 
 /// Whether ``raw``'s class has ``flag``, as the ``Py*_Check`` macros test.
@@ -238,12 +284,9 @@ pub fn has_flag(raw: *mut ffi::PyObject, flag: std::ffi::c_ulong) -> bool {
     unsafe { (*ob_type(raw)).tp_flags & flag != 0 }
 }
 
-/// ``Py_TYPE``, read from the object header. pyo3 binds 3.14's ``Py_TYPE`` as
-/// an exported function, which no call site inlines; on the GIL build (the
-/// only one this module compiles for) the header still holds ``ob_type``.
 #[inline(always)]
-pub unsafe fn ob_type(raw: *mut ffi::PyObject) -> *mut ffi::PyTypeObject {
-    unsafe { (*raw).ob_type }
+pub fn tp(obj: &B<'_>) -> *mut ffi::PyTypeObject {
+    ob_type(obj.as_ptr())
 }
 
 macro_rules! type_ptr {
@@ -263,11 +306,10 @@ type_ptr!(t_int, PyLong_Type);
 type_ptr!(t_float, PyFloat_Type);
 type_ptr!(t_bool, PyBool_Type);
 type_ptr!(t_proxy, PyDictProxy_Type);
-type_ptr!(t_object, PyBaseObject_Type);
 
 #[inline(always)]
 pub fn t_none() -> *mut ffi::PyTypeObject {
-    unsafe { ob_type(ffi::Py_None()) }
+    ob_type(unsafe { ffi::Py_None() })
 }
 
 #[inline(always)]
@@ -282,7 +324,8 @@ pub fn is_int(obj: &B<'_>) -> bool {
 
 #[inline(always)]
 pub fn is_float(obj: &B<'_>) -> bool {
-    unsafe { ffi::PyFloat_Check(obj.as_ptr()) != 0 }
+    let kind = tp(obj);
+    kind == t_float() || unsafe { ffi::PyType_IsSubtype(kind, t_float()) != 0 }
 }
 
 #[inline(always)]
@@ -303,6 +346,15 @@ pub fn is_dict(obj: &B<'_>) -> bool {
 #[inline(always)]
 pub fn is_class(obj: &B<'_>) -> bool {
     has_flag(obj.as_ptr(), ffi::Py_TPFLAGS_TYPE_SUBCLASS)
+}
+
+/// ``isinstance(obj, (bytes, bytearray))``.
+#[inline(always)]
+pub fn is_bytes_like(obj: &B<'_>) -> bool {
+    let kind = tp(obj);
+    has_flag(obj.as_ptr(), ffi::Py_TPFLAGS_BYTES_SUBCLASS)
+        || kind == &raw mut ffi::PyByteArray_Type
+        || unsafe { ffi::PyType_IsSubtype(kind, &raw mut ffi::PyByteArray_Type) != 0 }
 }
 
 #[inline(always)]
@@ -338,7 +390,7 @@ pub fn is_unhashable(obj: &B<'_>) -> PyResult<bool> {
     // ``__hash__``, which CPython keeps in step with ``tp_hash``. Any other
     // metaclass may answer the lookup itself (a ``__getattribute__``, a
     // ``__hash__`` property) while the slot still hashes.
-    if unsafe { ob_type(kind.cast()) } == &raw mut ffi::PyType_Type {
+    if ob_type(kind.cast()) == &raw mut ffi::PyType_Type {
         return Ok(unsafe { (*kind).tp_hash }.map(|f| f as usize) == hash_not_implemented());
     }
     let py = obj.py();
@@ -386,49 +438,30 @@ pub unsafe fn ascii_bytes<'a>(raw: *mut ffi::PyObject) -> &'a [u8] {
     }
 }
 
-/// ``utf8`` for a raw str pointer, with no reference taken; the bytes live
-/// as long as the str.
-///
-/// # Safety
-/// ``raw`` is a live ``str``, held for as long as the bytes are used.
-#[inline]
-pub unsafe fn utf8_raw<'a>(raw: *mut ffi::PyObject) -> Option<&'a [u8]> {
-    unsafe {
-        if compact_ascii(raw) {
-            let ascii = raw.cast::<ffi::PyASCIIObject>();
-            let length = (*ascii).length as usize;
-            return Some(std::slice::from_raw_parts(
-                ascii.add(1).cast::<u8>(),
-                length,
-            ));
-        }
-        let mut size: ffi::Py_ssize_t = 0;
-        let data = ffi::PyUnicode_AsUTF8AndSize(raw, &mut size);
-        if data.is_null() {
-            ffi::PyErr_Clear();
-            return None;
-        }
-        Some(std::slice::from_raw_parts(data.cast::<u8>(), size as usize))
-    }
-}
-
 /// The UTF-8 bytes of a str, or ``None`` when it holds lone surrogates.
 #[inline]
 pub fn utf8<'a>(obj: &'a B<'_>) -> Option<&'a [u8]> {
-    // A compact ASCII str stores its bytes right after its header, already
-    // UTF-8; reading them there skips ``PyUnicode_AsUTF8AndSize``'s checks.
+    unsafe { utf8_ptr(obj.as_ptr()) }
+}
+
+// Perf: exp000 from_plain, lockstep: ~1.03x.
+/// ``utf8`` for a borrowed str pointer, valid while the str lives.
+#[inline]
+pub unsafe fn utf8_ptr<'a>(obj: *mut ffi::PyObject) -> Option<&'a [u8]> {
     unsafe {
-        let raw = obj.as_ptr();
-        if has_flag(raw, ffi::Py_TPFLAGS_UNICODE_SUBCLASS) && compact_ascii(raw) {
-            let ascii = raw.cast::<ffi::PyASCIIObject>();
-            let length = (*ascii).length as usize;
-            let data = ascii.add(1).cast::<u8>();
-            return Some(std::slice::from_raw_parts(data, length));
+        // A compact ASCII str's characters are its UTF-8 form and follow the
+        // header, as ``PyUnicode_AsUTF8AndSize`` (an exported call) would
+        // answer. The state word follows ``hash``; on non-free-threaded
+        // 3.12-3.14 its bits are interned:2, kind:3, compact:1, ascii:1.
+        debug_assert!(ffi::PyUnicode_Check(obj) != 0);
+        let ascii = obj.cast::<ffi::PyASCIIObject>();
+        let state = *std::ptr::addr_of!((*ascii).hash).add(1).cast::<u32>();
+        if state & (0b11 << 5) == 0b11 << 5 {
+            let size = (*ascii).length as usize;
+            return Some(std::slice::from_raw_parts(ascii.add(1).cast::<u8>(), size));
         }
-    }
-    unsafe {
         let mut size: ffi::Py_ssize_t = 0;
-        let data = ffi::PyUnicode_AsUTF8AndSize(obj.as_ptr(), &mut size);
+        let data = ffi::PyUnicode_AsUTF8AndSize(obj, &mut size);
         if data.is_null() {
             ffi::PyErr_Clear();
             return None;
@@ -500,6 +533,29 @@ pub fn py_ne(obj: &B<'_>, other: &B<'_>) -> PyResult<bool> {
     Ok(result == 1)
 }
 
+/// The items of an exact list or tuple, borrowed: valid only until Python
+/// code next runs, which may resize the list.
+///
+/// # Safety
+/// ``obj`` must be an exact list or tuple.
+#[inline(always)]
+pub unsafe fn borrowed_items<'a>(obj: &'a B<'_>) -> &'a [*mut ffi::PyObject] {
+    unsafe {
+        let raw = obj.as_ptr();
+        if ffi::Py_TYPE(raw) == t_list() {
+            let list = raw.cast::<ffi::PyListObject>();
+            let size = ffi::Py_SIZE(raw) as usize;
+            if size == 0 {
+                return &[];
+            }
+            std::slice::from_raw_parts((*list).ob_item, size)
+        } else {
+            let tuple = raw.cast::<ffi::PyTupleObject>();
+            std::slice::from_raw_parts((*tuple).ob_item.as_ptr(), ffi::Py_SIZE(raw) as usize)
+        }
+    }
+}
+
 /// Whether ``obj`` is an exact dict whose keys are all exact ``str``.
 pub fn is_str_keyed_dict(obj: &B<'_>) -> bool {
     if tp(obj) != t_dict() {
@@ -555,7 +611,7 @@ pub struct DictItems<'py> {
 
 impl<'py> DictItems<'py> {
     pub fn new(dict: &Bound<'py, PyDict>) -> Self {
-        let used = unsafe { ffi::PyDict_Size(dict.as_ptr()) };
+        let used = unsafe { (*dict.as_ptr().cast::<ffi::PyDictObject>()).ma_used };
         Self {
             dict: dict.clone(),
             position: 0,
@@ -567,7 +623,8 @@ impl<'py> DictItems<'py> {
     #[inline]
     pub fn next_item(&mut self) -> PyResult<Option<(B<'py>, B<'py>)>> {
         let dict = self.dict.as_ptr();
-        if unsafe { ffi::PyDict_Size(dict) } != self.used {
+        // ``PyDict_Size`` is an exported call; the field read is its body.
+        if unsafe { (*dict.cast::<ffi::PyDictObject>()).ma_used } != self.used {
             self.used = -1;
             return Err(PyRuntimeError::new_err(
                 "dictionary changed size during iteration",
@@ -650,6 +707,14 @@ impl<'py> MapItems<'py> {
         Ok(Self::Iter(items.try_iter()?))
     }
 
+    /// The entry count of a dict, for sizing what reads them; 0 otherwise.
+    pub fn len_hint(&self) -> usize {
+        match self {
+            Self::Dict(items) => items.used.max(0) as usize,
+            Self::Iter(_) => 0,
+        }
+    }
+
     #[inline]
     pub fn next_item(&mut self) -> PyResult<Option<(B<'py>, B<'py>)>> {
         match self {
@@ -682,6 +747,15 @@ impl<'py> SeqItems<'py> {
             ));
         }
         Ok(Self::Iter(seq.try_iter()?))
+    }
+
+    /// The item count where known, for sizing what reads them.
+    pub fn len_hint(&self) -> usize {
+        match self {
+            Self::List(list, _) => list.len(),
+            Self::Tuple(tuple, _) => tuple.len(),
+            Self::Iter(_) => 0,
+        }
     }
 
     #[inline]

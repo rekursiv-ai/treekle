@@ -2566,13 +2566,15 @@ class TestForeignInput:
 
     def test_an_untagged_object_member_is_the_input_itself(self) -> None:
         # Callers edit a read record's ``object`` members in place, as
-        # ``custom_json.convert`` let them.
+        # ``custom_json.convert`` let them. A later call may read from what
+        # an earlier one kept, so each call is checked.
         inner: dict[str, object] = {"b": [1]}
         record = cast("PlainTree", {"a": inner})
-        read = from_plain(record, dict[str, object])
-        assert read == record
-        assert read is not record
-        assert read["a"] is inner
+        for _ in range(3):
+            read = from_plain(record, dict[str, object])
+            assert read == record
+            assert read is not record
+            assert read["a"] is inner
         assert from_plain(record, object) is record
 
     def test_a_tagged_object_member_still_decodes(self) -> None:

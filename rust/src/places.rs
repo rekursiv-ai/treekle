@@ -46,9 +46,18 @@ pub struct Paths<'py> {
     frames: Vec<Frame<'py>>,
 }
 
+// Perf: exp000 from_plain, paired: part of decode.rs Reading's 1.02x.
 // Python keeps paths as tuples in dicts, so a key's ``__hash__`` and ``__eq__``
 // run, and raise, wherever that dict hashes or compares the path.
 fn key_hash(key: &B<'_>) -> PyResult<u64> {
+    // A str caches its hash at ``PyASCIIObject.hash``; reading it skips the
+    // exported ``PyObject_Hash`` call for the common string step.
+    if tp(key) == t_str() {
+        let hash = unsafe { (*key.as_ptr().cast::<ffi::PyASCIIObject>()).hash };
+        if hash != -1 {
+            return Ok(hash as u64);
+        }
+    }
     let hash = unsafe { ffi::PyObject_Hash(key.as_ptr()) };
     if hash == -1 {
         return Err(PyErr::fetch(key.py()));
@@ -67,15 +76,95 @@ fn index_matches(index: usize, other: &B<'_>) -> PyResult<bool> {
     py_eq(index.into_pyobject(other.py())?.as_any(), other)
 }
 
+// Perf: exp000 from_plain, lockstep: part of decode.rs SPARE's ~1.04x.
+/// Emptied walk tables kept between calls, so a call reuses the last one's
+/// allocations instead of growing its tables from nothing.
+pub struct Spare {
+    frames: Vec<Frame<'static>>,
+    table: HashTable<Placed<'static>>,
+    log: Vec<(u64, u32)>,
+    built: Vec<B<'static>>,
+}
+
+/// Past this many entries a table is freed rather than kept.
+const SPARE_LIMIT: usize = 1 << 16;
+
+impl Spare {
+    /// The tables, for a walk that runs while ``'py`` holds.
+    pub fn take<'py>(self) -> (Paths<'py>, PlacedTable<'py>, Vec<B<'py>>) {
+        // SAFETY: every table is empty (``park`` clears it), so no value of
+        // the old lifetime remains; the types differ only by lifetime.
+        let (frames, table, built) = unsafe {
+            (
+                std::mem::transmute::<Vec<Frame<'static>>, Vec<Frame<'py>>>(self.frames),
+                std::mem::transmute::<HashTable<Placed<'static>>, HashTable<Placed<'py>>>(
+                    self.table,
+                ),
+                std::mem::transmute::<Vec<B<'static>>, Vec<B<'py>>>(self.built),
+            )
+        };
+        (
+            Paths::from_frames(frames),
+            PlacedTable {
+                table,
+                log: self.log,
+            },
+            built,
+        )
+    }
+
+    /// Empty the tables and keep their allocations. Dropping the values may
+    /// run Python code, so the tables are emptied before they are erased.
+    pub fn park<'py>(
+        paths: Paths<'py>,
+        placed: PlacedTable<'py>,
+        built: Vec<B<'py>>,
+    ) -> Option<Self> {
+        let (mut frames, mut table, mut log, mut built) =
+            (paths.frames, placed.table, placed.log, built);
+        frames.clear();
+        table.clear();
+        log.clear();
+        built.clear();
+        if frames.capacity() > SPARE_LIMIT
+            || table.capacity() > SPARE_LIMIT
+            || built.capacity() > SPARE_LIMIT
+        {
+            return None;
+        }
+        // SAFETY: as in ``take``; each table is empty.
+        unsafe {
+            Some(Self {
+                frames: std::mem::transmute::<Vec<Frame<'py>>, Vec<Frame<'static>>>(frames),
+                table: std::mem::transmute::<HashTable<Placed<'py>>, HashTable<Placed<'static>>>(
+                    table,
+                ),
+                log,
+                built: std::mem::transmute::<Vec<B<'py>>, Vec<B<'static>>>(built),
+            })
+        }
+    }
+}
+
 impl<'py> Paths<'py> {
     pub fn new(py: Python<'py>) -> Self {
         let _ = py;
-        let frames = vec![Frame {
+        Self::from_frames(Vec::with_capacity(4))
+    }
+
+    /// No frames at all, not even the root; only a placeholder to move out of.
+    pub fn empty() -> Self {
+        Self { frames: Vec::new() }
+    }
+
+    fn from_frames(mut frames: Vec<Frame<'py>>) -> Self {
+        debug_assert!(frames.is_empty());
+        frames.push(Frame {
             parent: ROOT,
             depth: 0,
             hash: SEED,
             step: Step::Index(0),
-        }];
+        });
         Self { frames }
     }
 

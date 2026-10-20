@@ -1,6 +1,21 @@
 //! Treekle's Rust core: ``to_plain`` and ``from_plain`` with the semantics of
 //! ``treekle.serialize`` and ``treekle.deserialize``, which install them.
 
+// Perf notes. Code written for speed carries a comment "Perf: <workload>, <method>: <gain>". The
+// gain is old time / new time against the build just before that change; gains overlap, so they do
+// not multiply.
+// Workloads:
+//   exp000: the 10 local priml exp000 configs.
+//   bench_configs: scripts/bench_configs.py's 28 priml configs; decode reads their generated
+//     slots-dataclass twins.
+//   rows: 1k-10k dataclass rows (flat, slots, frozen, nested), msgspec's benchmark shape.
+//   tiny: one small call, ns per call.
+// Methods:
+//   lockstep: two builds in separate processes taking turns; 50 passes, median, best of 3, one
+//     pinned core.
+//   paired: two builds in one process taking turns; min or median of rounds.
+// Timed on CPython 3.14, Linux (WSL), a shared machine: under ~3% is noise.
+
 // GilCell and the per-interpreter Rc caches require a real GIL. Refuse
 // free-threaded builds, including configurations that keep the GIL enabled
 // today but could later disable it with PYTHON_GIL=0 or -Xgil=0. Those
@@ -10,11 +25,13 @@ compile_error!(
     "treekle's Rust core requires a GIL; use the pure-Python wheel on free-threaded Python"
 );
 
+mod attrs;
 mod class;
 mod decode;
 mod encode;
 mod errors;
 mod freeze;
+mod json;
 mod places;
 mod py;
 mod sync;
@@ -22,7 +39,7 @@ mod sync;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
-use crate::py::{B, Flag, Maybe};
+use crate::py::{B, Flag, Maybe, t_tuple, tp};
 
 /// Read the decoder's helpers and sentinels from ``treekle.deserialize``'s globals.
 #[pyfunction]
@@ -120,11 +137,125 @@ fn to_plain<'py>(
     encode::to_plain(py, obj, dialect.0, mutable.0, hooks.0, sort.0)
 }
 
+/// ``json.dumps(tree, ...)`` for a plain tree, with the same text.
+#[pyfunction]
+#[pyo3(
+    signature = (tree, *, ensure_ascii = Maybe(None), separators = Maybe(None), indent = Maybe(None), sort_keys = Maybe(None)),
+    text_signature = "(tree, *, ensure_ascii=True, separators=None, indent=None, sort_keys=False)"
+)]
+fn json_dumps_plain<'py>(
+    py: Python<'py>,
+    tree: &B<'py>,
+    ensure_ascii: Maybe<'py>,
+    separators: Maybe<'py>,
+    indent: Maybe<'py>,
+    sort_keys: Maybe<'py>,
+) -> PyResult<B<'py>> {
+    json::dumps(
+        py,
+        tree,
+        ensure_ascii.0.as_ref(),
+        separators.0.as_ref(),
+        indent.0.as_ref(),
+        sort_keys.0.as_ref(),
+    )
+}
+
+/// ``json.loads(text)``, with the same value or error.
+#[pyfunction]
+fn json_loads_plain<'py>(py: Python<'py>, text: &B<'py>) -> PyResult<B<'py>> {
+    json::loads(py, text)
+}
+
+/// ``from_plain(json.loads(text), target, ...)``, with the same value or error.
+#[pyfunction]
+#[pyo3(
+    signature = (text, target, *, hooks = Maybe(None), allow_imports = Maybe(None), strict = Maybe(None)),
+    text_signature = "(text, target, *, hooks=..., allow_imports=False, strict=True)"
+)]
+fn json_loads_typed<'py>(
+    py: Python<'py>,
+    text: &B<'py>,
+    target: &B<'py>,
+    hooks: Maybe<'py>,
+    allow_imports: Maybe<'py>,
+    strict: Maybe<'py>,
+) -> PyResult<B<'py>> {
+    decode::from_json(py, text, target, hooks.0, allow_imports.0, strict.0)
+}
+
+/// ``json.dumps(to_plain(obj, ...), ...)`` in one walk, and ``json_loads``'s
+/// other half: one call from object to text or back.
+#[pyfunction]
+#[pyo3(
+    signature = (obj, *, dialect = Maybe(None), hooks = Maybe(None), sort = Maybe(None), ensure_ascii = Maybe(None), separators = Maybe(None), indent = Maybe(None), sort_keys = Maybe(None)),
+    text_signature = "(obj, *, dialect='json', hooks=..., sort=True, ensure_ascii=True, separators=None, indent=None, sort_keys=False)"
+)]
+#[allow(clippy::too_many_arguments)]
+fn json_dumps<'py>(
+    py: Python<'py>,
+    obj: &B<'py>,
+    dialect: Maybe<'py>,
+    hooks: Maybe<'py>,
+    sort: Maybe<'py>,
+    ensure_ascii: Maybe<'py>,
+    separators: Maybe<'py>,
+    indent: Maybe<'py>,
+    sort_keys: Maybe<'py>,
+) -> PyResult<B<'py>> {
+    let options = [
+        ensure_ascii.0.as_ref(),
+        separators.0.as_ref(),
+        indent.0.as_ref(),
+        sort_keys.0.as_ref(),
+    ];
+    // Read only where reading runs no Python code, so no option is read
+    // before ``to_plain``'s user code runs, as ``json.dumps`` reads them.
+    let style = json::Style::from_options(options[0], options[1], options[2], options[3])?.ok();
+    // ``json.dumps`` reads ``separators`` after that code ran, which may
+    // change a list; a tuple stays as the walk read it.
+    let fixed = options[1].is_none_or(|seps| seps.is_none() || tp(seps) == t_tuple());
+    // The text walk writes one line in tree order only; layout options go
+    // through the tree and the plain writer. A ``json.dumps`` replaced since
+    // import gets the whole tree, once, as in Python.
+    if let Some(style) = style.filter(|style| style.indent.is_none() && !style.sort_keys)
+        && fixed
+        && json::current_dumps(py)?.1
+        && let Some(text) = encode::to_json(
+            py,
+            obj,
+            dialect.0.clone(),
+            hooks.0.clone(),
+            sort.0.clone(),
+            style,
+            options,
+        )?
+    {
+        return Ok(text);
+    }
+    // The text walk declined before running any user code; the tree walk's
+    // answer goes through ``json.dumps`` as it is once that code has run.
+    let tree = encode::to_plain(py, obj, dialect.0, None, hooks.0, sort.0)?;
+    json::dumps(
+        py,
+        &tree,
+        ensure_ascii.0.as_ref(),
+        separators.0.as_ref(),
+        indent.0.as_ref(),
+        sort_keys.0.as_ref(),
+    )
+}
+
 #[pymodule(gil_used = true)]
 fn _rust(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    json::setup(module.py())?;
     module.add_function(wrap_pyfunction!(setup_decode, module)?)?;
     module.add_function(wrap_pyfunction!(from_plain, module)?)?;
     module.add_function(wrap_pyfunction!(setup_encode, module)?)?;
     module.add_function(wrap_pyfunction!(to_plain, module)?)?;
+    module.add_function(wrap_pyfunction!(json_dumps_plain, module)?)?;
+    module.add_function(wrap_pyfunction!(json_loads_plain, module)?)?;
+    module.add_function(wrap_pyfunction!(json_loads_typed, module)?)?;
+    module.add_function(wrap_pyfunction!(json_dumps, module)?)?;
     Ok(())
 }

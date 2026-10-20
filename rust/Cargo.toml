@@ -15,6 +15,8 @@ crate-type = ["cdylib"]
 [dependencies]
 pyo3 = { version = "=0.27.2", features = ["extension-module"] }
 hashbrown = "0.15"
+# Perf: rows json_dumps, lockstep: 1.10-1.14x on float-heavy rows (json.rs shortest_digits).
+ryu = "1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

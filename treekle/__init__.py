@@ -12,7 +12,7 @@ Modules:
 - ``types``: every public type -- the plain trees, ``Hooks``, ``FieldPath``,
   ``Dialect``, ``Invalid``, ``ReadError``.
 - ``plain``: ``mutable``, ``immutable``.
-- ``wire``: ``json_loads``, the one wire-format reader.
+- ``wire``: ``json_dumps`` and ``json_loads``, the wire-format entry points.
 - ``serialize``: ``to_plain``.
 - ``deserialize``: ``from_plain``.
 - ``parse``: ``parse``, for what a person typed.
@@ -53,7 +53,7 @@ from treekle.types import (
     PlainTree,
     ReadError,
 )
-from treekle.wire import json_loads
+from treekle.wire import json_dumps, json_loads
 
 
 __all__ = [
@@ -69,6 +69,7 @@ __all__ = [
     "ReadError",
     "from_plain",
     "immutable",
+    "json_dumps",
     "json_loads",
     "mutable",
     "parse",

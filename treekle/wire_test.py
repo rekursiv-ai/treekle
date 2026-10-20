@@ -2,19 +2,36 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 import json
 import math
+import os
+import subprocess
+import sys
+import textwrap
 
 import pytest
 
-from treekle import json_loads
+from treekle import json_dumps, json_loads, to_plain
 from treekle.types import Hooks, ReadError
 
 
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from treekle.types import Dialect
+
+
 pytestmark = pytest.mark.usefixtures("implementation")
+
+
+@dataclass(kw_only=True, slots=True)
+class AttributeOrder:
+    z: int = 1
+    a: int = 2
 
 
 class TestJsonLoads:
@@ -60,6 +77,148 @@ class TestJsonLoads:
             object,
             hooks=hooks,
         ) == Path("/a")
+
+
+class TestJsonDumps:
+    def test_an_object_writes_as_json_dumps_of_its_tree(self) -> None:
+        value = {"p": Path("/a"), "n": [1.5, None, "\u00e9"]}
+        assert json_dumps(value) == json.dumps(to_plain(value))
+
+    def test_layout_options_reach_json(self) -> None:
+        value = {"b": [1, 2], "a": "\u00e9"}
+        tree = to_plain(value)
+        assert json_dumps(value, indent=2, sort_keys=True) == json.dumps(
+            tree,
+            indent=2,
+            sort_keys=True,
+        )
+        assert json_dumps(value, ensure_ascii=False, separators=(",", ":")) == (
+            '{"b":[1,2],"a":"\u00e9"}'
+        )
+
+    def test_options_reach_to_plain(self) -> None:
+        value = Path("/a")
+        hooks: Hooks = {type(value): (str, Path)}
+        hooked = json_dumps(value, hooks=hooks)
+        assert hooked == json.dumps(to_plain(value, hooks=hooks))
+        assert '"py/hook"' in hooked
+        assert json_dumps(math.inf, dialect="python") == "Infinity"
+        assert json_dumps(math.inf) == '{"py/float": "inf"}'
+        attributes = AttributeOrder()
+        assert json_dumps(attributes, sort=False) == json.dumps(
+            to_plain(attributes, sort=False),
+        )
+        assert json_dumps(attributes) != json_dumps(attributes, sort=False)
+
+    @pytest.mark.parametrize("dialect", ["yaml"])
+    def test_an_unknown_dialect_is_rejected(self, dialect: str) -> None:
+        with pytest.raises(ValueError, match="dialect"):
+            json_dumps(1, dialect=cast("Dialect", dialect))
+
+
+def test_json_is_used_as_it_is_at_each_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A replacement made after import serves, called once per document, as
+    # Python's path names ``json.loads``/``json.dumps`` at the call.
+    seen: list[str] = []
+    loads = cast("Callable[..., object]", json.loads)
+    dumps = cast("Callable[..., str]", json.dumps)
+
+    def counted_loads(*args: object, **options: object) -> object:
+        seen.append("loads")
+        return loads(*args, **options)
+
+    def counted_dumps(*args: object, **options: object) -> str:
+        seen.append("dumps")
+        return dumps(*args, **options)
+
+    monkeypatch.setattr(json, "loads", counted_loads)
+    monkeypatch.setattr(json, "dumps", counted_dumps)
+    assert json_loads("[1]") == [1]
+    assert json_loads("[1]", list[int]) == [1]
+    assert json_dumps([1]) == "[1]"
+    assert seen == ["loads", "loads", "dumps"]
+
+
+def test_a_core_without_json_functions_warns_and_uses_json() -> None:
+    # A core built before the JSON functions existed still sets up its walkers.
+    completed = subprocess.run(  # noqa: S603 -- Runs this interpreter on the test's own script.
+        [
+            sys.executable,
+            "-c",
+            textwrap.dedent(
+                """
+                import sys
+                import types
+                import warnings
+
+                core = types.ModuleType("treekle._rust")
+                core.setup_encode = core.setup_decode = lambda module: None
+                core.to_plain = lambda obj, **options: obj
+                core.from_plain = lambda data, target, **options: data
+                sys.modules["treekle._rust"] = core
+                with warnings.catch_warnings(record=True) as caught:
+                    warnings.simplefilter("always")
+                    from treekle import wire
+
+                assert (wire._loads, wire._dumps, wire._typed_loads) == (None, None, None)
+                print(wire.json_dumps([1]), wire.json_loads("[2]"), wire.json_loads("[3]", list))
+                print(
+                    [
+                        str(warning.message).split(" (")[0]
+                        for warning in caught
+                        if warning.category is RuntimeWarning
+                    ],
+                )
+                """,
+            ),
+        ],
+        capture_output=True,
+        check=False,
+        env={**os.environ, "TREEKLE_PURE_PYTHON": ""},
+        text=True,
+        timeout=120,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.splitlines() == [
+        "[1] [2] [3]",
+        '["treekle\'s Rust core does not match this treekle"]',
+    ]
+
+
+def test_pure_python_serves_every_wire_step() -> None:
+    # The choice is made at import, so only a fresh interpreter sees it; an
+    # installed core must not serve a step its unset-up walkers would need.
+    completed = subprocess.run(  # noqa: S603 -- Runs this interpreter on the test's own script.
+        [
+            sys.executable,
+            "-c",
+            textwrap.dedent(
+                """
+                from dataclasses import dataclass
+
+                from treekle import json_dumps, json_loads, wire
+
+                @dataclass
+                class Point:
+                    x: int
+
+                assert wire._loads is None
+                assert wire._dumps is None
+                assert wire._typed_loads is None
+                text = json_dumps(Point(1))
+                assert json_loads(text, Point) == Point(1)
+                print(text)
+                """,
+            ),
+        ],
+        capture_output=True,
+        check=False,
+        env={**os.environ, "TREEKLE_PURE_PYTHON": "1"},
+        text=True,
+        timeout=120,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == '{"py/object": "__main__.Point", "x": 1}'
 
 
 if __name__ == "__main__":

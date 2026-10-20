@@ -16,16 +16,25 @@ use crate::py::*;
 use crate::sync;
 
 unsafe extern "C" {
-    pub fn _PyType_Lookup(
-        kind: *mut ffi::PyTypeObject,
-        name: *mut ffi::PyObject,
-    ) -> *mut ffi::PyObject;
+    fn _PyType_Lookup(kind: *mut ffi::PyTypeObject, name: *mut ffi::PyObject)
+    -> *mut ffi::PyObject;
 }
 
 // ------------------------------------------------------------------ stamps --
 
 unsafe extern "C" {
     fn PyUnstable_Type_AssignVersionTag(kind: *mut ffi::PyTypeObject) -> std::ffi::c_int;
+}
+
+/// The class's version tag, assigned if it has none; 0 when out of tags.
+#[inline]
+pub fn version_tag(kind: *mut ffi::PyTypeObject) -> u32 {
+    unsafe {
+        if (*kind).tp_version_tag == 0 {
+            PyUnstable_Type_AssignVersionTag(kind);
+        }
+        (*kind).tp_version_tag
+    }
 }
 
 /// What a fact learned from a class assumed about it. CPython replaces a
@@ -41,38 +50,24 @@ impl Stamp {
     /// The class's current state, or ``None`` if it cannot change.
     pub fn of(class: &B<'_>) -> Option<Self> {
         let kind = class.as_ptr().cast::<ffi::PyTypeObject>();
-        unsafe {
-            if ffi::PyType_HasFeature(kind, ffi::Py_TPFLAGS_IMMUTABLETYPE) != 0 {
-                return None;
-            }
-            if (*kind).tp_version_tag == 0 {
-                // A class out of tags stays at 0, which never matches.
-                PyUnstable_Type_AssignVersionTag(kind);
-            }
-            let qualname = heap_qualname(kind);
-            Some(Self {
-                tag: (*kind).tp_version_tag,
-                qualname: (!qualname.is_null())
-                    .then(|| Py::from_borrowed_ptr(class.py(), qualname)),
-            })
+        if unsafe { ffi::PyType_HasFeature(kind, ffi::Py_TPFLAGS_IMMUTABLETYPE) } != 0 {
+            return None;
         }
+        Some(Self::always(class))
     }
 
     /// The class's current state, immutable classes included. A fact kept
     /// across calls by class address needs this: version tags are never
     /// reused, so a new class that takes a dead one's address never matches.
+    /// A class out of tags stays at 0, which never matches.
     pub fn always(class: &B<'_>) -> Self {
         let kind = class.as_ptr().cast::<ffi::PyTypeObject>();
-        unsafe {
-            if (*kind).tp_version_tag == 0 {
-                PyUnstable_Type_AssignVersionTag(kind);
-            }
-            let qualname = heap_qualname(kind);
-            Self {
-                tag: (*kind).tp_version_tag,
-                qualname: (!qualname.is_null())
-                    .then(|| Py::from_borrowed_ptr(class.py(), qualname)),
-            }
+        let tag = version_tag(kind);
+        let qualname = unsafe { heap_qualname(kind) };
+        Self {
+            tag,
+            qualname: (!qualname.is_null())
+                .then(|| unsafe { Py::from_borrowed_ptr(class.py(), qualname) }),
         }
     }
 
@@ -202,15 +197,9 @@ pub struct ClassInfo {
     pub layouts: [Option<Rc<Layout>>; 2],
     /// Whether it reduces as ``Enum.__reduce_ex__`` does, read natively.
     pub enum_member: Option<bool>,
-    /// The ``__dict__`` keys of the last instance read, by identity, and the
-    /// order sorting gave them; instances of one class usually share both.
-    pub dict_order: Option<DictOrder>,
-}
-
-/// The keys one instance's ``__dict__`` held, and the order they sort in.
-pub struct DictOrder {
-    pub keys: Vec<Py<PyAny>>,
-    pub sorted: Vec<usize>,
+    /// Whether its instances' ``__reduce_ex__(2)`` is ``object``'s own calling
+    /// a custom ``__reduce__``, so the call can be made without Python's.
+    pub own_reduce: Option<bool>,
 }
 
 /// A class's slots, as ``attribute_names`` names them, and where each lives.
@@ -224,9 +213,43 @@ pub struct Layout {
     /// Each slot's offset in the instance where ``getattr`` would only read
     /// it, in ``names`` order.
     pub offsets: Box<[Option<isize>]>,
-    /// When each slot has an offset, no slot name is a tag, and instances
-    /// carry no ``__dict__``: the members are then exactly the slots, in order.
-    pub direct: bool,
+    /// How ``getattr`` finds an instance's members.
+    pub reading: Reading,
+    /// Under ``Reading::Slots``, each slot name as JSON text, quoted, where
+    /// it is ASCII that needs no escape and so reads the same under every
+    /// ``Style``.
+    pub key_texts: Vec<Option<Box<[u8]>>>,
+    /// Under ``Reading::Dict``, how the last instance dict read was named.
+    pub dict_keys: std::cell::RefCell<Option<Rc<DictKeys>>>,
+}
+
+/// How ``getattr`` finds the members of a class's instances.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Reading {
+    /// Generic lookup and no instance dict, every slot an object member
+    /// named by an exact str other than ``py/object``: the members are
+    /// exactly the slots, each read at its offset, with no code run.
+    Slots,
+    /// Generic lookup, no slots, and the plain ``__dict__`` descriptor: the
+    /// members are the instance dict's entries (``dict_read``).
+    Dict,
+    /// ``object.__getattribute__`` behind a ``__getattr__``: a set slot is
+    /// read at its offset, an unset one by ``getattr``, which calls the hook.
+    Hooked,
+    /// Each member by ``getattr``, a slot with an offset read there.
+    Generic,
+}
+
+/// What an instance dict's key sequence implies for its members, checked
+/// once per sequence while the class's stamp holds: every key is an exact
+/// str other than ``py/object`` that no data descriptor on the class shadows,
+/// so ``getattr(instance, key)`` is the dict's own value and runs no code.
+pub struct DictKeys {
+    /// The keys in insertion order, matched by identity.
+    pub keys: Vec<Py<PyAny>>,
+    /// Each member in ``attribute_names`` order: its key's index in ``keys``,
+    /// and its name as JSON text where ``plain_key_text`` gives one.
+    pub members: Vec<(u8, Option<Box<[u8]>>)>,
 }
 
 /// ``_PyType_Lookup``: the first of the MRO's dicts holding ``name``. Read
@@ -290,6 +313,12 @@ impl Layout {
         self.offsets.len()
     }
 
+    /// The name of slot ``index``, borrowed from ``names``.
+    #[inline]
+    pub fn name<'py>(&self, py: Python<'py>, index: usize) -> B<'py> {
+        unsafe { self.names.bind(py).get_borrowed_item_unchecked(index) }.to_owned()
+    }
+
     /// Each slot's name with its offset.
     pub fn slots<'a, 'py>(
         &'a self,
@@ -307,20 +336,49 @@ impl Layout {
         })
     }
 
+    /// The layout of slots ``names`` at ``offsets``, read as ``reading``
+    /// says. ``Reading::Slots`` asks only for generic lookup and no instance
+    /// dict; it is kept where every slot has an offset and a plain key for a
+    /// name, else the slots are read generically.
     pub fn new(
-        py: Python<'_>,
         stamp: Stamp,
-        slots: Vec<(B<'_>, Option<isize>)>,
-        direct: bool,
-    ) -> PyResult<Self> {
-        let (names, offsets): (Vec<_>, Vec<_>) = slots.into_iter().unzip();
-        Ok(Self {
+        names: Bound<'_, PyTuple>,
+        offsets: Box<[Option<isize>]>,
+        reading: Reading,
+    ) -> Self {
+        let exact = || {
+            offsets.iter().all(Option::is_some)
+                && names
+                    .iter()
+                    .all(|name| unsafe { crate::encode::plain_key_raw(name.as_ptr()) })
+        };
+        let reading = match reading {
+            Reading::Slots if !exact() => Reading::Generic,
+            reading => reading,
+        };
+        let key_texts = match reading {
+            Reading::Slots => names
+                .iter()
+                .map(|name| crate::json::plain_key_text(&name))
+                .collect(),
+            _ => Vec::new(),
+        };
+        Self {
             stamp,
-            names: PyTuple::new(py, names)?.unbind(),
-            offsets: offsets.into_boxed_slice(),
-            direct,
-        })
+            names: names.unbind(),
+            offsets,
+            reading,
+            key_texts,
+            dict_keys: std::cell::RefCell::new(None),
+        }
     }
+}
+
+/// Whether an object node can take ``name`` as a key built at the end: an
+/// exact str, whose hash and equality run no code, other than ``py/object``.
+#[inline]
+pub fn is_clean_name(name: &B<'_>) -> bool {
+    tp(name) == t_str() && utf8(name).is_some_and(|text| text != b"py/object")
 }
 
 pub const PY_AUDIT_READ: std::ffi::c_int = 2;
@@ -328,6 +386,30 @@ pub const PY_AUDIT_READ: std::ffi::c_int = 2;
 #[inline]
 pub fn generic_getattr(kind: *mut ffi::PyTypeObject) -> bool {
     unsafe { (*kind).tp_getattro }.map(|f| f as usize) == generic_getattr_slot()
+}
+
+/// The slot ``found`` describes for instances of ``kind``, if it is a member
+/// descriptor that applies to them. A class can install another class's
+/// member descriptor under a slot name; its offset is not an offset in this
+/// instance, so that descriptor is left to ``getattr``, which enforces
+/// ownership, rather than read as arbitrary memory.
+///
+/// # Safety
+/// ``kind`` is a live class; ``found`` is null or a live object.
+pub unsafe fn member_of(
+    kind: *mut ffi::PyTypeObject,
+    found: *mut ffi::PyObject,
+) -> *mut ffi::PyMemberDef {
+    unsafe {
+        if found.is_null() || ob_type(found) != &raw mut ffi::PyMemberDescr_Type {
+            return std::ptr::null_mut();
+        }
+        let descriptor = found.cast::<ffi::PyMemberDescrObject>();
+        if ffi::PyType_IsSubtype(kind, (*descriptor).d_common.d_type) == 0 {
+            return std::ptr::null_mut();
+        }
+        (*descriptor).d_member.cast::<ffi::PyMemberDef>()
+    }
 }
 
 /// The offset of the object member ``kind``'s MRO finds first under
@@ -341,19 +423,11 @@ fn member_offset(
         return None;
     }
     unsafe {
-        let found = type_lookup(kind, name.as_ptr());
-        if found.is_null() || ob_type(found) != &raw mut ffi::PyMemberDescr_Type {
-            return None;
-        }
-        let descriptor = found.cast::<ffi::PyMemberDescrObject>();
-        // A class can install another class's member descriptor under a slot
-        // name. Its offset is not an offset in this instance; let getattr
-        // enforce descriptor ownership rather than reading arbitrary memory.
-        if ffi::PyType_IsSubtype(kind, (*descriptor).d_common.d_type) == 0 {
-            return None;
-        }
-        let member = (*descriptor).d_member.cast::<ffi::PyMemberDef>();
-        if (*member).type_code != ffi::Py_T_OBJECT_EX || (*member).flags & refused != 0 {
+        let member = member_of(kind, type_lookup(kind, name.as_ptr()));
+        if member.is_null()
+            || (*member).type_code != ffi::Py_T_OBJECT_EX
+            || (*member).flags & refused != 0
+        {
             return None;
         }
         Some((*member).offset)
@@ -453,8 +527,8 @@ pub fn object_new(kind: &B<'_>) -> Option<ffi::newfunc> {
         let new = (*base).tp_new?;
         let plain = ob_type(kind.as_ptr()) == &raw mut ffi::PyType_Type
             && (*class).tp_new.map(|f| f as usize) == Some(new as usize)
-            && !_PyType_Lookup(class, name).is_null()
-            && _PyType_Lookup(class, name) == _PyType_Lookup(base, name);
+            && !type_lookup(class, name).is_null()
+            && type_lookup(class, name) == type_lookup(base, name);
         plain.then_some(new)
     }
 }
@@ -480,7 +554,7 @@ unsafe fn is_name(key: *mut ffi::PyObject, name: *mut ffi::PyObject) -> bool {
     unsafe {
         key == name
             || (ob_type(key) == t_str()
-                && utf8_raw(key).is_some_and(|text| Some(text) == utf8_raw(name)))
+                && utf8_ptr(key).is_some_and(|text| Some(text) == utf8_ptr(name)))
     }
 }
 
@@ -619,7 +693,7 @@ pub unsafe fn own_offsets(
             {
                 return None;
             }
-            let text = utf8_raw(name)?;
+            let text = utf8_ptr(name)?;
             if text.starts_with(b"__") || text.starts_with(b"py/") || text.starts_with(b"json://") {
                 return None;
             }
@@ -660,12 +734,7 @@ pub unsafe fn layout_from(
     unsafe {
         let names = Bound::from_borrowed_ptr(py, read.names).cast_into_unchecked::<PyTuple>();
         if sort {
-            return Some(Layout {
-                stamp,
-                names: names.unbind(),
-                offsets: offsets.into(),
-                direct: true,
-            });
+            return Some(Layout::new(stamp, names, offsets.into(), Reading::Slots));
         }
         // ``__slots__``' order: each name is one ``ht_slots`` holds, or the
         // ``__weakref__`` slot, which carries no state.
@@ -680,12 +749,12 @@ pub unsafe fn layout_from(
             order.push(name);
             kept.push(offsets[at]);
         }
-        Some(Layout {
+        Some(Layout::new(
             stamp,
-            names: PyTuple::new(py, order).ok()?.unbind(),
-            offsets: kept.into_boxed_slice(),
-            direct: true,
-        })
+            PyTuple::new(py, order).ok()?,
+            kept.into_boxed_slice(),
+            Reading::Slots,
+        ))
     }
 }
 
@@ -822,9 +891,9 @@ pub fn native_import_path_in<'py>(
     for part in &parts[module_parts..] {
         let next = if walked.get_type().as_ptr() == g.module_type.as_ptr() {
             module_dict(&walked).get_item(*part)?
-        } else if unsafe { ob_type(walked.as_ptr()) } == &raw mut ffi::PyType_Type {
+        } else if ob_type(walked.as_ptr()) == &raw mut ffi::PyType_Type {
             let name = PyString::new(py, part);
-            let found = unsafe { _PyType_Lookup(walked.as_ptr().cast(), name.as_ptr()) };
+            let found = unsafe { type_lookup(walked.as_ptr().cast(), name.as_ptr()) };
             // A descriptor found there could answer ``getattr`` itself.
             if found.is_null() {
                 return Ok(None);

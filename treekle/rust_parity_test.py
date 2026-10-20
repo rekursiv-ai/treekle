@@ -34,8 +34,11 @@ import datetime as dt
 import gc
 import importlib
 import inspect
+import json
 import math
 import os
+import random
+import struct
 import subprocess
 import sys
 import textwrap
@@ -45,7 +48,7 @@ import weakref
 
 import pytest
 
-from treekle import deserialize, serialize
+from treekle import deserialize, serialize, wire
 from treekle.types import ReadError
 
 
@@ -54,7 +57,7 @@ if TYPE_CHECKING:
     from abc import ABCMeta
     from collections.abc import Callable
 
-    from treekle.types import Hooks, PlainTree
+    from treekle.types import Dialect, Hooks, PlainTree
 
 
 # Without the Rust core each case compares the Python versions with
@@ -2221,6 +2224,1700 @@ def test_a_protocol_naming_a_non_str_member_judges_alike(
         list[_Areal],
         allow_imports=True,
     )
+
+
+# The native walks keep what they learn about a class or a key across values
+# and calls, so each case below reads or writes more than once: a wrong cached
+# answer shows only after the first.
+_TIMES = 3
+
+
+def _assert_reads_alike_each_time(
+    data: object,
+    target: object,
+    *,
+    allow_imports: bool = False,
+) -> None:
+    """Assert ``from_plain`` and ``json_loads`` read ``data`` as Python does, call after call."""
+    text = json.dumps(data)
+
+    def python() -> object:
+        tree = cast("PlainTree", json.loads(text))
+        read = deserialize._python_from_plain(tree, target, allow_imports=allow_imports)
+        return serialize._python_to_plain(read)
+
+    def fused() -> object:
+        read = wire.json_loads(text, target, allow_imports=allow_imports)
+        return serialize._python_to_plain(read)
+
+    for _ in range(_TIMES):
+        _assert_reads_alike(data, target, allow_imports=allow_imports)
+        assert _outcome(fused) == _outcome(python)
+
+
+def _assert_writes_alike_each_time(value: object, *, sort: bool = True) -> None:
+    """Assert ``to_plain`` and ``json_dumps`` write ``value`` as Python does, call after call."""
+    tree = _outcome(lambda: serialize._python_to_plain(value, sort=sort))
+    text = _outcome(lambda: json.dumps(serialize._python_to_plain(value, sort=sort)))
+    for _ in range(_TIMES):
+        assert _outcome(lambda: serialize.to_plain(value, sort=sort)) == tree
+        assert _outcome(lambda: wire.json_dumps(value, sort=sort)) == text
+
+
+# Any ``py/`` key makes its dict a tag (``_has_tag_key``), even under a target
+# whose values are plain, so the dict is a reference, or an unknown tag's error.
+@pytest.mark.parametrize(
+    ("data", "target"),
+    [
+        ([{"a": 1}, {"py/id": 1}], list[dict[str, int]]),
+        ([{"a": 1}, {"py/ref": [0]}], list[dict[str, int]]),
+        ({"k": {"a": 1}, "j": {"py/id": 1}}, dict[str, dict[str, object]]),
+        ([{"a": "x"}, {"py/x": "y"}], list[dict[str, str]]),
+        ([{"a": "x"}, {"py/": "y"}], list[dict[str, object]]),
+        ([{"a": "x"}, {"b": "y", "py/id": 1}], list[dict[str, object]]),
+    ],
+    ids=[
+        "py/id",
+        "py/ref",
+        "py/id under str keys",
+        "unknown tag",
+        "bare prefix",
+        "tag key last",
+    ],
+)
+def test_a_tag_key_in_a_plain_dict_reads_as_a_tag(data: object, target: object) -> None:
+    _assert_reads_alike_each_time(data, target)
+
+
+class _MaybeArea:
+    """Has ``area`` or not, by instance: its property raises ``AttributeError`` when off."""
+
+    def __init__(self, *, has: bool) -> None:
+        self.has = has
+
+    # The error names the value; its default repr holds an address.
+    @override
+    def __repr__(self) -> str:
+        return f"_MaybeArea(has={self.has})"
+
+    @property
+    def area(self) -> float:
+        if self.has:
+            return 1.0
+        raise AttributeError("area")
+
+
+# ``hasattr`` runs the property for each value, so one value's answer says
+# nothing about the next one of its class.
+@pytest.mark.parametrize(
+    "order",
+    [[True, False], [False, True], [True, True, False], [False, False, True]],
+    ids=[
+        "fits, then not",
+        "not, then fits",
+        "fits twice, then not",
+        "not twice, then fits",
+    ],
+)
+def test_a_protocol_member_answering_per_value_judges_each_value(
+    order: list[bool],
+) -> None:
+    for has in order:
+        tree = serialize._python_to_plain([_MaybeArea(has=has)])
+        _assert_reads_alike_each_time(tree, list[_Areal], allow_imports=True)
+    mixed = serialize._python_to_plain([_MaybeArea(has=has) for has in order])
+    _assert_reads_alike_each_time(mixed, list[_Areal], allow_imports=True)
+
+
+@dataclass(kw_only=True, slots=True)
+class _DictFromGetattr:
+    """A slotted class with no ``__dict__`` slot whose ``__getattr__`` supplies one."""
+
+    a: int = 1
+
+    def __getattr__(self, name: str) -> object:
+        if name == "__dict__":
+            return {"extra": 2}
+        if name == "extra":
+            return 2
+        raise AttributeError(name)
+
+
+class _SlotsDictFromGetattr:
+    __slots__ = ("a",)
+
+    def __init__(self) -> None:
+        self.a = 1
+
+    def __getattr__(self, name: str) -> object:
+        if name == "__dict__":
+            return {"extra": 2}
+        raise AttributeError(name)
+
+
+# ``attribute_names`` asks ``getattr(value, "__dict__", None)``; with no dict
+# storage that reaches ``__getattr__``, whose answer joins the attributes.
+@pytest.mark.parametrize("sort", [True, False])
+@pytest.mark.parametrize(
+    "kind",
+    [_DictFromGetattr, _SlotsDictFromGetattr],
+    ids=["slots dataclass", "slotted class"],
+)
+def test_a_dict_from_getattr_writes_as_python_does(
+    kind: Callable[[], object],
+    sort: bool,
+) -> None:
+    _assert_writes_alike_each_time(kind(), sort=sort)
+
+
+class _ReduceBase:
+    __slots__ = ("a",)
+
+    def __init__(self) -> None:
+        self.a = 1
+
+
+class _DictReduceBase:
+    def __init__(self) -> None:
+        self.a = 1
+
+
+def _reduce_property(error: type[Exception] | None) -> property:
+    """Return a ``__reduce__`` property that raises ``error``, or gives a recipe."""
+
+    def reduce(self: object) -> object:
+        if error is None:
+            return lambda: (type(self), ())
+        raise error("no reduce")
+
+    return property(reduce)
+
+
+# Built with ``type`` because a checker rejects a property overriding a method.
+def _reduce_class(
+    name: str,
+    error: type[Exception] | None,
+    *,
+    slotted: bool,
+) -> type[object]:
+    reduce = _reduce_property(error)
+    if slotted:
+        return type(
+            name,
+            (_ReduceBase,),
+            {"__module__": __name__, "__slots__": (), "__reduce__": reduce},
+        )
+    return type(
+        name,
+        (_DictReduceBase,),
+        {"__module__": __name__, "__reduce__": reduce},
+    )
+
+
+SlottedReduceRaisesAttributeError = _reduce_class(
+    "SlottedReduceRaisesAttributeError",
+    AttributeError,
+    slotted=True,
+)
+SlottedReduceRaisesTypeError = _reduce_class(
+    "SlottedReduceRaisesTypeError",
+    TypeError,
+    slotted=True,
+)
+SlottedReduceRaisesKeyError = _reduce_class(
+    "SlottedReduceRaisesKeyError",
+    KeyError,
+    slotted=True,
+)
+SlottedReduceFromProperty = _reduce_class(
+    "SlottedReduceFromProperty",
+    None,
+    slotted=True,
+)
+DictReduceRaisesAttributeError = _reduce_class(
+    "DictReduceRaisesAttributeError",
+    AttributeError,
+    slotted=False,
+)
+
+
+# ``object.__reduce_ex__`` reads ``__reduce__`` off the instance, so a property
+# runs there: an ``AttributeError`` falls back to copyreg's recipe, other
+# errors propagate, and what it returns is called for the recipe.
+@pytest.mark.parametrize(
+    "kind",
+    [
+        SlottedReduceRaisesAttributeError,
+        SlottedReduceRaisesTypeError,
+        SlottedReduceRaisesKeyError,
+        SlottedReduceFromProperty,
+        DictReduceRaisesAttributeError,
+    ],
+    ids=[
+        "slotted, AttributeError",
+        "slotted, TypeError",
+        "slotted, KeyError",
+        "slotted, gives a recipe",
+        "dict-backed, AttributeError",
+    ],
+)
+def test_a_reduce_property_writes_as_python_does(kind: Callable[[], object]) -> None:
+    _assert_writes_alike_each_time(kind())
+
+
+class _HidesReduce(type):
+    """Answers ``__reduce__`` with ``object``'s, hiding the class's own."""
+
+    @override
+    def __getattribute__(cls, name: str) -> object:
+        if name == "__reduce__":
+            return object.__reduce__
+        return cast("object", super().__getattribute__(name))
+
+
+class ReduceHiddenByMetaclass(metaclass=_HidesReduce):
+    __slots__ = ()
+
+    @override
+    def __reduce__(self) -> tuple[object, ...]:
+        return (ReduceHiddenByMetaclass, ())
+
+
+# ``object.__reduce_ex__`` reads ``__reduce__`` through the metaclass, so one
+# that hides the class's own leaves copyreg's recipe.
+def test_a_reduce_the_metaclass_hides_writes_as_python_does() -> None:
+    _assert_writes_alike_each_time(ReduceHiddenByMetaclass())
+
+
+class _CountsModuleReads(type):
+    """Counts each read of ``__module__``."""
+
+    reads: ClassVar[int] = 0
+
+    @override
+    def __getattribute__(cls, name: str) -> object:
+        if name == "__module__":
+            _CountsModuleReads.reads += 1
+        return cast("object", super().__getattribute__(name))
+
+
+class ReducesToAnUnknownName(metaclass=_CountsModuleReads):
+    __slots__ = ()
+
+    @override
+    def __reduce__(self) -> str:
+        return "unknown_name"
+
+
+@pytest.mark.parametrize(
+    "function",
+    [serialize._python_to_plain, serialize.to_plain, wire.json_dumps],
+    ids=["python", "to_plain", "json_dumps"],
+)
+def test_a_bare_name_reduce_reads_the_module_once_as_python_does(
+    function: Callable[[object], object],
+) -> None:
+    for _ in range(_TIMES):
+        _CountsModuleReads.reads = 0
+        with pytest.raises(TypeError, match="does not resolve"):
+            function(ReducesToAnUnknownName())
+        assert _CountsModuleReads.reads == 1
+
+
+@needs_rust
+@pytest.mark.parametrize("slots", [False, True], ids=["dict-backed", "slotted"])
+def test_a_member_that_drops_a_later_member_writes_as_python_does(
+    slots: bool,
+) -> None:
+    # Python reads every member before encoding any, so the dropped list is
+    # still written; read lazily, it would be gone, or freed, by its turn.
+    printed = _run_python(
+        f"""
+        from dataclasses import dataclass
+        import gc
+        import json
+        from treekle import serialize, wire
+
+        class Drops:
+            def __init__(self, owner):
+                self.owner = owner
+
+            def __reduce__(self):
+                if self.owner is not None and hasattr(self.owner, "b"):
+                    del self.owner.b
+                    gc.collect()
+                    [bytearray(64) for _ in range(1000)]
+                return (Drops, (None,))
+
+        @dataclass(slots={slots})
+        class Owner:
+            a: object
+            b: object
+
+        def built():
+            owner = Owner(None, None)
+            owner.a, owner.b = Drops(owner), ["only", ["held", "here"]]
+            return [owner]
+
+        tree = serialize._python_to_plain(built())
+        text = json.dumps(tree)
+        print(*(serialize.to_plain(built()) == tree for _ in range(3)))
+        print(*(wire.json_dumps(built()) == text for _ in range(3)))
+        """,
+    )
+    assert printed == "True True True\nTrue True True"
+
+
+@needs_rust
+def test_a_resolved_cache_replaced_many_times_is_still_read() -> None:
+    # Each replacement is another dict for the reader to watch.
+    printed = _run_python(
+        """
+        import os
+        import treekle.deserialize as deserialize
+
+        path = "collections.OrderedDict"
+        kept = []
+        for _ in range(6):
+            deserialize._RESOLVED = {}
+            kept.append(deserialize._RESOLVED)
+            for _ in range(2):
+                deserialize.from_plain({"py/type": path}, object, allow_imports=True)
+        deserialize._RESOLVED[path] = os.PathLike
+        print(deserialize.from_plain({"py/type": path}, object, allow_imports=True))
+        """,
+    )
+    assert printed == "<class 'os.PathLike'>"
+
+
+class _GcProbe:
+    pass
+
+
+# A hook may read or switch the cyclic collector; the walk leaves it alone.
+@pytest.mark.parametrize(
+    "enabled",
+    [True, False],
+    ids=["collector on", "collector off"],
+)
+def test_a_hook_sees_and_keeps_the_collector_state_as_python_does(
+    enabled: bool,
+) -> None:
+    def encode(probe: _GcProbe) -> PlainTree:
+        del probe
+        seen = gc.isenabled()
+        if enabled:
+            gc.disable()
+        else:
+            gc.enable()
+        return {"enabled": seen}
+
+    def decode(tree: PlainTree) -> _GcProbe:
+        del tree
+        return _GcProbe()
+
+    hooks: Hooks = {_GcProbe: (encode, decode)}
+    writers: list[Callable[[], object]] = [
+        lambda: serialize._python_to_plain(_GcProbe(), hooks=hooks),
+        lambda: serialize.to_plain(_GcProbe(), hooks=hooks),
+        lambda: cast("object", json.loads(wire.json_dumps(_GcProbe(), hooks=hooks))),
+    ]
+    was = gc.isenabled()
+    try:
+        seen: list[tuple[object, bool]] = []
+        for write in writers:
+            for _ in range(_TIMES):
+                if enabled:
+                    gc.enable()
+                else:
+                    gc.disable()
+                seen.append((_outcome(write), gc.isenabled()))
+    finally:
+        if was:
+            gc.enable()
+        else:
+            gc.disable()
+    assert seen == [seen[0]] * len(seen)
+    assert seen[0] == (
+        ("ok", _shape({"py/hook": [f"{__name__}._GcProbe", {"enabled": enabled}]})),
+        not enabled,
+    )
+
+
+# With the core, ``json_loads`` and ``json_dumps`` parse and write the text
+# themselves and leave to ``json`` only what they would not answer exactly as
+# it does. Each case below must give what ``json`` gives: the same value, down
+# to float bits and container types, or the same error with the same text.
+
+
+def _exact(tree: object) -> object:
+    """Return ``tree`` as data that tells JSON values apart, ``-0.0`` from ``0.0`` too."""
+    if isinstance(tree, dict):
+        items = cast("dict[object, object]", tree).items()
+        return ("dict", [(_exact(key), _exact(value)) for key, value in items])
+    if isinstance(tree, list):
+        return ("list", [_exact(item) for item in cast("list[object]", tree)])
+    if isinstance(tree, float):
+        return ("float", repr(tree))
+    return (type(tree).__name__, tree)
+
+
+def _text_outcome(call: Callable[[], object]) -> object:
+    """Return the call's value as ``_exact`` shows it, or the type and text of what it raised."""
+    try:
+        return ("ok", _exact(call()))
+    except Exception as error:  # noqa: BLE001 -- Parity compares whatever either side raises.
+        return ("raise", type(error).__name__, str(error))
+
+
+def _read_outcome(call: Callable[[], object]) -> object:
+    """Return what the call read, as Python writes it and ``_exact`` shows it, or its error."""
+    try:
+        return ("ok", _exact(serialize._python_to_plain(call())))
+    except ReadError as error:
+        return ("raise", "ReadError", _exact(_failure(error)))
+    except Exception as error:  # noqa: BLE001 -- Parity compares whatever either side raises.
+        return ("raise", type(error).__name__, str(error))
+
+
+def _parses_alike(text: object) -> bool:
+    """Return whether ``json_loads(text)`` gives what ``json.loads(text)`` gives."""
+    document = cast("str", text)
+    return _text_outcome(lambda: wire.json_loads(document)) == _text_outcome(
+        lambda: cast("object", json.loads(document)),
+    )
+
+
+_JSON_TEXTS: dict[str, list[object]] = {
+    "structure": [
+        "",
+        " ",
+        "{",
+        "}",
+        "[",
+        "]",
+        "[1,]",
+        '{"a":1,}',
+        '{"a" 1}',
+        "{1:2}",
+        "[1 2]",
+        "{} {}",
+        "{}  x",
+        '{"a": [1, {"b": null}], "c": {}}',
+        "[[], {}, [{}]]",
+    ],
+    "numbers": [
+        "0",
+        "-0",
+        "-0.0",
+        "01",
+        "-",
+        "1.",
+        ".5",
+        "1e",
+        "1e+",
+        "1E+2",
+        "0e0",
+        "+1",
+        "0x10",
+        "1e400",
+        "-1e400",
+        "1e-400",
+        "4.9e-324",
+        "2.2250738585072014e-308",
+        "1.7976931348623157e308",
+        "0.1",
+        "999999999999999999",
+        "-999999999999999999",
+        "9223372036854775807",
+        "9223372036854775808",
+        "-9223372036854775808",
+        "-9223372036854775809",
+        "9999999999999999999",
+        "18446744073709551616",
+        "123456789012345678901234567890",
+        "9" * 4300,
+        "9" * 4301,
+        "-" + "9" * 5000,
+    ],
+    "constants": [
+        "NaN",
+        "-NaN",
+        "nan",
+        "Infinity",
+        "-Infinity",
+        "infinity",
+        "[NaN, Infinity, -Infinity]",
+        "true",
+        "false",
+        "null",
+        "True",
+        "nul",
+        "t",
+    ],
+    "strings": [
+        '"a"',
+        '"\\u00e9"',
+        '"\\ud83d\\ude00"',
+        '"\\ud83d"',
+        '"\\ude00"',
+        '"\\ud83dx"',
+        '"\\ud83d\\u0041"',
+        '"\\x41"',
+        '"\\u12"',
+        '"\\u12g4"',
+        '"\\/\\b\\f\\n\\r\\t\\"\\\\"',
+        '"a\nb"',
+        '"a\tb"',
+        '"a\x00b"',
+        '"\x7f"',
+        '"\u00e9"',
+        '"\U0001f600"',
+        '"\ud83d"',
+        '"unterminated',
+        '"\\',
+    ],
+    "framing": [
+        "\ufeff{}",
+        "{}\ufeff",
+        "\x0c{}",
+        "{}\x0c",
+        "\u00a0{}",
+        " \t\r\n{} \t\r\n",
+    ],
+    "keys": [
+        '{"a": 1, "a": 2}',
+        '{"a": {"b": 1}, "a": [2]}',
+        '{"": 0}',
+        '{"\\u0061": 1, "a": 2}',
+        '{"py/x": 1}',
+        '{"json://1": 2}',
+    ],
+    "nesting": [
+        "[" * 199 + "]" * 199,
+        "[" * 200 + "]" * 200,
+        "[" * 201 + "]" * 201,
+        '{"a": ' * 300 + "1" + "}" * 300,
+        "[" * 5_000 + "]" * 5_000,
+    ],
+    "bytes": [
+        b"{}",
+        b'{"a": "\xc3\xa9"}',
+        b'"\xff"',
+        b'"\xc3"',
+        b'"\xed\xa0\xbd"',
+        b"\xef\xbb\xbf{}",
+        '{"a": 1}'.encode("utf-16"),
+        '{"a": 1}'.encode("utf-16-le"),
+        '{"a": 1}'.encode("utf-32"),
+        bytearray(b"[1]"),
+        memoryview(b"[1]"),
+    ],
+}
+
+
+@pytest.mark.parametrize("group", list(_JSON_TEXTS))
+def test_json_loads_parses_as_json_does(group: str) -> None:
+    assert [text for text in _JSON_TEXTS[group] if not _parses_alike(text)] == []
+
+
+@dataclass(kw_only=True, slots=True)
+class _Row:
+    id: int
+    name: str
+    score: float
+    ok: bool
+    tags: list[str]
+    note: str | None = None
+
+
+@dataclass(frozen=True, kw_only=True, slots=True)
+class _FrozenRow:
+    id: int
+    score: float
+
+
+@dataclass(
+    kw_only=True,
+)  # house-ignore[dataclass] -- The dict-backed row: its fields live in __dict__.
+class _DictRow:
+    id: int
+    score: float
+
+
+@dataclass(kw_only=True, slots=True)
+class _Batch:
+    rows: list[_Row]
+    by_name: dict[str, _FrozenRow]
+    pair: tuple[int, str]
+    counts: dict[int, float]
+    either: _DictRow | int
+
+
+def _tag(name: str) -> str:
+    return f'"py/object": "{__name__}.{name}"'
+
+
+# Records carry their tags, as ``to_plain`` writes them: the typed reader
+# takes only tagged records straight from the text.
+_ROW_FIELDS = '"id": 1, "name": "a", "score": 0.5, "ok": true, "tags": ["x"]'
+_ROW = f"{{{_tag('_Row')}, {_ROW_FIELDS}}}"
+_FROZEN = f'{{{_tag("_FrozenRow")}, "id": 2, "score": -0.0}}'
+_DICT_ROW = f'{{{_tag("_DictRow")}, "id": 4, "score": 1e400}}'
+_BATCH = (
+    f'{{{_tag("_Batch")}, "rows": [{_ROW}], "by_name": {{"a": {_FROZEN}}},'
+    f' "pair": [3, "b"], "counts": {{"json://1": 0.5}}, "either": {_DICT_ROW}}}'
+)
+
+# (id, text, target, strict): documents the typed reader takes straight from
+# the text, and ones where it must give up part way and leave them to the tree.
+_TYPED_TEXTS: list[tuple[str, str, object, bool]] = [
+    ("rows", f"[{_ROW}, {_ROW}]", list[_Row], True),
+    ("untagged rows", f"[{{{_ROW_FIELDS}}}]", list[_Row], True),
+    ("tag last", f"[{{{_ROW_FIELDS}, {_tag('_Row')}}}]", list[_Row], True),
+    ("tag twice", f"[{_ROW[:-1]}, {_tag('_Row')}}}]", list[_Row], True),
+    ("tag of another class", f"[{_FROZEN}]", list[_Row], True),
+    ("tag that is not text", f'[{{"py/object": 1, {_ROW_FIELDS}}}]', list[_Row], True),
+    ("one record", _ROW, _Row, True),
+    ("empty list", "[]", list[_Row], True),
+    (
+        "default left out",
+        f'[{{{_tag("_Row")}, "id": 1, "name": "a", "score": 1, "ok": false, "tags": []}}]',
+        list[_Row],
+        True,
+    ),
+    (
+        "required field left out",
+        f'[{{{_tag("_Row")}, "id": 1, "name": "a"}}]',
+        list[_Row],
+        True,
+    ),
+    ("extra key", f'[{_ROW[:-1]}, "extra": 1}}]', list[_Row], True),
+    ("extra key, not strict", f'[{_ROW[:-1]}, "extra": 1}}]', list[_Row], False),
+    ("duplicate key", f'[{_ROW[:-1]}, "id": 2}}]', list[_Row], True),
+    ("escaped key", _ROW.replace('"id"', '"\\u0069d"'), _Row, True),
+    ("escaped text", _ROW.replace('"a"', '"\\u00e9\\ud83d\\ude00\\n"'), _Row, True),
+    ("lone surrogate text", _ROW.replace('"a"', '"\\ud800"'), _Row, True),
+    ("float text in an int field", _ROW.replace('"id": 1', '"id": 1.0'), _Row, True),
+    ("int text in a float field", _ROW.replace("0.5", "7"), _Row, True),
+    (
+        "huge int",
+        _ROW.replace('"id": 1', '"id": 123456789012345678901234567890'),
+        _Row,
+        True,
+    ),
+    (
+        "non-finite floats",
+        f"[{_FROZEN.replace('-0.0', 'NaN')}, {_FROZEN.replace('-0.0', '-Infinity')}]",
+        list[_FrozenRow],
+        True,
+    ),
+    (
+        "float extremes",
+        f"[{_FROZEN.replace('-0.0', '5e-324')}, {_FROZEN.replace('-0.0', '1e400')}]",
+        list[_FrozenRow],
+        True,
+    ),
+    ("int text in a float", _FROZEN.replace("-0.0", "-0"), _FrozenRow, True),
+    ("float text in an int", _FROZEN.replace('"id": 2', '"id": 2.0'), _FrozenRow, True),
+    ("text in an int", _FROZEN.replace('"id": 2', '"id": "2"'), _FrozenRow, False),
+    ("bool in an int", _FROZEN.replace('"id": 2', '"id": true'), _FrozenRow, True),
+    ("bool from 0", _ROW.replace("true", "0"), _Row, True),
+    ("lax bool from text", _ROW.replace("true", '"yes"'), _Row, False),
+    ("null for an optional", f'[{_ROW[:-1]}, "note": null}}]', list[_Row], True),
+    ("null for a required field", _ROW.replace("0.5", "null"), _Row, True),
+    (
+        "bad record late in the list",
+        "[" + ", ".join([_ROW] * 20 + [_ROW.replace('"id": 1', '"id": "x"')]) + "]",
+        list[_Row],
+        True,
+    ),
+    ("unclosed list", f"[{_ROW}, {_ROW}", list[_Row], True),
+    ("trailing comma", f"[{_ROW},]", list[_Row], True),
+    ("trailing text", f"[{_ROW}] x", list[_Row], True),
+    (
+        "space everywhere",
+        f" \n[\t{_ROW.replace(': ', ' :  ')} ,\r\n{_ROW} ]\n ",
+        list[_Row],
+        True,
+    ),
+    ("tag key in a record", f'[{_ROW[:-1]}, "py/id": 1}}]', list[_Row], True),
+    ("a reference to a record", f'[{_ROW}, {{"py/id": 1}}]', list[_Row], True),
+    (
+        "frozen rows by name",
+        f'{{"a": {_FROZEN}, "b": {_FROZEN}}}',
+        dict[str, _FrozenRow],
+        True,
+    ),
+    ("dict-backed rows", f"[{_DICT_ROW}, {_DICT_ROW}]", list[_DictRow], True),
+    ("tag key in a plain dict", '{"a": 1, "py/x": 2}', dict[str, int], True),
+    (
+        "reference in a plain dict",
+        '[{"a": 1}, {"py/id": 1}]',
+        list[dict[str, int]],
+        True,
+    ),
+    ("records in records", _BATCH, _Batch, True),
+    (
+        "tuple as an envelope",
+        _BATCH.replace('[3, "b"]', '{"py/tuple": [3, "b"]}'),
+        _Batch,
+        True,
+    ),
+    (
+        "union member as an int",
+        _BATCH.replace(_DICT_ROW, "5"),
+        _Batch,
+        True,
+    ),
+    (
+        "escaped key not canonical",
+        _BATCH.replace("json://1", "json://01"),
+        _Batch,
+        True,
+    ),
+    ("escaped key not an int", _BATCH.replace("json://1", "json://true"), _Batch, True),
+]
+
+
+@pytest.mark.parametrize(
+    ("text", "target", "strict"),
+    [case[1:] for case in _TYPED_TEXTS],
+    ids=[case[0] for case in _TYPED_TEXTS],
+)
+def test_typed_json_loads_reads_as_from_plain_of_json_loads(
+    text: str,
+    target: object,
+    strict: bool,
+) -> None:
+    def python() -> object:
+        tree = cast("PlainTree", json.loads(text))
+        return deserialize._python_from_plain(
+            tree,
+            target,
+            strict=strict,
+            allow_imports=True,
+        )
+
+    expected = _read_outcome(python)
+    for _ in range(_TIMES):
+        assert (
+            _read_outcome(
+                lambda: wire.json_loads(
+                    text,
+                    target,
+                    strict=strict,
+                    allow_imports=True,
+                ),
+            )
+            == expected
+        )
+
+
+class _Layout(NamedTuple):
+    sort: bool = True
+    ensure_ascii: bool = True
+    separators: tuple[str, str] | None = None
+    indent: int | str | None = None
+    sort_keys: bool = False
+
+
+_LAYOUTS = {
+    "default": _Layout(),
+    "unsorted attributes": _Layout(sort=False),
+    "compact": _Layout(separators=(",", ":")),
+    "indented": _Layout(indent=2),
+    "tab indent and sorted keys": _Layout(indent="\t", sort_keys=True),
+    "non-ASCII kept": _Layout(ensure_ascii=False),
+}
+
+
+def _dumps_outcomes(
+    value: object,
+    *,
+    dialect: object,
+    hooks: Hooks | None,
+    layout: _Layout,
+) -> tuple[object, object]:
+    """Return what ``json_dumps`` gives for ``value``, and ``json.dumps`` of Python's tree."""
+    style = cast("Dialect", dialect)
+
+    def python() -> str:
+        tree = serialize._python_to_plain(
+            value,
+            dialect=style,
+            hooks=hooks or {},
+            sort=layout.sort,
+        )
+        return json.dumps(
+            tree,
+            ensure_ascii=layout.ensure_ascii,
+            separators=layout.separators,
+            indent=layout.indent,
+            sort_keys=layout.sort_keys,
+        )
+
+    def written() -> str:
+        return wire.json_dumps(
+            value,
+            dialect=style,
+            hooks=hooks or {},
+            sort=layout.sort,
+            ensure_ascii=layout.ensure_ascii,
+            separators=layout.separators,
+            indent=layout.indent,
+            sort_keys=layout.sort_keys,
+        )
+
+    return _text_outcome(written), _text_outcome(python)
+
+
+@pytest.mark.parametrize("layout", list(_LAYOUTS))
+@pytest.mark.parametrize(
+    ("value", "dialect", "hooks"),
+    [case[1:] for case in ENCODE_CASES],
+    ids=[case[0] for case in ENCODE_CASES],
+)
+def test_json_dumps_writes_json_dumps_of_to_plain(
+    value: object,
+    dialect: object,
+    hooks: Hooks | None,
+    layout: str,
+) -> None:
+    written, expected = _dumps_outcomes(
+        value,
+        dialect=dialect,
+        hooks=hooks,
+        layout=_LAYOUTS[layout],
+    )
+    assert written == expected
+
+
+@pytest.mark.parametrize(
+    ("value", "hooks"),
+    [(case[1], case[3]) for case in ENCODE_CASES],
+    ids=[case[0] for case in ENCODE_CASES],
+)
+def test_json_loads_reads_back_what_json_dumps_wrote(
+    value: object,
+    hooks: Hooks | None,
+) -> None:
+    try:
+        text = json.dumps(serialize._python_to_plain(value, hooks=hooks or {}))
+    except (TypeError, ValueError):
+        pytest.skip("the value does not encode")
+
+    def python() -> object:
+        tree = cast("PlainTree", json.loads(text))
+        return deserialize._python_from_plain(
+            tree,
+            object,
+            hooks=hooks or {},
+            allow_imports=True,
+        )
+
+    assert _read_outcome(
+        lambda: wire.json_loads(text, object, hooks=hooks or {}, allow_imports=True),
+    ) == _read_outcome(python)
+
+
+# Options ``json.dumps`` takes but would not take from a type checker: the
+# core leaves each one it cannot read exactly to ``json``.
+@pytest.mark.parametrize(
+    ("ensure_ascii", "separators", "indent", "sort_keys"),
+    [
+        (0, None, None, False),
+        (True, [",", ":"], None, False),
+        (True, (1, 2), None, False),
+        (True, ("\u00b7", "\u2192"), None, False),
+        (True, None, 0, False),
+        (True, None, -1, False),
+        (True, None, 2.5, False),
+        (True, None, "\u2192", True),
+        (True, None, None, "yes"),
+    ],
+)
+def test_json_dumps_takes_odd_options_as_json_dumps_does(
+    ensure_ascii: object,
+    separators: object,
+    indent: object,
+    sort_keys: object,
+) -> None:
+    layout = _Layout(
+        ensure_ascii=cast("bool", ensure_ascii),
+        separators=cast("tuple[str, str] | None", separators),
+        indent=cast("int | str | None", indent),
+        sort_keys=cast("bool", sort_keys),
+    )
+    value = [_tree(), {"\u00e9": [1.5, None], "b": (1, 2)}]
+    written, expected = _dumps_outcomes(
+        value,
+        dialect="json",
+        hooks=None,
+        layout=layout,
+    )
+    assert written == expected
+
+
+# What the core cannot write as text the way ``json`` would (an int past the
+# digit limit, two keys that escape to the same text, a tree too deep) it
+# leaves to ``json`` without encoding anything again: user code runs as many
+# times as in Python, and errors carry the same text and notes.
+_BIG = 10**5000
+
+
+class _Counted:
+    """A value written by a hook that counts its calls."""
+
+
+class _Opaque:
+    """A key hashed by identity, so two of them escape to the same text."""
+
+
+class _Members:
+    def __init__(self, members: Mapping[object, object]) -> None:
+        for name, member in members.items():
+            # Names that are not text too: ``__dict__`` takes any key.
+            vars(self)[cast("str", name)] = member
+
+
+class _Pair:
+    __slots__ = ("a", "b")
+
+    def __init__(self, a: object, b: object) -> None:
+        self.a = a
+        self.b = b
+
+
+class _Float(float):
+    __slots__ = ()
+
+
+class _OddComplex(complex):
+    __slots__ = ()
+
+    @property
+    @override
+    def real(self) -> float:
+        return _BIG
+
+
+class _Repeating(Mapping[object, object]):
+    """A mapping that lists one key twice."""
+
+    @override
+    def __iter__(self) -> Iterator[object]:
+        return iter([1, 1, _Counted()])
+
+    @override
+    def __getitem__(self, key: object) -> object:
+        return [_Counted(), 0 if isinstance(key, _Counted) else key]
+
+    @override
+    def __len__(self) -> int:
+        return 3
+
+
+class _Unreducible:
+    @override
+    def __reduce__(self) -> str | tuple[object, ...]:
+        raise TypeError("cannot reduce")
+
+
+class _Foreign:
+    """A class whose encoder is a Python function, as one outside the core is."""
+
+    def __init__(self, held: object = None) -> None:
+        self.held = held
+
+
+def _encode_foreign(value: object, state: serialize._Encoding) -> object:
+    # An int key and a tuple: a tree ``json`` writes and the core's writer
+    # leaves to it.
+    del state
+    return {1: "\u00e9", "held": cast("_Foreign", value).held, "pair": (1, 2)}
+
+
+class _LateFailingReduce:
+    """Reduces to ``first``, then a part that cannot be encoded at all.
+
+    The walk then cuts back to the reduce and writes it by its slots.
+    """
+
+    __slots__ = ("first",)
+
+    def __init__(self, first: object) -> None:
+        self.first = first
+
+    @override
+    def __reduce__(self) -> str | tuple[object, ...]:
+        return (_LateFailingReduce, (self.first, _Unreducible()))
+
+
+class _Itemized(dict[str, object]):
+    """A dict that writes how often its items were read into itself."""
+
+    @override
+    def items(self) -> dict_items[str, object]:
+        self["asked"] = cast("int", self.get("asked", 0)) + 1
+        return super().items()
+
+
+def _shared_itemized() -> object:
+    # Its two encoders' trees are left to ``json``, which reads its items
+    # once for each.
+    held = _Itemized(a=1)
+    return [_Counted(), _Foreign(held), _Foreign(held)]
+
+
+def _wrapped(depth: int, leaf: object, wrap: Callable[[object], object]) -> object:
+    for _ in range(depth):
+        leaf = wrap(leaf)
+    return leaf
+
+
+def _decode_counted(raw: object) -> _Counted:
+    del raw
+    return _Counted()
+
+
+def _shared_under_an_int_name() -> object:
+    inner = [1]
+    return [_Members({5: inner}), inner, _Counted()]
+
+
+_HOLE_CASES: dict[str, Callable[[], object]] = {
+    "big in a list": lambda: [_Counted(), [1, _BIG], _Counted()],
+    "big in a dict": lambda: {"a": _Counted(), "b": {"c": _BIG}, "d": _Counted()},
+    "big in a tuple": lambda: (_Counted(), (1, _BIG)),
+    "big in sets": lambda: [_Counted(), {1, _BIG}, frozenset({_BIG})],
+    "big alone": lambda: _BIG,
+    "big among leaves": lambda: [_Counted(), [1, 2, _BIG, 3], {"a": 1, "b": _BIG}],
+    "big in objects": lambda: [
+        _Counted(),
+        _Members({"x": [_BIG]}),
+        _Members({"x": _BIG}),
+    ],
+    "big in slots": lambda: [_Counted(), _Pair(1, _BIG), _Pair(_BIG, _Counted())],
+    "big twice": lambda: [_Counted(), _BIG, _Counted(), [_BIG + 1]],
+    "hook after big": lambda: [_BIG, _Counted(), {1}],
+    "big key": lambda: [_Counted(), {_BIG: 1}],
+    "nan keys": lambda: [
+        _Counted(),
+        {float("nan"): _Counted(), float("nan"): _Counted()},
+    ],
+    "object keys": lambda: [{_Opaque(): _Counted(), _Opaque(): _Counted()}, _Counted()],
+    "tuple keys": lambda: [{(1, 2): _Counted(), (3,): [_BIG]}, _Counted()],
+    "leaf keys": lambda: [
+        {1: _Counted(), 2: [_BIG], 3.5: _Counted(), None: 1, False: 2},
+        _Counted(),
+    ],
+    "tag-like keys": lambda: [{"py/a": _Counted(), "json://x": _Counted()}, _Counted()],
+    "mapping repeating a key": lambda: [_Counted(), _Repeating()],
+    "member named py/object": lambda: [_Counted(), _Members({"py/object": _Counted()})],
+    "int member name": lambda: [_Counted(), _Members({5: _Counted()})],
+    "str subclass member name": lambda: [_Counted(), _Members({_Text("y"): [_BIG]})],
+    "reference to an int-named member": _shared_under_an_int_name,
+    "float subclass": lambda: [_Counted(), _Float(1.5)],
+    "complex": lambda: [_Counted(), 1 + 2j, complex(math.nan, 1), _OddComplex(1, 2)],
+    "non-finite floats": lambda: [_Counted(), math.nan, math.inf, _Float("-inf")],
+    "surrogate keys": lambda: [
+        _Counted(),
+        {"\ud800": {"\udc00x": _BIG}, "\ud800\udc00": [_BIG]},
+    ],
+    "deep lists": lambda: [_Counted(), _wrapped(150, [_BIG], lambda inner: [inner])],
+    "deep tuples": lambda: _wrapped(120, [_Counted()], lambda inner: (inner,)),
+    "deep dicts": lambda: _wrapped(
+        300,
+        {"k": _Counted()},
+        lambda inner: {"k": inner, "o": _Counted()},
+    ),
+    "nan keys, non-ASCII": lambda: [
+        _Counted(),
+        {float("nan"): "\u00e9", float("nan"): _Counted()},
+    ],
+    "python encoder": lambda: [_Counted(), _Foreign(), _Foreign([_Counted()])],
+    "python encoder, big": lambda: [_Counted(), _Foreign(_BIG)],
+    "python encoders sharing a dict subclass": _shared_itemized,
+    "reduce failing late": lambda: [
+        _Counted(),
+        _LateFailingReduce(_Foreign()),
+        _LateFailingReduce(_BIG),
+        _Counted(),
+    ],
+    "reduce failing late, after a python encoder": lambda: [
+        _Foreign(),
+        _LateFailingReduce(_Foreign()),
+    ],
+    "reduce failing late, after big": lambda: [_BIG, _LateFailingReduce(1)],
+}
+
+
+class _HoleLayout(NamedTuple):
+    dialect: str = "json"
+    separators: tuple[str, str] | None = None
+    ensure_ascii: bool = True
+
+
+_HOLE_LAYOUTS = {
+    "default": _HoleLayout(),
+    "compact": _HoleLayout(separators=(",", ":")),
+    "no separators": _HoleLayout(separators=("", "")),
+    "non-ASCII kept": _HoleLayout(ensure_ascii=False),
+    "python dialect": _HoleLayout(dialect="python"),
+}
+
+
+@pytest.fixture
+def digit_limit() -> Iterator[None]:
+    """Hold ``int`` to the default digit limit, as a test before may have changed it."""
+    limit = sys.get_int_max_str_digits()
+    sys.set_int_max_str_digits(4300)
+    try:
+        yield
+    finally:
+        sys.set_int_max_str_digits(limit)
+
+
+def _counted_dumps(
+    make: Callable[[], object],
+    write: Callable[[object, Hooks], str],
+    payload: Callable[[int], object],
+) -> tuple[object, int]:
+    """Return what ``write`` gives for a fresh value, with its notes, and how often hooks ran."""
+    calls: list[object] = []
+
+    def encode(value: object) -> object:
+        calls.append(value)
+        return payload(len(calls))
+
+    hooks: Hooks = {_Counted: (encode, _decode_counted)}
+    value = make()
+    try:
+        result: object = ("ok", write(value, hooks))
+    except Exception as error:  # noqa: BLE001 -- Parity compares whatever either side raises.
+        notes = getattr(error, "__notes__", None)
+        result = ("raise", type(error).__name__, str(error), notes)
+    return result, len(calls)
+
+
+def _hole_writers(
+    layout: _HoleLayout,
+) -> tuple[Callable[[object, Hooks], str], Callable[[object, Hooks], str]]:
+    """Return ``json_dumps`` and Python's ``json.dumps(to_plain(...))`` under ``layout``."""
+    style = cast("Dialect", layout.dialect)
+
+    def written(value: object, hooks: Hooks) -> str:
+        return wire.json_dumps(
+            value,
+            dialect=style,
+            hooks=hooks,
+            separators=layout.separators,
+            ensure_ascii=layout.ensure_ascii,
+        )
+
+    def python(value: object, hooks: Hooks) -> str:
+        # Every option, as ``json_dumps`` passes them: a replaced
+        # ``json.dumps`` sees what it is passed.
+        return json.dumps(
+            serialize._python_to_plain(value, dialect=style, hooks=hooks),
+            ensure_ascii=layout.ensure_ascii,
+            separators=layout.separators,
+            indent=None,
+            sort_keys=False,
+        )
+
+    return written, python
+
+
+def _assert_dumps_with_hooks_alike(
+    make: Callable[[], object],
+    layout: _HoleLayout,
+    payload: Callable[[int], object] = lambda count: count,
+) -> None:
+    written, python = _hole_writers(layout)
+    assert _counted_dumps(make, written, payload) == _counted_dumps(
+        make,
+        python,
+        payload,
+    )
+
+
+@pytest.mark.usefixtures("digit_limit")
+@pytest.mark.parametrize("layout", list(_HOLE_LAYOUTS))
+@pytest.mark.parametrize("case", list(_HOLE_CASES))
+def test_json_dumps_runs_hooks_as_often_as_python_where_text_falls_short(
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+    layout: str,
+) -> None:
+    monkeypatch.setitem(serialize._ENCODER_CACHE, _Foreign, _encode_foreign)
+    for _ in range(_TIMES):
+        _assert_dumps_with_hooks_alike(_HOLE_CASES[case], _HOLE_LAYOUTS[layout])
+
+
+def test_json_dumps_gives_up_where_json_does_on_a_deep_tree() -> None:
+    # The text walk could write any depth; ``json`` stops where the C stack
+    # runs short, and so must ``json_dumps``. Notes differ with the stack.
+    value = _wrapped(100_000, [_Counted()], lambda inner: [inner])
+
+    def kind(write: Callable[[object, Hooks], str]) -> tuple[object, int]:
+        outcome, calls = _counted_dumps(lambda: value, write, lambda count: count)
+        return cast("tuple[object, ...]", outcome)[:2], calls
+
+    assert kind(lambda tree, hooks: wire.json_dumps(tree, hooks=hooks)) == kind(
+        lambda tree, hooks: json.dumps(serialize._python_to_plain(tree, hooks=hooks)),
+    )
+
+
+_JSON_DUMPS = cast("Callable[..., str]", json.dumps)
+_JSON_LOADS = cast("Callable[[str | bytes], object]", json.loads)
+
+
+class _ReplacedDumps:
+    """A ``json.dumps`` put in place after import.
+
+    Each text it writes starts with its call's place in line and keeps
+    non-ASCII text, so a call Python does not make, or one on part of a tree,
+    shows in the document.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def __call__(self, tree: object, **options: object) -> str:
+        self.calls.append(options)
+        text = _JSON_DUMPS(tree, **{**options, "ensure_ascii": False})
+        return f"{len(self.calls)}:{text}"
+
+
+class _ReplacedLoads:
+    """A ``json.loads`` put in place after import that lists what it parses.
+
+    A list it reads gains its call's place in line, so a document parsed
+    without it reads otherwise.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[str | bytes] = []
+
+    def __call__(self, text: str | bytes) -> object:
+        self.calls.append(text)
+        tree = _JSON_LOADS(text)
+        if isinstance(tree, list):
+            return [*cast("list[object]", tree), len(self.calls)]
+        return tree
+
+
+@pytest.mark.usefixtures("digit_limit")
+@pytest.mark.parametrize("layout", ["default", "compact", "python dialect"])
+@pytest.mark.parametrize("case", [*_HOLE_CASES, "no part left to json"])
+def test_json_dumps_calls_a_replaced_json_dumps_as_python_does(
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+    layout: str,
+) -> None:
+    # Python calls ``json.dumps`` once, on the whole tree, and ``to_plain``
+    # calls it for set orders and escaped keys; the core must call one
+    # replaced since import just so, not on parts of the tree or twice.
+    monkeypatch.setitem(serialize._ENCODER_CACHE, _Foreign, _encode_foreign)
+    make = _HOLE_CASES.get(case, lambda: [_Counted(), {"\u00e9": [1.5, None]}])
+    written, python = _hole_writers(_HOLE_LAYOUTS[layout])
+
+    def run(
+        write: Callable[[object, Hooks], str],
+    ) -> tuple[object, int, list[dict[str, object]]]:
+        replaced = _ReplacedDumps()
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(json, "dumps", replaced)
+            outcome, hooks = _counted_dumps(make, write, lambda count: count)
+        return outcome, hooks, replaced.calls
+
+    assert run(written) == run(python)
+
+
+_NO_TARGET = object()
+
+_REPLACED_LOADS_CASES: dict[str, tuple[str | bytes, object]] = {
+    "plain": ('[1, {"a": 2.5}]', _NO_TARGET),
+    "plain bytes": (b"[1, 2]", _NO_TARGET),
+    "typed": ("[1, 2]", list[int]),
+    "typed records": ('{"a": [1], "b": [2, 3]}', dict[str, list[int]]),
+    "escaped keys": ('{"json://1": [3], "json://2.5": [4]}', dict[float, list[int]]),
+    "malformed": ("[1,", list[int]),
+}
+
+
+@pytest.mark.parametrize("case", list(_REPLACED_LOADS_CASES))
+def test_json_loads_calls_a_replaced_json_loads_as_python_does(case: str) -> None:
+    # Python calls ``json.loads`` once on the document, and ``from_plain``
+    # once for each escaped key.
+    text, target = _REPLACED_LOADS_CASES[case]
+
+    def read() -> object:
+        if target is _NO_TARGET:
+            return wire.json_loads(text)
+        return wire.json_loads(text, target)
+
+    def python() -> object:
+        tree = cast("PlainTree", json.loads(text))
+        if target is _NO_TARGET:
+            return tree
+        return deserialize._python_from_plain(tree, target)
+
+    def run(call: Callable[[], object]) -> tuple[object, list[str | bytes]]:
+        replaced = _ReplacedLoads()
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(json, "loads", replaced)
+            outcome = _read_outcome(call)
+        return outcome, replaced.calls
+
+    for _ in range(_TIMES):
+        assert run(read) == run(python)
+
+
+@pytest.mark.usefixtures("digit_limit")
+def test_json_dumps_runs_a_hook_once_whose_payload_json_cannot_write() -> None:
+    _assert_dumps_with_hooks_alike(
+        lambda: [_Counted(), {"k": _Counted()}],
+        _HoleLayout(),
+        lambda count: {"x": [_BIG + count], 1: 2},
+    )
+
+
+@pytest.mark.usefixtures("digit_limit")
+@pytest.mark.parametrize("limit", [4300, 0], ids=["digit limit", "no digit limit"])
+def test_json_dumps_writes_big_ints_as_json_does_under_the_digit_limit(
+    monkeypatch: pytest.MonkeyPatch,
+    limit: int,
+) -> None:
+    monkeypatch.setitem(serialize._ENCODER_CACHE, _Foreign, _encode_foreign)
+    sys.set_int_max_str_digits(limit)
+    _assert_dumps_with_hooks_alike(
+        lambda: {"a": [_Counted(), _Foreign(_BIG)], "b": _BIG, "c": {_BIG: 1}},
+        _HoleLayout(separators=(";", "=")),
+    )
+
+
+class _Flag:
+    """A ``json.dumps`` flag that counts how often its truth is asked, and may act."""
+
+    def __init__(self, value: bool, action: Callable[[], None] | None = None) -> None:
+        self.value = value
+        self.action = action
+        self.asked = 0
+
+    def __bool__(self) -> bool:
+        self.asked += 1
+        if self.action is not None:
+            self.action()
+        return self.value
+
+
+def _raise_from_a_flag() -> None:
+    raise RuntimeError("asked")
+
+
+class _FlagCase(NamedTuple):
+    """A value, and a flag for ``ensure_ascii``, or ``sort_keys`` if ``sorts``."""
+
+    value: list[object]
+    truth: bool = True
+    sorts: bool = False
+    grows: bool = False
+    raises: bool = False
+    indent: int | None = None
+
+
+def _flag_cases() -> dict[str, _FlagCase]:
+    return {
+        "ensure_ascii": _FlagCase(["\u00e9"]),
+        "sort_keys": _FlagCase([{"b": 1, "a": 2}], sorts=True),
+        "ensure_ascii that grows the value": _FlagCase([1], grows=True),
+        "sort_keys that grows the value": _FlagCase(
+            [1],
+            truth=False,
+            sorts=True,
+            grows=True,
+        ),
+        "ensure_ascii that grows an indented value": _FlagCase(
+            [1],
+            grows=True,
+            indent=1,
+        ),
+        "raising, with a value that cannot be encoded": _FlagCase(
+            [_Unreducible()],
+            raises=True,
+        ),
+        "raising, with a value that can": _FlagCase([1], raises=True),
+    }
+
+
+@pytest.mark.parametrize("case", list(_flag_cases()))
+def test_json_dumps_asks_a_flags_truth_when_json_dumps_does(case: str) -> None:
+    # ``json`` asks only once the tree is built, so a flag that acts sees,
+    # or changes, what Python's walk left.
+    def run(write: Callable[[list[object], object, object], str]) -> tuple[object, int]:
+        value, truth, sorts, grows, raises, _ = _flag_cases()[case]
+        action = (
+            (lambda: value.append(2))
+            if grows
+            else _raise_from_a_flag
+            if raises
+            else None
+        )
+        flag = _Flag(truth, action)
+        outcome = _text_outcome(
+            lambda: write(value, True, flag) if sorts else write(value, flag, False),
+        )
+        return outcome, flag.asked
+
+    indent = _flag_cases()[case].indent
+
+    def written(value: list[object], ensure_ascii: object, sort: object) -> str:
+        return wire.json_dumps(
+            value,
+            ensure_ascii=cast("bool", ensure_ascii),
+            sort_keys=cast("bool", sort),
+            indent=indent,
+        )
+
+    def python(value: list[object], ensure_ascii: object, sort: object) -> str:
+        return json.dumps(
+            serialize._python_to_plain(value),
+            ensure_ascii=cast("bool", ensure_ascii),
+            sort_keys=cast("bool", sort),
+            indent=indent,
+        )
+
+    assert run(written) == run(python)
+
+
+@pytest.mark.parametrize("kind", [list, tuple])
+def test_json_dumps_reads_separators_after_hooks_run(kind: type) -> None:
+    # A hook may change a list of separators, and json reads them only once
+    # the tree is built.
+    def run(write: Callable[[object, Hooks, object], str]) -> object:
+        separators = [", ", ": "]
+
+        def encode(value: object) -> object:
+            del value
+            separators[0] = ";"
+            return 0
+
+        hooks: Hooks = {_Counted: (encode, _decode_counted)}
+        given = separators if kind is list else tuple(separators)
+        return _text_outcome(lambda: write([_Counted(), {"a": 1}], hooks, given))
+
+    assert run(
+        lambda value, hooks, separators: wire.json_dumps(
+            value,
+            hooks=hooks,
+            separators=cast("tuple[str, str]", separators),
+        ),
+    ) == run(
+        lambda value, hooks, separators: json.dumps(
+            serialize._python_to_plain(value, hooks=hooks),
+            separators=cast("tuple[str, str]", separators),
+        ),
+    )
+
+
+def _float_samples() -> list[float]:
+    """Return float edges, then random bit patterns and random magnitudes, all finite."""
+    rng = random.Random(20261018)  # noqa: S311 -- Seeded test data, not secrets.
+    samples = [
+        0.0,
+        -0.0,
+        5e-324,
+        -5e-324,
+        2.2250738585072009e-308,
+        2.2250738585072014e-308,
+        1.7976931348623157e308,
+        0.1,
+        0.2,
+        0.3,
+        1 / 3,
+        1e16,
+        1e-7,
+        1e21,
+        1e22,
+        1e23,
+        9007199254740993.0,
+        123456789.123456789,
+    ]
+    while len(samples) < 4_000:
+        (value,) = struct.unpack("<d", rng.getrandbits(64).to_bytes(8, "little"))
+        if math.isfinite(value):
+            samples.append(value)
+    samples.extend(rng.uniform(-1e6, 1e6) for _ in range(1_000))
+    # Quarters near 2**50 to 2**53 lie halfway between two shortest spellings
+    # (``x.25`` between ``x.2`` and ``x.3``), which ``repr`` breaks to the even.
+    samples.extend(
+        sign * (base + odd) / 4
+        for base in (2**50, 2**51, 2**52, 2**53 - 64)
+        for odd in range(1, 64, 2)
+        for sign in (1, -1)
+    )
+    return samples
+
+
+def _float_texts(samples: list[float]) -> list[str]:
+    """Return several spellings of each sample, and long decimals no double holds exactly."""
+    rng = random.Random(7)  # noqa: S311 -- Seeded test data, not secrets.
+    texts: list[str] = []
+    for value in samples:
+        texts.extend((repr(value), f"{value:.17e}", f"{value:.{rng.randint(1, 16)}g}"))
+    for _ in range(1_000):
+        digits = "".join(rng.choice("0123456789") for _ in range(rng.randint(18, 40)))
+        texts.append(f"{digits[0]}.{digits[1:]}e{rng.randint(-330, 310)}")
+    return texts
+
+
+def test_floats_parse_and_write_as_json_does() -> None:
+    samples = _float_samples()
+    text = "[" + ", ".join(_float_texts(samples)) + "]"
+    assert _text_outcome(lambda: wire.json_loads(text)) == _text_outcome(
+        lambda: cast("object", json.loads(text)),
+    )
+
+    def python() -> object:
+        tree = cast("PlainTree", json.loads(text))
+        return deserialize._python_from_plain(tree, list[float])
+
+    assert _read_outcome(lambda: wire.json_loads(text, list[float])) == _read_outcome(
+        python,
+    )
+    rows = (
+        "[" + ", ".join(f'{{"id": 0, "score": {value!r}}}' for value in samples) + "]"
+    )
+
+    def python_rows() -> object:
+        tree = cast("PlainTree", json.loads(rows))
+        return deserialize._python_from_plain(tree, list[_FrozenRow])
+
+    assert _read_outcome(
+        lambda: wire.json_loads(rows, list[_FrozenRow]),
+    ) == _read_outcome(python_rows)
+    assert wire.json_dumps(samples) == json.dumps(serialize._python_to_plain(samples))
+
+
+def _string_samples() -> list[str]:
+    """Return strings built from escapes, controls, surrogates and wide characters."""
+    rng = random.Random(11)  # noqa: S311 -- Seeded test data, not secrets.
+    alphabet = [
+        "a",
+        "\x00",
+        "\x1f",
+        "\x7f",
+        "\x80",
+        "\u00e9",
+        "\u20ac",
+        "\u2028",
+        "\uffff",
+        "\ud800",
+        "\udfff",
+        "\U0001f600",
+        '"',
+        "\\",
+        "/",
+        "\n",
+        "\t",
+        "\b",
+        "\f",
+        "\r",
+    ]
+    samples = ["", *alphabet, "x" * 5_000]
+    samples.extend(
+        "".join(rng.choice(alphabet) for _ in range(rng.randint(1, 40)))
+        for _ in range(300)
+    )
+    # ASCII text is checked for escapes eight bytes at a time, then byte by
+    # byte: put each character that needs one at every place in both.
+    samples.extend(
+        "a" * at + special + "a" * (size - at - 1)
+        for special in ('"', "\\", "\x7f", "\x00", "\x1f", "\n")
+        for size in range(1, 26)
+        for at in range(size)
+    )
+    return samples
+
+
+@pytest.mark.parametrize("ensure_ascii", [True, False])
+def test_strings_parse_and_write_as_json_does(ensure_ascii: bool) -> None:
+    samples = _string_samples()
+    expected = json.dumps(
+        serialize._python_to_plain(samples),
+        ensure_ascii=ensure_ascii,
+    )
+    assert wire.json_dumps(samples, ensure_ascii=ensure_ascii) == expected
+    keyed = {text: index for index, text in enumerate(samples)}
+    assert wire.json_dumps(keyed, ensure_ascii=ensure_ascii) == json.dumps(
+        serialize._python_to_plain(keyed),
+        ensure_ascii=ensure_ascii,
+    )
+    assert _parses_alike(expected)
+
+    def python() -> object:
+        tree = cast("PlainTree", json.loads(expected))
+        return deserialize._python_from_plain(tree, list[str])
+
+    assert _read_outcome(lambda: wire.json_loads(expected, list[str])) == _read_outcome(
+        python,
+    )
+
+
+# The plain-tree writer takes any tree, not only ``to_plain``'s, so it meets
+# what ``to_plain`` never writes: cycles, non-text keys and leaf subclasses.
+class _ShownInt(int):
+    @override
+    def __repr__(self) -> str:
+        return "shown"
+
+
+class _ShownFloat(float):
+    @override
+    def __repr__(self) -> str:
+        return "shown"
+
+
+class _Text(str):
+    __slots__ = ()
+
+
+def _plain_trees() -> dict[str, object]:
+    cycle: list[object] = []
+    cycle.append(cycle)
+    looped: dict[str, object] = {}
+    looped["self"] = looped
+    return {
+        "list cycle": cycle,
+        "dict cycle": looped,
+        "non-text keys": {1: "a", 2.5: "b", None: "c", False: "d"},
+        "mixed keys sorted": {"b": 1, 2: 3},
+        "leaf subclasses": [_ShownInt(1), _ShownFloat(2.5), _Text("t"), True],
+        "subclass key": {_Text("k"): 1},
+        "tuple": (1, [2, (3,)]),
+        "not plain": [object()],
+        "nested": {"b": [1, {"d": 1.5, "c": None}], "a": "\u00e9"},
+    }
+
+
+@needs_rust
+@pytest.mark.parametrize("sort_keys", [False, True])
+@pytest.mark.parametrize("indent", [None, 1])
+@pytest.mark.parametrize("name", list(_plain_trees()))
+def test_the_plain_tree_writer_writes_as_json_dumps_does(
+    name: str,
+    indent: int | None,
+    sort_keys: bool,
+) -> None:
+    from treekle import _rust  # noqa: PLC0415 -- Absent in a pure-Python run.
+
+    tree = _plain_trees()[name]
+    assert _text_outcome(
+        lambda: _rust.json_dumps_plain(tree, indent=indent, sort_keys=sort_keys),
+    ) == _text_outcome(lambda: json.dumps(tree, indent=indent, sort_keys=sort_keys))
 
 
 @needs_rust

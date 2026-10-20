@@ -34,6 +34,7 @@ use pyo3::types::{PyDict, PyInt, PyList, PyString, PyTuple, PyWeakrefReference};
 
 use crate::class::*;
 use crate::freeze::freeze;
+use crate::json::{self, Writer};
 use crate::py::*;
 use crate::sync;
 
@@ -130,8 +131,19 @@ pub struct EncGlobals {
     enum_reduce_ex: Py<PyAny>,
     /// ``object.__dict__["__class__"]``.
     object_class: Py<PyAny>,
+    /// ``object.__dict__["__reduce_ex__"]`` and ``["__reduce__"]``.
+    object_reduce_ex: Py<PyAny>,
+    object_reduce: Py<PyAny>,
     pure_path: Py<PyAny>,
     partial: Py<PyAny>,
+    /// ``slot_tp_getattr_hook``, the ``tp_getattro`` of a class defining
+    /// ``__getattr__``, read from a probe class.
+    getattr_hook: Option<usize>,
+    /// ``subtype_dict``, the getter of a plain class's ``__dict__``
+    /// descriptor, read from a probe class.
+    dict_getter: Option<usize>,
+    /// ``object.__dict__["__getattribute__"]``.
+    object_getattribute: Py<PyAny>,
     /// ``_IN_KEY``, the linked place of the ``IN_KEY`` frame, so a Python walk
     /// called inside a key sees the same sentinel.
     in_key: Py<PyAny>,
@@ -308,6 +320,31 @@ pub fn setup(module: &Bound<'_, PyDict>) -> PyResult<()> {
         .getattr("object")?
         .getattr("__dict__")?
         .get_item("__class__")?;
+    let object_attrs = builtins.getattr("object")?.getattr("__dict__")?;
+    let object_reduce_ex = object_attrs.get_item("__reduce_ex__")?;
+    let object_reduce = object_attrs.get_item("__reduce__")?;
+    let object_getattribute = object_attrs.get_item("__getattribute__")?;
+    let probe_attrs = PyDict::new(py);
+    probe_attrs.set_item("__getattr__", builtins.getattr("len")?)?;
+    let probe = builtins.getattr("type")?.call1((
+        "_GetattrProbe",
+        PyTuple::new(py, [builtins.getattr("object")?])?,
+        probe_attrs,
+    ))?;
+    let getattr_hook =
+        unsafe { (*probe.as_ptr().cast::<ffi::PyTypeObject>()).tp_getattro }.map(|f| f as usize);
+    let dict_probe = builtins.getattr("type")?.call1((
+        "_DictProbe",
+        PyTuple::new(py, [builtins.getattr("object")?])?,
+        PyDict::new(py),
+    ))?;
+    let dict_getter = unsafe {
+        let found = type_lookup(dict_probe.as_ptr().cast(), intern!(py, "__dict__").as_ptr());
+        (!found.is_null() && ffi::Py_TYPE(found) == &raw mut ffi::PyGetSetDescr_Type)
+            .then(|| (*(*found.cast::<ffi::PyGetSetDescrObject>()).d_getset).get)
+            .flatten()
+            .map(|f| f as usize)
+    };
     let globals = EncGlobals {
         module: module.clone().unbind(),
         reflect: reflect.dict().unbind(),
@@ -348,8 +385,13 @@ pub fn setup(module: &Bound<'_, PyDict>) -> PyResult<()> {
         enum_type: enum_type.unbind(),
         enum_reduce_ex: enum_reduce_ex.unbind(),
         object_class: object_class.unbind(),
+        object_reduce_ex: object_reduce_ex.unbind(),
+        object_reduce: object_reduce.unbind(),
         pure_path: py.import("pathlib")?.getattr("PurePath")?.unbind(),
         partial: py.import("functools")?.getattr("partial")?.unbind(),
+        getattr_hook,
+        dict_getter,
+        object_getattribute: object_getattribute.unbind(),
         in_key: get("_IN_KEY")?,
     };
     // Kept facts name the old module's encoders, so they go with it.
@@ -553,6 +595,71 @@ impl Env {
     }
 }
 
+/// The instance dict ``dict_read`` read, which holds the members it lent
+/// out, and how its keys name them.
+type DictRead<'py> = (B<'py>, Rc<DictKeys>);
+
+/// A class's layout and the sort it answers, where the sort is known
+/// without asking.
+type SortLayout = (Rc<Layout>, bool);
+
+/// The most members an instance dict may have to be read by ``dict_read``.
+const DICT_LIMIT: usize = 64;
+
+/// Whether generic lookup of ``name`` on an instance of ``kind`` reads the
+/// instance dict first: nothing on the class, or something whose immutable
+/// type is no data descriptor.
+fn unshadowed(kind: *mut ffi::PyTypeObject, name: *mut ffi::PyObject) -> bool {
+    unsafe {
+        let found = type_lookup(kind, name);
+        if found.is_null() {
+            return true;
+        }
+        let of = ffi::Py_TYPE(found);
+        ffi::PyType_HasFeature(of, ffi::Py_TPFLAGS_IMMUTABLETYPE) != 0
+            && (*of).tp_descr_set.is_none()
+    }
+}
+
+/// Whether ``getattr(instance, "__dict__")`` is ``PyObject_GenericGetDict``:
+/// the class's ``__dict__`` is the plain ``subtype_dict`` getset, and no
+/// builtin base with a dict of its own gives that getter another to defer to.
+fn plain_dict_attr(kind: *mut ffi::PyTypeObject, dict_name: &B<'_>, getter: Option<usize>) -> bool {
+    let Some(getter) = getter else {
+        return false;
+    };
+    unsafe {
+        let found = type_lookup(kind, dict_name.as_ptr());
+        if found.is_null() || ffi::Py_TYPE(found) != &raw mut ffi::PyGetSetDescr_Type {
+            return false;
+        }
+        let def = (*found.cast::<ffi::PyGetSetDescrObject>()).d_getset;
+        if (*def).get.map(|f| f as usize) != Some(getter) {
+            return false;
+        }
+        let mut each = kind;
+        while !(*each).tp_base.is_null() {
+            if (*each).tp_dictoffset != 0
+                && ffi::PyType_HasFeature(each, ffi::Py_TPFLAGS_HEAPTYPE) == 0
+            {
+                return false;
+            }
+            each = (*each).tp_base;
+        }
+        true
+    }
+}
+
+/// An object node holding only its ``py/object`` tag, sized for ``members``.
+fn object_node<'py>(py: Python<'py>, path: B<'py>, members: usize) -> PyResult<Bound<'py, PyDict>> {
+    let node = unsafe {
+        Bound::from_owned_ptr_or_err(py, _PyDict_NewPresized(members as ffi::Py_ssize_t + 1))?
+            .cast_into_unchecked::<PyDict>()
+    };
+    node.set_item(intern!(py, "py/object"), path)?;
+    Ok(node)
+}
+
 /// Read a slot at ``offset``, as ``getattr`` would: ``None`` when unset.
 #[inline]
 fn read_slot<'py>(obj: &B<'py>, offset: isize) -> Option<B<'py>> {
@@ -666,7 +773,7 @@ fn is_plain_key(key: &B<'_>) -> PyResult<bool> {
 /// # Safety
 /// ``key`` is a live object.
 #[inline(always)]
-unsafe fn plain_key_raw(key: *mut ffi::PyObject) -> bool {
+pub unsafe fn plain_key_raw(key: *mut ffi::PyObject) -> bool {
     unsafe {
         if ob_type(key) != t_str() {
             return false;
@@ -674,7 +781,7 @@ unsafe fn plain_key_raw(key: *mut ffi::PyObject) -> bool {
         let text = if compact_ascii_str(key) {
             ascii_bytes(key)
         } else {
-            match utf8_raw(key) {
+            match utf8_ptr(key) {
                 Some(text) => text,
                 None => return false,
             }
@@ -701,6 +808,14 @@ const IN_PLACE_DEPTH: usize = 48;
 
 /// The frame an escaped key's own parts hang from, Python's ``_IN_KEY``.
 const IN_KEY: u32 = 1;
+
+/// What ``_encode_reduce`` writes for a value: its protocols, a ``py/type``
+/// import path, or a ``py/reduce`` of these parts.
+enum Recipe<'py> {
+    Unreduced,
+    Path(B<'py>),
+    Parts(Vec<B<'py>>),
+}
 
 /// Where in its node a part is written.
 #[derive(Clone)]
@@ -744,6 +859,132 @@ fn write<'py>(node: &B<'py>, slot: &Slot<'py>, done: B<'py>) -> PyResult<()> {
     }
 }
 
+/// Whether ``value`` is an exact list or tuple of ``is_leaf_value`` items.
+#[inline]
+fn all_leaf_items(value: &B<'_>) -> bool {
+    let op = value.as_ptr();
+    let kind = tp(value);
+    let leaf = |item: *mut ffi::PyObject| {
+        let kind = ob_type(item);
+        kind == t_str()
+            || kind == t_int()
+            || kind == t_bool()
+            || kind == t_none()
+            || kind == t_float()
+    };
+    unsafe {
+        if kind == t_list() {
+            (0..ffi::PyList_GET_SIZE(op)).all(|at| leaf(ffi::PyList_GET_ITEM(op, at)))
+        } else if kind == t_tuple() {
+            (0..ffi::PyTuple_GET_SIZE(op)).all(|at| leaf(ffi::PyTuple_GET_ITEM(op, at)))
+        } else {
+            false
+        }
+    }
+}
+
+/// One entry of a JSON walk's stack.
+enum TextEntry<'py> {
+    /// A container a JSON walk has opened in its text, with parts to go.
+    Seq(Seq<'py>),
+    /// ``Check`` for a JSON walk: the reduce's text starts at ``offset``.
+    TextCheck {
+        value: B<'py>,
+        mark: usize,
+        offset: usize,
+        frame: u32,
+    },
+}
+
+/// The parts of a container a JSON walk writes, as the tree walk would
+/// queue them: each a leaf written at once, or a value encoded in its turn.
+struct Seq<'py> {
+    items: Items<'py>,
+    at: usize,
+    /// The frame the parts hang from.
+    frame: u32,
+    /// Whether the first part follows an entry already written, as an
+    /// object's members follow its ``py/object``.
+    after: bool,
+    close: Close,
+}
+
+enum Items<'py> {
+    Values(Vec<B<'py>>),
+    /// Each key, its value, and whether the key is still to be escaped; an
+    /// escaped key replaces the raw one when its entry is reached.
+    Entries(Vec<(B<'py>, B<'py>, bool)>),
+}
+
+/// The text that closes a container a JSON walk opened, and so the
+/// containers its parts sit in.
+#[derive(Clone, Copy)]
+enum Close {
+    /// ``]``: the parts are a list's items.
+    List,
+    /// ``}``: the parts are a dict's values.
+    Dict,
+    /// ``]}``: the parts are the items of a list that is a dict's one value,
+    /// under this tag.
+    Tagged(&'static str),
+}
+
+impl Close {
+    fn text(self) -> &'static [u8] {
+        match self {
+            Self::List => b"]",
+            Self::Dict => b"}",
+            Self::Tagged(_) => b"]}",
+        }
+    }
+}
+
+/// One step down the JSON text from a container to a part in it.
+enum Step<'py> {
+    Item(usize),
+    Key(B<'py>),
+}
+
+/// A part of the tree that only ``json`` writes exactly: a value ``json``
+/// writes otherwise than the writer would, or raises for, or nests deeper
+/// than the writer goes. Its text is left out at ``offset`` and filled in
+/// once the walk is done, as ``json.dumps`` would write it at ``path``.
+struct Hole<'py> {
+    offset: usize,
+    tree: B<'py>,
+    path: Vec<Step<'py>>,
+}
+
+/// What ``text_leaf`` did with a value.
+#[derive(PartialEq, Eq)]
+enum Leaf {
+    /// Wrote it.
+    Written,
+    /// Wrote nothing: the value is no leaf.
+    Other,
+    /// Wrote nothing: the value is a leaf the writer cannot write exactly.
+    Unwritable,
+}
+
+/// Past this many entries on a JSON walk's stack, a node is written from
+/// its tree, so the text the walk writes itself nests at most twice as
+/// deep, plus the few levels a node writes inline: within ``json``'s
+/// ``MAX_DEPTH``, where the writer and ``json`` agree.
+const TEXT_DEPTH: usize = 96;
+
+impl Items<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Values(values) => values.len(),
+            Self::Entries(entries) => entries.len(),
+        }
+    }
+}
+
+/// A JSON walk's result: it stops only on a Python error, as the tree walk
+/// would raise it.
+type Text<T> = PyResult<T>;
+
 struct Encoder<'py, 'g> {
     py: Python<'py>,
     g: &'g EncGlobals,
@@ -778,9 +1019,23 @@ struct Encoder<'py, 'g> {
     /// The frame of each place in ``linked``, by address; ``linked`` holds
     /// every place keyed here, so no address is reused.
     linked_frames: HashMap<usize, u32>,
+    /// The text a JSON walk writes; unused by a tree walk.
+    w: Writer,
+    /// A JSON walk's open containers and reduce checkpoints.
+    text_stack: Vec<TextEntry<'py>>,
+    /// Emptied ``Items`` vectors of finished containers, reused by the next
+    /// ones a JSON walk opens.
+    spare_values: Vec<Vec<B<'py>>>,
+    spare_entries: Vec<Vec<(B<'py>, B<'py>, bool)>>,
+    /// The parts a JSON walk left for ``json`` to write, in text order.
+    holes: Vec<Hole<'py>>,
 }
 
+/// Spare ``Items`` vectors a JSON walk keeps; enough for its nesting depth.
+const SPARE_LIMIT: usize = 64;
+
 impl<'py, 'g> Encoder<'py, 'g> {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'py>,
         g: &'g EncGlobals,
@@ -789,6 +1044,7 @@ impl<'py, 'g> Encoder<'py, 'g> {
         hooks: B<'py>,
         sort: Flag<'py>,
         classes: Classes,
+        w: Writer,
     ) -> PyResult<Self> {
         let hooks_are_immutable_empty = hooks.is(g.default_hooks.bind(py)) && hooks.len()? == 0;
         let generation = sync::ENCODE.rewrites();
@@ -825,6 +1081,11 @@ impl<'py, 'g> Encoder<'py, 'g> {
             synced: 0,
             linked: Vec::new(),
             linked_frames: HashMap::new(),
+            w,
+            text_stack: Vec::new(),
+            spare_values: Vec::new(),
+            spare_entries: Vec::new(),
+            holes: Vec::new(),
         };
         Ok(encoder)
     }
@@ -977,7 +1238,7 @@ impl<'py, 'g> Encoder<'py, 'g> {
     /// ``raw`` is a live object.
     #[inline(always)]
     unsafe fn plain_raw(&self, raw: *mut ffi::PyObject) -> bool {
-        let kind = unsafe { ob_type(raw) };
+        let kind = ob_type(raw);
         if kind == t_str() || kind == t_int() || kind == t_bool() || kind == t_none() {
             return true;
         }
@@ -1221,12 +1482,53 @@ impl<'py, 'g> Encoder<'py, 'g> {
                 path: None,
                 layouts: [None, None],
                 enum_member: None,
-                dict_order: None,
+                own_reduce: None,
             };
             let stale = self.classes.insert(key, info);
             drop(stale);
         }
         self.classes.get_mut(&key)
+    }
+
+    /// A class whose kept facts say it encodes as a plain object: the path
+    /// ``class_path`` would give and, where the sort is known without asking,
+    /// the layout ``layout`` would give, in one probe of the class cache.
+    fn cached_object(&mut self, kind: &B<'py>) -> PyResult<Option<(B<'py>, Option<SortLayout>)>> {
+        let now = self.current()?;
+        let Some(info) = self.known(kind, now) else {
+            return Ok(None);
+        };
+        if !matches!(&info.encoder, Some(Kept::Native(Nat::Object))) {
+            return Ok(None);
+        }
+        let Some(path) = &info.path else {
+            return Ok(None);
+        };
+        let path = path.bind(self.py).clone();
+        let pre = match self.sort {
+            Flag::Known(sort) if self.env.names_own => info.layouts[usize::from(sort)]
+                .clone()
+                .filter(|layout| layout.stamp.holds(kind))
+                .map(|layout| (layout, sort)),
+            _ => None,
+        };
+        Ok(Some((path, pre)))
+    }
+
+    /// ``layout(kind, sort)`` and the sort, while its stamp holds, where the
+    /// sort is known without asking: the first call ``object_members`` makes,
+    /// made early.
+    fn known_layout(&mut self, kind: &B<'py>) -> PyResult<Option<SortLayout>> {
+        let Flag::Known(sort) = self.sort else {
+            return Ok(None);
+        };
+        if !self.env.names_own {
+            return Ok(None);
+        }
+        Ok(self
+            .layout(kind, sort)?
+            .filter(|layout| layout.stamp.holds(kind))
+            .map(|layout| (layout, sort)))
     }
 
     /// ``value`` encoded as ``_encode_object`` with its slots read in place,
@@ -1248,7 +1550,9 @@ impl<'py, 'g> Encoder<'py, 'g> {
         let plan = move |info: &ClassInfo| {
             let layout = info.layouts[usize::from(sort)].as_ref()?;
             match (&info.encoder, &info.path) {
-                (Some(Kept::Native(Nat::Object)), Some(path)) if layout.direct => {
+                (Some(Kept::Native(Nat::Object)), Some(path))
+                    if matches!(layout.reading, Reading::Slots | Reading::Dict) =>
+                {
                     Some((path.bind(py).clone(), layout.clone()))
                 }
                 _ => None,
@@ -1256,14 +1560,49 @@ impl<'py, 'g> Encoder<'py, 'g> {
         };
         let planned = match (self.known(kind, now), now) {
             (Some(info), _) => plan(info),
-            (None, Some(now)) => return self.first_sight(value, kind, frame, now, sort),
-            (None, None) => return Ok(None),
+            (None, Some(now)) => {
+                return self.first_sight(value, kind, frame, now, sort);
+            }
+            (None, _) => return Ok(None),
         };
         let Some((path, layout)) = planned else {
             return Ok(None);
         };
-        self.register(value, frame);
-        self.direct_object(value, path, &layout, frame).map(Some)
+        self.object_fast(value, kind, path, &layout, sort, frame, true)
+    }
+
+    /// ``encode_object`` read from ``layout``: a ``Reading::Slots`` class's
+    /// slots, or a ``Reading::Dict`` instance's dict by ``dict_read``. ``None``, with nothing
+    /// registered, where neither applies. ``register`` registers ``value``
+    /// once the read is certain, for a caller that has not.
+    #[allow(clippy::too_many_arguments)]
+    fn object_fast(
+        &mut self,
+        value: &B<'py>,
+        kind: &B<'py>,
+        path: B<'py>,
+        layout: &Layout,
+        sort: bool,
+        frame: u32,
+        register: bool,
+    ) -> PyResult<Option<B<'py>>> {
+        if layout.reading == Reading::Slots {
+            if register {
+                self.register(value, frame);
+            }
+            return self.direct_object(value, path, layout, frame).map(Some);
+        }
+        if !(layout.reading == Reading::Dict && layout.stamp.holds(kind)) {
+            return Ok(None);
+        }
+        let mut found = [std::ptr::null_mut(); DICT_LIMIT];
+        let Some((_dict, order)) = self.dict_read(value, kind, layout, sort, &mut found)? else {
+            return Ok(None);
+        };
+        if register {
+            self.register(value, frame);
+        }
+        self.dict_object(path, &order, &found, frame).map(Some)
     }
 
     fn native_or_foreign(&self, func: B<'py>) -> Enc<'py> {
@@ -1358,7 +1697,7 @@ impl<'py, 'g> Encoder<'py, 'g> {
                 path: Some(path.clone().unbind()),
                 layouts,
                 enum_member: None,
-                dict_order: None,
+                own_reduce: None,
             };
             let stale = self.classes.insert(key, info);
             drop(stale);
@@ -1602,8 +1941,7 @@ impl<'py, 'g> Encoder<'py, 'g> {
     /// read with no Python code; ``None`` for ``layout``'s general reading.
     fn class_layout(&self, kind: &B<'py>, before: &Stamp, sort: bool) -> Option<Rc<Layout>> {
         let class = kind.as_ptr().cast::<ffi::PyTypeObject>();
-        if unsafe { ob_type(kind.as_ptr()) } != &raw mut ffi::PyType_Type || !generic_getattr(class)
-        {
+        if ob_type(kind.as_ptr()) != &raw mut ffi::PyType_Type || !generic_getattr(class) {
             return None;
         }
         own_layout(class, before, sort, self.py).map(Rc::new)
@@ -1619,24 +1957,44 @@ impl<'py, 'g> Encoder<'py, 'g> {
     ) -> PyResult<Rc<Layout>> {
         let class = kind.as_ptr().cast::<ffi::PyTypeObject>();
         let generic = generic_getattr(class);
+        // Perf: exp000 to_plain, lockstep: ~1.01x (from 78512ab).
+        // ``__getattr__`` over ``object.__getattribute__``: the hook reads a
+        // set slot generically, and calls ``__getattr__`` only for an unset one.
+        let hooked = !generic
+            && unsafe { (*class).tp_getattro }.map(|f| f as usize) == self.g.getattr_hook
+            && unsafe { type_lookup(class, intern!(self.py, "__getattribute__").as_ptr()) }
+                == self.g.object_getattribute.as_ptr();
         let slots: Vec<(B<'py>, Option<isize>)> = slots
             .into_iter()
             .map(|name| {
-                let offset = generic.then(|| slot_offset(class, &name)).flatten();
+                let offset = (generic || hooked)
+                    .then(|| slot_offset(class, &name))
+                    .flatten();
                 (name, offset)
             })
             .collect();
         let py = self.py;
-        let dictless = generic && dictless(class, py);
-        let direct = dictless
-            && slots.iter().all(|(name, offset)| {
-                offset.is_some()
-                    && tp(name) == t_str()
-                    && utf8(name).is_some_and(|text| {
-                        !text.starts_with(b"py/") && !text.starts_with(b"json://")
-                    })
-            });
-        let layout = Rc::new(Layout::new(py, Stamp::always(kind), slots, direct)?);
+        // A ``__getattr__`` makes lookup other than generic, so a generic
+        // class's ``getattr(obj, "__dict__", None)`` runs no code.
+        let reading = if hooked {
+            Reading::Hooked
+        } else if generic && dictless(class, py) {
+            Reading::Slots
+        } else if generic
+            && slots.is_empty()
+            && plain_dict_attr(class, intern!(py, "__dict__").as_any(), self.g.dict_getter)
+        {
+            Reading::Dict
+        } else {
+            Reading::Generic
+        };
+        let (names, offsets): (Vec<_>, Vec<_>) = slots.into_iter().unzip();
+        let layout = Rc::new(Layout::new(
+            Stamp::always(kind),
+            PyTuple::new(py, names)?,
+            offsets.into_boxed_slice(),
+            reading,
+        ));
         if let Some(info) = self.keep(kind, now, before) {
             info.layouts[usize::from(sort)] = Some(layout.clone());
         }
@@ -1662,7 +2020,7 @@ impl<'py, 'g> Encoder<'py, 'g> {
         let subtype = |base: &Py<PyAny>| unsafe {
             ffi::PyType_IsSubtype(class, base.as_ptr().cast::<ffi::PyTypeObject>()) != 0
         };
-        let lookup = |name: &Bound<'py, PyString>| unsafe { _PyType_Lookup(class, name.as_ptr()) };
+        let lookup = |name: &Bound<'py, PyString>| unsafe { type_lookup(class, name.as_ptr()) };
         let fast = subtype(&self.g.enum_type)
             && !subtype(&self.g.pure_path)
             && !subtype(&self.g.partial)
@@ -1945,11 +2303,11 @@ impl<'py, 'g> Encoder<'py, 'g> {
     /// ``_ordered``: a set's members sorted by ``(repr, encoded JSON)``.
     fn ordered(&mut self, members: &B<'py>, frame: u32) -> PyResult<Bound<'py, PyList>> {
         let all: Vec<B<'py>> = members.try_iter()?.collect::<PyResult<_>>()?;
-        if all.iter().all(is_leaf_value) {
+        if all.iter().all(is_leaf_value) && json::current_dumps(self.py)?.1 {
             // Distinct leaves have distinct reprs, except NaNs, which also
             // encode alike; so the JSON half of the key would decide nothing,
             // and it is skipped. Python still calls ``json.dumps`` for each
-            // member, so only a replaced ``json.dumps`` sees a difference.
+            // member, so a replaced one is called here as there.
             let keyed: Vec<([B<'py>; 1], B<'py>)> = all
                 .into_iter()
                 .map(|member| Ok(([member.repr()?.into_any()], member)))
@@ -2000,10 +2358,25 @@ impl<'py, 'g> Encoder<'py, 'g> {
             }
         }
         self.register(value, frame);
-        let node = unsafe { Bound::from_owned_ptr_or_err(py, ffi::PyDict_Copy(source))? };
+        let node = unsafe {
+            Bound::from_owned_ptr_or_err(py, ffi::PyDict_Copy(source))?
+                .cast_into_unchecked::<PyDict>()
+        };
+        self.own_parts(&node, frame)?;
+        Ok(Some(node.into_any()))
+    }
+
+    /// ``_push_values`` for a node this walk alone holds, every key an exact
+    /// str: each value, as ``part`` takes it. The node already holds every
+    /// member, read before any is encoded, so code an encoding runs cannot
+    /// change or free what is still to come.
+    fn own_parts(&mut self, node: &Bound<'py, PyDict>, frame: u32) -> PyResult<()> {
+        let py = self.py;
         let base = self.stack.len();
-        // ``node`` is this walk's own dict, which no other code sees: setting
-        // a key it holds never resizes it, so its iteration stays valid.
+        let shared = node.as_any();
+        let (mut key, mut item) = (std::ptr::null_mut(), std::ptr::null_mut());
+        // No other code sees ``node``, and setting a key it holds never
+        // resizes it, so its iteration stays valid.
         let mut position: ffi::Py_ssize_t = 0;
         while unsafe { ffi::PyDict_Next(node.as_ptr(), &mut position, &mut key, &mut item) } != 0 {
             if unsafe { self.plain_raw(item) } {
@@ -2011,10 +2384,10 @@ impl<'py, 'g> Encoder<'py, 'g> {
             }
             let part = unsafe { Bound::from_borrowed_ptr(py, item) };
             let key = unsafe { Bound::from_borrowed_ptr(py, key) };
-            self.part(&node, Slot::Key(key), part, frame)?;
+            self.part(shared, Slot::Key(key), part, frame)?;
         }
         self.queued(base);
-        Ok(Some(node))
+        Ok(())
     }
 
     fn encode_dict(&mut self, value: &B<'py>, frame: u32) -> PyResult<B<'py>> {
@@ -2080,21 +2453,23 @@ impl<'py, 'g> Encoder<'py, 'g> {
     /// hang from ``IN_KEY``, which ``reference`` refuses to name.
     fn escape_key(&mut self, key: &B<'py>) -> PyResult<B<'py>> {
         let py = self.py;
-        let text = match leaf_key_text(key)? {
-            Some(text) => text,
-            None => {
-                let _guard = Recursion::enter(py, c" while encoding")?;
-                let mark = self.alive.len();
-                let encoded = self.walk(key, IN_KEY);
-                self.rollback(mark)?;
-                let text = self
-                    .b(&self.g.json)
-                    .getattr(intern!(py, "dumps"))?
-                    .call1((encoded?,))?;
-                text.str()?.to_cow()?.into_owned()
-            }
+        // ``json``'s own ``dumps`` writes a leaf key as known without asking;
+        // a replaced one is asked, as Python asks it.
+        if json::current_dumps(py)?.1
+            && let Some(text) = leaf_key_text(key)?
+        {
+            return Ok(pystr(py, &format!("json://{text}")));
+        }
+        let encoded = {
+            let _guard = Recursion::enter(py, c" while encoding")?;
+            let mark = self.alive.len();
+            let encoded = self.walk(key, IN_KEY);
+            self.rollback(mark)?;
+            encoded?
         };
-        Ok(pystr(py, &format!("json://{text}")))
+        let text = json::current_dumps(py)?.0.call1((encoded,))?;
+        // ``"json://" + text``, which takes only what ``str`` adds to.
+        intern!(py, "json://").add(text)
     }
 
     fn encode_object(&mut self, value: &B<'py>, kind: &B<'py>, frame: u32) -> PyResult<B<'py>> {
@@ -2104,10 +2479,11 @@ impl<'py, 'g> Encoder<'py, 'g> {
         if self.env.names_own {
             let sort = self.sort.get()?;
             if let Some(layout) = self.layout(kind, sort)?
-                && layout.direct
                 && layout.stamp.holds(kind)
+                && let Some(done) =
+                    self.object_fast(value, kind, path.clone(), &layout, sort, frame, false)?
             {
-                return self.direct_object(value, path, &layout, frame);
+                return Ok(done);
             }
         }
         let members = self.object_members(value, kind)?;
@@ -2124,6 +2500,119 @@ impl<'py, 'g> Encoder<'py, 'g> {
         }
         self.push_values(&node, frame)?;
         Ok(node.into_any())
+    }
+
+    /// ``encode_object``'s node for a ``Reading::Dict`` instance whose
+    /// members ``dict_read`` read into ``found``: a presized dict holding
+    /// every member, then its parts taken as ``own_parts`` takes them.
+    fn dict_object(
+        &mut self,
+        path: B<'py>,
+        keys: &DictKeys,
+        found: &[*mut ffi::PyObject; DICT_LIMIT],
+        frame: u32,
+    ) -> PyResult<B<'py>> {
+        let py = self.py;
+        let pending = self.g.pending.as_ptr();
+        let node = object_node(py, path, keys.members.len())?;
+        let mut parts = false;
+        // The caller holds the instance dict, which holds each member until
+        // the node does; no code runs between.
+        for &(index, _) in &keys.members {
+            let member = found[index as usize];
+            if member == pending {
+                continue;
+            }
+            let name = keys.keys[index as usize].as_ptr();
+            if unsafe { ffi::PyDict_SetItem(node.as_ptr(), name, member) } < 0 {
+                return Err(PyErr::fetch(py));
+            }
+            parts = parts || !unsafe { self.plain_raw(member) };
+        }
+        if parts {
+            self.own_parts(&node, frame)?;
+        }
+        Ok(node.into_any())
+    }
+
+    // Perf: rows to_plain, lockstep: flat and frozen ~1.5x (from 78512ab).
+    /// ``attribute_names`` and ``getattr`` for an instance of a
+    /// ``Reading::Dict`` class whose stamp holds, read from its dict with no
+    /// code run: the dict and its ``DictKeys``, with ``found`` filled in
+    /// insertion order. ``found`` is borrowed from the dict, which holds its
+    /// members only until code runs: a caller takes its own reference to
+    /// each before running any. ``None`` where a key or the dict is not one
+    /// that reads so, for the generic reading to take over.
+    fn dict_read(
+        &self,
+        value: &B<'py>,
+        kind: &B<'py>,
+        layout: &Layout,
+        sort: bool,
+        found: &mut [*mut ffi::PyObject; DICT_LIMIT],
+    ) -> PyResult<Option<DictRead<'py>>> {
+        let py = self.py;
+        let dict = unsafe {
+            Bound::from_owned_ptr_or_err(
+                py,
+                PyObject_GenericGetDict(value.as_ptr(), std::ptr::null_mut()),
+            )?
+        };
+        // A dict subclass is iterated and tested through its own methods.
+        if tp(&dict) != t_dict() {
+            return Ok(None);
+        }
+        let size = unsafe { (*dict.as_ptr().cast::<ffi::PyDictObject>()).ma_used } as usize;
+        if size > DICT_LIMIT {
+            return Ok(None);
+        }
+        let mut keys = [std::ptr::null_mut(); DICT_LIMIT];
+        let (mut pos, mut at) = (0, 0);
+        let (mut key, mut item) = (std::ptr::null_mut(), std::ptr::null_mut());
+        while at < size
+            && unsafe { ffi::PyDict_Next(dict.as_ptr(), &mut pos, &mut key, &mut item) } != 0
+        {
+            keys[at] = key;
+            found[at] = item;
+            at += 1;
+        }
+        let keys = &keys[..at];
+        let cached = layout.dict_keys.borrow().clone();
+        if let Some(known) = cached
+            && known.keys.len() == keys.len()
+            && known
+                .keys
+                .iter()
+                .zip(keys)
+                .all(|(each, &key)| each.as_ptr() == key)
+        {
+            return Ok(Some((dict, known)));
+        }
+        let class = kind.as_ptr().cast::<ffi::PyTypeObject>();
+        let mut names = Vec::with_capacity(keys.len());
+        for &key in keys {
+            let name = unsafe { B::from_borrowed_ptr(py, key) };
+            if !is_clean_name(&name) || !unshadowed(class, key) {
+                return Ok(None);
+            }
+            names.push(name);
+        }
+        let mut order: Vec<u8> = (0..keys.len() as u8).collect();
+        if sort {
+            // UTF-8 byte order is code point order, which is how ``sorted``
+            // orders exact strs.
+            order.sort_by(|&a, &b| utf8(&names[a as usize]).cmp(&utf8(&names[b as usize])));
+        }
+        let members = order
+            .into_iter()
+            .map(|index| (index, json::plain_key_text(&names[index as usize])))
+            .collect();
+        let keys = Rc::new(DictKeys {
+            keys: names.into_iter().map(Bound::unbind).collect(),
+            members,
+        });
+        layout.dict_keys.replace(Some(keys.clone()));
+        Ok(Some((dict, keys)))
     }
 
     /// ``encode_object`` for an instance whose members are exactly its
@@ -2151,15 +2640,11 @@ impl<'py, 'g> Encoder<'py, 'g> {
         frame: u32,
     ) -> PyResult<B<'py>> {
         let py = self.py;
-        let size = offsets.len() + 1;
-        let node = unsafe {
-            Bound::from_owned_ptr_or_err(py, _PyDict_NewPresized(size as ffi::Py_ssize_t))?
-                .cast_into_unchecked::<PyDict>()
-        };
-        node.set_item(intern!(py, "py/object"), path)?;
+        let node = object_node(py, path, offsets.len())?;
         let pending = self.g.pending.as_ptr();
-        let base = self.stack.len();
-        let shared = node.as_any();
+        let mut parts = false;
+        // The walk holds the instance, which holds each member until the
+        // node does; no code runs between.
         for (index, offset) in offsets.iter().enumerate() {
             let Some(offset) = offset else {
                 continue;
@@ -2174,20 +2659,15 @@ impl<'py, 'g> Encoder<'py, 'g> {
             if member.is_null() || member == pending {
                 continue;
             }
-            // The layout holds its names, and the walk holds the instance,
-            // which holds the member while no Python code runs.
             let name = unsafe { ffi::PyTuple_GET_ITEM(names, index as ffi::Py_ssize_t) };
             if unsafe { ffi::PyDict_SetItem(node.as_ptr(), name, member) } < 0 {
                 return Err(PyErr::fetch(py));
             }
-            if unsafe { self.plain_raw(member) } {
-                continue;
-            }
-            let key = unsafe { Bound::from_borrowed_ptr(py, name) };
-            let member = unsafe { Bound::from_borrowed_ptr(py, member) };
-            self.part(shared, Slot::Key(key), member, frame)?;
+            parts = parts || !unsafe { self.plain_raw(member) };
         }
-        self.queued(base);
+        if parts {
+            self.own_parts(&node, frame)?;
+        }
         Ok(node.into_any())
     }
 
@@ -2219,6 +2699,23 @@ impl<'py, 'g> Encoder<'py, 'g> {
             }
             return Ok(members);
         };
+        if layout.reading == Reading::Dict && layout.stamp.holds(kind) {
+            let mut found = [std::ptr::null_mut(); DICT_LIMIT];
+            if let Some((_dict, keys)) = self.dict_read(value, kind, &layout, sort, &mut found)? {
+                let pending = self.g.pending.as_ptr();
+                return Ok(keys
+                    .members
+                    .iter()
+                    .filter(|&&(index, _)| found[index as usize] != pending)
+                    .map(|&(index, _)| unsafe {
+                        (
+                            keys.keys[index as usize].bind(py).clone(),
+                            B::from_borrowed_ptr(py, found[index as usize]),
+                        )
+                    })
+                    .collect());
+            }
+        }
         // ``attribute_names``' own reading of the instance: its ``__dict__``
         // keys that are not slots, after the slots, sorted together if asked.
         let mut extra = Vec::new();
@@ -2231,12 +2728,6 @@ impl<'py, 'g> Encoder<'py, 'g> {
         } else {
             optional_attr(value, intern!(py, "__dict__").as_any())?
         };
-        if layout.len() == 0
-            && let Some(state) = &state
-            && let Some(members) = self.dict_members(value, kind, state, sort)?
-        {
-            return Ok(members);
-        }
         if let Some(state) = state
             && state.is_truthy()?
         {
@@ -2285,111 +2776,6 @@ impl<'py, 'g> Encoder<'py, 'g> {
         Ok(members)
     }
 
-    /// The members of a slotless object read straight from its ``__dict__``,
-    /// or ``None`` where ``getattr`` might answer otherwise.
-    ///
-    /// ``getattr`` returns the instance dict's entry unless the class has a
-    /// data descriptor of that name, or its lookup is not ``object``'s; and
-    /// only when ``__dict__`` is the dict that lookup reads. With exact str
-    /// keys no Python code runs, so the dict cannot change while it is read.
-    fn dict_members(
-        &mut self,
-        value: &B<'py>,
-        kind: &B<'py>,
-        state: &B<'py>,
-        sort: bool,
-    ) -> PyResult<Option<Vec<(B<'py>, B<'py>)>>> {
-        let py = self.py;
-        let class = kind.as_ptr().cast::<ffi::PyTypeObject>();
-        if tp(state) != t_dict() || !generic_getattr(class) {
-            return Ok(None);
-        }
-        let generic = unsafe {
-            Bound::from_owned_ptr_or_opt(
-                py,
-                PyObject_GenericGetDict(value.as_ptr(), std::ptr::null_mut()),
-            )
-        };
-        match generic {
-            Some(generic) if generic.is(state) => {}
-            Some(_) => return Ok(None),
-            None => {
-                unsafe { ffi::PyErr_Clear() };
-                return Ok(None);
-            }
-        }
-        let entries = dict_entries(unsafe { state.cast_unchecked::<PyDict>() });
-        // The order and the descriptor check are kept per class only while the
-        // class is unchanged, so its keys need no fresh lookup.
-        let now = self.current()?;
-        let known = self
-            .known(kind, now)
-            .and_then(|info| info.dict_order.as_ref());
-        if let Some(order) = known
-            && order.keys.len() == entries.len()
-            && order
-                .keys
-                .iter()
-                .zip(&entries)
-                .all(|(key, (each, _))| key.as_ptr() == each.as_ptr())
-        {
-            let pending = self.b(&self.g.pending);
-            let mut members = Vec::with_capacity(entries.len());
-            let pick = |index: usize| entries[index].clone();
-            if sort {
-                for &index in &order.sorted {
-                    let (key, member) = pick(index);
-                    if !member.is(pending) {
-                        members.push((key, member));
-                    }
-                }
-            } else {
-                for index in 0..entries.len() {
-                    let (key, member) = pick(index);
-                    if !member.is(pending) {
-                        members.push((key, member));
-                    }
-                }
-            }
-            return Ok(Some(members));
-        }
-        let before = Stamp::always(kind);
-        let mut keyed = Vec::with_capacity(entries.len());
-        for (index, (key, _)) in entries.iter().enumerate() {
-            if tp(key) != t_str() {
-                return Ok(None);
-            }
-            let found = unsafe { _PyType_Lookup(class, key.as_ptr()) };
-            if !found.is_null() && unsafe { (*ob_type(found)).tp_descr_set.is_some() } {
-                return Ok(None);
-            }
-            keyed.push(([key.clone()], index));
-        }
-        let sorted = sorted_by_keys(py, keyed)?;
-        let order = DictOrder {
-            keys: entries
-                .iter()
-                .map(|(key, _)| key.clone().unbind())
-                .collect(),
-            sorted: sorted.clone(),
-        };
-        let pending = self.b(&self.g.pending).clone();
-        let indices: Vec<usize> = if sort {
-            sorted
-        } else {
-            (0..entries.len()).collect()
-        };
-        let members = indices
-            .into_iter()
-            .map(|index| entries[index].clone())
-            .filter(|(_, member)| !member.is(&pending))
-            .collect();
-        if let Some(info) = self.keep(kind, now, &before) {
-            info.dict_order = Some(order);
-        }
-        Ok(Some(members))
-    }
-
     /// ``getattr(value, name, PENDING)`` unless that is ``PENDING``, read
     /// from the slot's offset while the class is as the layout found it.
     fn member(
@@ -2399,11 +2785,15 @@ impl<'py, 'g> Encoder<'py, 'g> {
         name: &B<'py>,
         slot: Option<(&Layout, usize)>,
     ) -> PyResult<Option<B<'py>>> {
-        let offset = slot
-            .filter(|(layout, _)| layout.stamp.holds(kind))
-            .and_then(|(layout, index)| layout.offsets[index]);
+        let held = slot.filter(|(layout, _)| layout.stamp.holds(kind));
+        let offset = held.and_then(|(layout, index)| layout.offsets[index]);
         let found = match offset {
-            Some(offset) => read_slot(value, offset),
+            Some(offset) => match read_slot(value, offset) {
+                None if held.is_some_and(|(layout, _)| layout.reading == Reading::Hooked) => {
+                    optional_attr(value, name)?
+                }
+                found => found,
+            },
             None => optional_attr(value, name)?,
         };
         Ok(found.filter(|member| !member.is(self.b(&self.g.pending))))
@@ -2431,38 +2821,10 @@ impl<'py, 'g> Encoder<'py, 'g> {
         slot: &Slot<'py>,
     ) -> PyResult<B<'py>> {
         let py = self.py;
-        let recipe = if self.enum_member(kind)? {
-            self.enum_recipe(value, kind)?
-        } else {
-            None
-        };
-        let native = match recipe {
-            Some(parts) => Some(parts),
-            None if self.env.reduce_own => self.native_reduce(value)?,
-            None => None,
-        };
-        let mut parts = match native {
-            Some(parts) if parts.is_empty() => return self.encode_unreduced(value, frame),
-            // A bare-name reduce, its path verified natively.
-            Some(mut parts) if parts.len() == 1 => {
-                return self.tagged(intern!(py, "py/type"), parts.remove(0));
-            }
-            Some(parts) => parts,
-            None => {
-                let recipe = self.env.canonical_reduce.bind(py).call1((value,))?;
-                if recipe.is_none() {
-                    return self.encode_unreduced(value, frame);
-                }
-                // A bare-name reduce names a module global, written as an
-                // import path.
-                if is_str(&recipe) {
-                    let module = kind.getattr(intern!(py, "__module__"))?;
-                    let path = format!("{}.{}", module.str()?.to_cow()?, recipe.str()?.to_cow()?);
-                    let path = self.env.verified_path.bind(py).call1((path, value))?;
-                    return self.tagged(intern!(py, "py/type"), path);
-                }
-                recipe.try_iter()?.collect::<PyResult<Vec<_>>>()?
-            }
+        let mut parts = match self.recipe(value, kind)? {
+            Recipe::Unreduced => return self.encode_unreduced(value, frame),
+            Recipe::Path(path) => return self.tagged(intern!(py, "py/type"), path),
+            Recipe::Parts(parts) => parts,
         };
         let mark = self.alive.len();
         // A hashable value with no state beyond its arguments (an enum
@@ -2486,19 +2848,67 @@ impl<'py, 'g> Encoder<'py, 'g> {
         self.tagged(intern!(py, "py/reduce"), parts.into_any())
     }
 
-    /// ``_canonical_reduce(value)``, read natively: ``Some(empty)`` where it
-    /// gives ``None``, ``None`` where Python must answer (a str recipe, a
-    /// ``PurePath`` or ``partial``, which it rewrites).
-    fn native_reduce(&self, value: &B<'py>) -> PyResult<Option<Vec<B<'py>>>> {
+    /// Whether ``kind``'s ``__reduce_ex__(2)`` is ``object``'s own calling a
+    /// custom ``__reduce__``, with no instance dict to shadow either and a
+    /// plain ``type`` metaclass, through which ``object.__reduce_ex__`` reads
+    /// it, so the recipe can be read without Python's ``_canonical_reduce``.
+    fn own_reduce(&mut self, kind: &B<'py>) -> PyResult<bool> {
+        let now = self.current()?;
+        if !self.env.reduce_own {
+            return Ok(false);
+        }
+        if let Some(info) = self.known(kind, now)
+            && let Some(own) = info.own_reduce
+        {
+            return Ok(own);
+        }
+        let before = Stamp::always(kind);
         let py = self.py;
-        let class = tp(value);
-        let subtype = |base: &Py<PyAny>| unsafe {
-            ffi::PyType_IsSubtype(class, base.as_ptr().cast::<ffi::PyTypeObject>()) != 0
-        };
-        if subtype(&self.g.pure_path) || subtype(&self.g.partial) {
+        let class = kind.as_ptr().cast::<ffi::PyTypeObject>();
+        let lookup = |name: &Bound<'py, PyString>| unsafe { type_lookup(class, name.as_ptr()) };
+        let reduce = lookup(intern!(py, "__reduce__"));
+        // Only a plain function, or an attribute with no ``__get__``, binds
+        // with no code run. Anything else (a property, say) may raise on
+        // access, where ``object.__reduce_ex__`` turns an ``AttributeError``
+        // into copyreg's recipe; Python's own reading handles that.
+        let plain = !reduce.is_null()
+            && unsafe {
+                let kind = ob_type(reduce);
+                kind == &raw mut ffi::PyFunction_Type || (*kind).tp_descr_get.is_none()
+            };
+        let own = ob_type(kind.as_ptr()) == &raw mut ffi::PyType_Type
+            && generic_getattr(class)
+            && unsafe { (*class).tp_dictoffset == 0 }
+            && unsafe { ffi::PyType_HasFeature(class, ffi::Py_TPFLAGS_MANAGED_DICT) == 0 }
+            && lookup(intern!(py, "__reduce_ex__")) == self.g.object_reduce_ex.as_ptr()
+            && plain
+            && reduce != self.g.object_reduce.as_ptr();
+        if let Some(info) = self.keep(kind, now, &before) {
+            info.own_reduce = Some(own);
+        }
+        Ok(own)
+    }
+
+    /// ``_canonical_reduce(value)`` without Python's function, where
+    /// ``own_reduce`` holds: ``Some(None)`` where it gives ``None``, ``None``
+    /// where Python's own reading is needed.
+    fn own_recipe(&mut self, value: &B<'py>, kind: &B<'py>) -> PyResult<Option<Option<B<'py>>>> {
+        if !self.own_reduce(kind)? {
             return Ok(None);
         }
-        let reduced = match value.call_method1(intern!(py, "__reduce_ex__"), (2,)) {
+        let py = self.py;
+        let class = kind.as_ptr().cast::<ffi::PyTypeObject>();
+        let found = unsafe { type_lookup(class, intern!(py, "__reduce__").as_ptr()) };
+        // ``_PyObject_LookupSpecial`` binds what it finds, as lookup does.
+        let callable = unsafe {
+            match (*ob_type(found)).tp_descr_get {
+                Some(get) => {
+                    Bound::from_owned_ptr_or_err(py, get(found, value.as_ptr(), kind.as_ptr()))?
+                }
+                None => B::from_borrowed_ptr(py, found),
+            }
+        };
+        let reduced = match callable.call0() {
             Ok(reduced) => reduced,
             Err(error)
                 if error.is_instance_of::<PyAttributeError>(py)
@@ -2506,58 +2916,143 @@ impl<'py, 'g> Encoder<'py, 'g> {
                     || error.is_instance_of::<PyTypeError>(py)
                     || error.is_instance_of::<PyValueError>(py) =>
             {
-                return Ok(Some(Vec::new()));
+                return Ok(Some(None));
             }
             Err(error) => return Err(error),
         };
-        if is_str(&reduced) {
-            return Ok(self.global_path(value, &reduced)?.map(|path| vec![path]));
-        }
-        if !is_tuple(&reduced) {
-            return Ok(Some(Vec::new()));
-        }
-        let reduced = unsafe { reduced.cast_unchecked::<PyTuple>() };
-        let size = reduced.len();
-        if !(2..=5).contains(&size) {
-            return Ok(Some(Vec::new()));
-        }
-        let func = reduced.get_item(0)?;
-        let args = reduced.get_item(1)?;
-        if !is_callable(&func) || !is_tuple(&args) {
-            return Ok(Some(Vec::new()));
-        }
-        let mut parts = Vec::with_capacity(size);
-        parts.push(func);
-        parts.push(args);
-        for index in 2..size {
-            let part = reduced.get_item(index)?;
-            // ``list(part)`` for the list and dict item iterators.
-            let part = if (index == 3 || index == 4) && !part.is_none() {
-                let listed = unsafe { ffi::PySequence_List(part.as_ptr()) };
-                unsafe { Bound::from_owned_ptr_or_err(py, listed)? }
-            } else {
-                part
-            };
-            parts.push(part);
-        }
-        Ok(Some(parts))
+        Ok(Some(self.canonical_recipe(value, &reduced)?))
     }
 
-    /// ``_verified_path(f"{type(value).__module__}.{name}", value)`` where it
-    /// reads natively: the module is in ``sys.modules`` as a plain module
-    /// whose own dict holds ``name`` as ``value`` itself, and no longer
-    /// dotted prefix of the path is loaded. ``None`` to ask Python.
-    fn global_path(&self, value: &B<'py>, name: &B<'py>) -> PyResult<Option<B<'py>>> {
+    /// The rest of ``_canonical_reduce``: the recipe's shape checks and its
+    /// interpreter-independent arguments.
+    fn canonical_recipe(&mut self, value: &B<'py>, reduced: &B<'py>) -> PyResult<Option<B<'py>>> {
+        let py = self.py;
+        if is_str(reduced) {
+            return Ok(Some(reduced.clone()));
+        }
+        if !is_tuple(reduced) {
+            return Ok(None);
+        }
+        let size = unsafe { ffi::PyTuple_GET_SIZE(reduced.as_ptr()) };
+        if !(2..=5).contains(&size) {
+            return Ok(None);
+        }
+        let item = |index: ffi::Py_ssize_t| unsafe {
+            B::from_borrowed_ptr(py, ffi::PyTuple_GET_ITEM(reduced.as_ptr(), index))
+        };
+        let (func, arguments) = (item(0), item(1));
+        if !is_callable(&func) || !is_tuple(&arguments) {
+            return Ok(None);
+        }
+        let arguments = if value.is_instance(self.b(&self.g.pure_path))? {
+            PyTuple::new(py, [value.str()?])?.into_any()
+        } else {
+            arguments
+        };
+        let mut parts = vec![func, arguments];
+        for index in 2..size {
+            let part = item(index);
+            // ``list(part) if index in (1, 2)`` over ``parts[2:]``.
+            if (3..=4).contains(&index) && !part.is_none() {
+                parts.push(self.snapshot(&part)?.into_any());
+            } else {
+                parts.push(part);
+            }
+        }
+        if value.is_instance(self.b(&self.g.partial))? && parts.len() > 2 && is_tuple(&parts[2]) {
+            let state = unsafe { parts[2].cast_unchecked::<PyTuple>() }.clone();
+            let count = state.len();
+            if count == 0 {
+                return Err(PyValueError::new_err(
+                    "not enough values to unpack (expected at least 1, got 0)",
+                ));
+            }
+            // ``instance_dict == {}``: an empty instance dict rebuilds as none.
+            let empty = PyDict::new(py);
+            if py_eq(&state.get_item(count - 1)?, empty.as_any())? {
+                let mut fixed = Vec::with_capacity(count);
+                for index in 0..count - 1 {
+                    fixed.push(state.get_item(index)?);
+                }
+                fixed.push(py.None().into_bound(py));
+                parts[2] = PyTuple::new(py, fixed)?.into_any();
+            }
+        }
+        PyTuple::new(py, parts).map(|recipe| Some(recipe.into_any()))
+    }
+
+    /// ``ordered``'s members as a vector, for a JSON walk.
+    fn ordered_values(&mut self, members: &B<'py>, frame: u32) -> PyResult<Vec<B<'py>>> {
+        Ok(self.ordered(members, frame)?.iter().collect())
+    }
+
+    /// ``_encode_reduce``'s recipe for ``value``: an enum member's from its
+    /// own attributes, a custom ``__reduce__``'s or ``__reduce_ex__(2)``'s read
+    /// natively while ``_canonical_reduce`` is the module's own, else
+    /// ``_canonical_reduce``'s. A bare name is a module global, written as its
+    /// verified import path.
+    fn recipe(&mut self, value: &B<'py>, kind: &B<'py>) -> PyResult<Recipe<'py>> {
+        let py = self.py;
+        if self.enum_member(kind)?
+            && let Some(parts) = self.enum_recipe(value, kind)?
+        {
+            return Ok(Recipe::Parts(parts));
+        }
+        let recipe = match self.own_recipe(value, kind)? {
+            Some(recipe) => recipe,
+            None if self.env.reduce_own => {
+                match value.call_method1(intern!(py, "__reduce_ex__"), (2,)) {
+                    Ok(reduced) => self.canonical_recipe(value, &reduced)?,
+                    Err(error)
+                        if error.is_instance_of::<PyAttributeError>(py)
+                            || error
+                                .is_instance_of::<pyo3::exceptions::PyNotImplementedError>(py)
+                            || error.is_instance_of::<PyTypeError>(py)
+                            || error.is_instance_of::<PyValueError>(py) =>
+                    {
+                        None
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            None => {
+                let recipe = self.env.canonical_reduce.bind(py).call1((value,))?;
+                (!recipe.is_none()).then_some(recipe)
+            }
+        };
+        let Some(recipe) = recipe else {
+            return Ok(Recipe::Unreduced);
+        };
+        if is_str(&recipe) {
+            let module = kind.getattr(intern!(py, "__module__"))?;
+            if let Some(path) = self.global_path(value, &module, &recipe)? {
+                return Ok(Recipe::Path(path));
+            }
+            let path = format!("{}.{}", module.str()?.to_cow()?, recipe.str()?.to_cow()?);
+            let path = self.env.verified_path.bind(py).call1((path, value))?;
+            return Ok(Recipe::Path(path));
+        }
+        Ok(Recipe::Parts(
+            recipe.try_iter()?.collect::<PyResult<Vec<_>>>()?,
+        ))
+    }
+
+    /// ``_verified_path(f"{module}.{name}", value)`` where it reads natively:
+    /// ``module`` is in ``sys.modules`` as a plain module whose own dict holds
+    /// ``name`` as ``value`` itself, and no longer dotted prefix of the path
+    /// is loaded. ``None`` to ask Python.
+    fn global_path(
+        &self,
+        value: &B<'py>,
+        module: &B<'py>,
+        name: &B<'py>,
+    ) -> PyResult<Option<B<'py>>> {
         let py = self.py;
         if !self.env.helpers_own || tp(name) != t_str() {
             return Ok(None);
         }
-        let kind = value.get_type();
-        let Some(module) = kind.as_any().getattr_opt(intern!(py, "__module__"))? else {
-            return Ok(None);
-        };
         let (Some(module_text), Some(name_text)) = (
-            (tp(&module) == t_str()).then(|| utf8(&module)).flatten(),
+            (tp(module) == t_str()).then(|| utf8(module)).flatten(),
             utf8(name),
         ) else {
             return Ok(None);
@@ -2577,7 +3072,7 @@ impl<'py, 'g> Encoder<'py, 'g> {
         else {
             return Ok(None);
         };
-        let Some(found) = modules.get_item(&module)? else {
+        let Some(found) = modules.get_item(module)? else {
             return Ok(None);
         };
         if !found.get_type().is(self.g.paths.module_type.bind(py)) {
@@ -2813,7 +3308,16 @@ pub fn to_plain<'py>(
         let hooks = hooks.unwrap_or_else(|| g.default_hooks.bind(py).clone());
         let sort = Flag::new(sort, true);
         let classes = CLASSES.take(py).unwrap_or_default();
-        let mut encoder = Encoder::new(py, g, dialect, python_dialect, hooks, sort, classes)?;
+        let mut encoder = Encoder::new(
+            py,
+            g,
+            dialect,
+            python_dialect,
+            hooks,
+            sort,
+            classes,
+            Writer::idle(),
+        )?;
         let tree = encoder.walk(obj, ROOT);
         // Moved out whole: a default ``Classes`` left in their place would
         // allocate and zero its tables only to drop them.
@@ -2857,4 +3361,1185 @@ fn finish<'py>(
         return Ok(frozen);
     }
     immutable.call1((tree,))
+}
+
+// ------------------------------------------------------------ text walk --
+
+/// The JSON walk: the text ``json.dumps`` writes for the tree the walk above
+/// builds, written without building it. Parts are reached in the tree walk's
+/// order, so every encoder, hook, and registration runs as it runs there; a
+/// leaf is written where the tree walk places it, a container's text stays
+/// open on the stack while its parts are encoded, and a reduce that restarts
+/// by protocol cuts its text back first.
+///
+/// Once user code may have run, the walk never starts over. A part only
+/// Python's ``json`` writes exactly (an int past ``int``'s digit limit, a
+/// tree holding what the writer does not know, nesting past ``TEXT_DEPTH``)
+/// is left as a ``Hole`` for ``json`` to fill when the walk is done; a node
+/// whose text could not follow its tree as it is built (a dict whose
+/// escaped keys may collide, an object whose names change its dict) is
+/// built by the tree walk, in its turn, and its tree written.
+impl<'py> Encoder<'py, '_> {
+    fn text_walk(&mut self, value: &B<'py>) -> Text<()> {
+        let base = self.text_stack.len();
+        let result = self.text_drain(value, base);
+        self.text_stack.truncate(base);
+        result
+    }
+
+    fn text_drain(&mut self, value: &B<'py>, base: usize) -> Text<()> {
+        // As in the tree walk, a failure at the root has no checkpoint below it.
+        self.text_node(value, ROOT)?;
+        while self.text_stack.len() > base {
+            let Some(TextEntry::Seq(seq)) = self.text_stack.pop() else {
+                continue;
+            };
+            if let Err(error) = self.text_resume(seq) {
+                self.text_recover(error, base)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Write ``seq``'s parts up to the first that is not a leaf, which is
+    /// then encoded with ``seq`` waiting below it.
+    fn text_resume(&mut self, mut seq: Seq<'py>) -> Text<()> {
+        while seq.at < seq.items.len() {
+            let index = seq.at;
+            seq.at += 1;
+            if index > 0 || seq.after {
+                self.w.item_sep();
+            }
+            let (value, slot) = match &mut seq.items {
+                Items::Values(values) => (values[index].clone(), Slot::Index(index)),
+                Items::Entries(entries) => {
+                    let entry = &mut entries[index];
+                    if entry.2 {
+                        entry.0 = self.escape_key(&entry.0)?;
+                        entry.2 = false;
+                    }
+                    let key = entry.0.clone();
+                    // Every key reaches here an exact str: a plain key, an
+                    // escaped one, or an object's clean name.
+                    if tp(&key) != t_str() {
+                        return Err(PyRuntimeError::new_err(
+                            "treekle: a JSON walk reached a key that is not a str",
+                        ));
+                    }
+                    self.w.str(&key);
+                    self.w.key_sep();
+                    (entry.1.clone(), Slot::Key(key))
+                }
+            };
+            match self.text_leaf(&value)? {
+                Leaf::Written => continue,
+                Leaf::Unwritable => {
+                    self.hole(value, Some(&seq));
+                    continue;
+                }
+                Leaf::Other => {}
+            }
+            let frame = self.push_frame(seq.frame, slot);
+            self.text_stack.push(TextEntry::Seq(seq));
+            return self.text_node(&value, frame);
+        }
+        self.w.raw(seq.close.text());
+        self.spare(seq.items);
+        Ok(())
+    }
+
+    /// The JSON path to the part being written: the current part of each
+    /// container open on the stack, then of ``seq``, which is off it.
+    fn json_path(&self, seq: Option<&Seq<'py>>) -> Vec<Step<'py>> {
+        let mut path = Vec::new();
+        let open = self.text_stack.iter().filter_map(|entry| match entry {
+            TextEntry::Seq(seq) => Some(seq),
+            TextEntry::TextCheck { .. } => None,
+        });
+        for seq in open.chain(seq) {
+            let index = seq.at - 1;
+            if let Close::Tagged(tag) = seq.close {
+                path.push(Step::Key(pystr(self.py, tag)));
+            }
+            path.push(match &seq.items {
+                Items::Values(_) => Step::Item(index),
+                Items::Entries(entries) => Step::Key(entries[index].0.clone()),
+            });
+        }
+        path
+    }
+
+    /// How many containers of the JSON text hold the part being written.
+    fn json_depth(&self) -> u32 {
+        self.text_stack
+            .iter()
+            .map(|entry| match entry {
+                TextEntry::Seq(Seq {
+                    close: Close::Tagged(_),
+                    ..
+                }) => 2,
+                TextEntry::Seq(_) => 1,
+                TextEntry::TextCheck { .. } => 0,
+            })
+            .sum()
+    }
+
+    /// Leave the part being written, whose tree is ``tree``, for ``json``.
+    #[cold]
+    fn hole(&mut self, tree: B<'py>, seq: Option<&Seq<'py>>) {
+        let path = self.json_path(seq);
+        self.holes.push(Hole {
+            offset: self.w.buf.len(),
+            tree,
+            path,
+        });
+    }
+
+    /// Write the part being written from its tree, or leave it for ``json``
+    /// where the writer cannot write the tree exactly.
+    fn text_tree(&mut self, tree: B<'py>) {
+        let mark = self.w.buf.len();
+        if self.w.plain(&tree, self.json_depth()).is_err() {
+            self.w.buf.truncate(mark);
+            self.hole(tree, None);
+        }
+    }
+
+    // Perf: exp000 json_dumps, lockstep: the arena walk's wins ported to the text walk, 1.13x.
+    fn spare(&mut self, items: Items<'py>) {
+        match items {
+            Items::Values(mut values) if self.spare_values.len() < SPARE_LIMIT => {
+                values.clear();
+                self.spare_values.push(values);
+            }
+            Items::Entries(mut entries) if self.spare_entries.len() < SPARE_LIMIT => {
+                entries.clear();
+                self.spare_entries.push(entries);
+            }
+            _ => {}
+        }
+    }
+
+    /// Open ``items`` in the text: closed at once when empty, else queued.
+    fn text_open(&mut self, items: Items<'py>, frame: u32, after: bool, close: Close) {
+        if items.len() == 0 {
+            self.w.raw(close.text());
+            self.spare(items);
+            return;
+        }
+        self.text_stack.push(TextEntry::Seq(Seq {
+            items,
+            at: 0,
+            frame,
+            after,
+            close,
+        }));
+    }
+
+    /// ``_recover`` for text: cut back to the innermost reduce and write it
+    /// by protocol instead.
+    fn text_recover(&mut self, mut error: PyErr, base: usize) -> Text<()> {
+        if !error.is_instance_of::<PyTypeError>(self.py) {
+            return Err(error);
+        }
+        while self.text_stack.len() > base {
+            let Some(TextEntry::TextCheck {
+                value,
+                mark,
+                offset,
+                frame,
+            }) = self.text_stack.pop()
+            else {
+                continue;
+            };
+            self.w.buf.truncate(offset);
+            // A hole at ``offset`` itself sits before the reduce's text.
+            let kept = self.holes.partition_point(|hole| hole.offset <= offset);
+            self.holes.truncate(kept);
+            self.rollback(mark)?;
+            match self.text_unreduced(&value, frame) {
+                Ok(()) => return Ok(()),
+                Err(again) if again.is_instance_of::<PyTypeError>(self.py) => {
+                    error = again;
+                }
+                Err(again) => return Err(again),
+            }
+        }
+        Err(error)
+    }
+
+    /// A leaf written as the tree walk leaves it; nothing written for any
+    /// other value, or for a leaf the writer cannot write exactly.
+    #[inline(always)]
+    fn text_leaf(&mut self, value: &B<'py>) -> Text<Leaf> {
+        let kind = tp(value);
+        let done = if kind == t_float() {
+            let number = unsafe { ffi::PyFloat_AS_DOUBLE(value.as_ptr()) };
+            if !(number.is_finite() || self.python_dialect) {
+                // ``repr`` of a float is an exact str.
+                let shown = value.repr()?;
+                self.w.open_tag(b"py/float");
+                self.w.str(shown.as_any());
+                self.w.raw(b"}");
+                return Ok(Leaf::Written);
+            }
+            self.w.float(number)
+        } else if kind == t_str() || kind == t_int() || kind == t_bool() || kind == t_none() {
+            self.w.leaf(value).map(|_| ())
+        } else {
+            return Ok(Leaf::Other);
+        };
+        // The writer writes nothing for what it cannot write.
+        Ok(match done {
+            Ok(()) => Leaf::Written,
+            Err(json::Bail) => Leaf::Unwritable,
+        })
+    }
+
+    /// ``_encode_float``'s output for ``value``, whose number is ``number``.
+    fn text_float(&mut self, value: &B<'py>, number: f64) -> Text<()> {
+        if number.is_finite() || self.python_dialect {
+            // The tree keeps ``value`` itself, which ``json`` writes by
+            // ``float.__repr__`` when it is a float and by its type otherwise.
+            if !(is_float(value) && self.w.float(number).is_ok()) {
+                self.text_tree(value.clone());
+            }
+            return Ok(());
+        }
+        let shown = value.repr()?;
+        self.text_tagged("py/float", shown.as_any())
+    }
+
+    fn text_float_of(&mut self, value: &B<'py>) -> Text<()> {
+        let number = unsafe {
+            if is_float(value) {
+                ffi::PyFloat_AS_DOUBLE(value.as_ptr())
+            } else {
+                let number = ffi::PyFloat_AsDouble(value.as_ptr());
+                if number == -1.0 && !ffi::PyErr_Occurred().is_null() {
+                    return Err(PyErr::fetch(self.py));
+                }
+                number
+            }
+        };
+        self.text_float(value, number)
+    }
+
+    fn text_tagged(&mut self, tag: &'static str, value: &B<'py>) -> Text<()> {
+        if tp(value) == t_str() {
+            self.w.open_tag(tag.as_bytes());
+            self.w.str(value);
+            self.w.raw(b"}");
+            return Ok(());
+        }
+        let tree = self.tagged(&PyString::new(self.py, tag), value.clone())?;
+        self.text_tree(tree);
+        Ok(())
+    }
+
+    /// ``_encode_node`` for text.
+    fn text_node(&mut self, value: &B<'py>, frame: u32) -> Text<()> {
+        match self.text_leaf(value)? {
+            Leaf::Written => return Ok(()),
+            Leaf::Unwritable => {
+                self.hole(value.clone(), None);
+                return Ok(());
+            }
+            Leaf::Other => {}
+        }
+        if self.text_stack.len() >= TEXT_DEPTH {
+            let tree = self.walk(value, frame)?;
+            self.text_tree(tree);
+            return Ok(());
+        }
+        if let Some(&at) = self.seen.get(&(value.as_ptr() as usize)) {
+            if self.text_reference(at)? {
+                return Ok(());
+            }
+            if self.encloses(at, frame) {
+                return Err(PyTypeError::new_err(format!(
+                    "Cannot serialize a dict key holding a cycle through {}.",
+                    value.repr()?
+                )));
+            }
+        }
+        let kind = value.get_type().into_any();
+        if !self.hooks_are_immutable_empty && self.hooks.contains(&kind)? {
+            return self.text_hooked(value, &kind, frame);
+        }
+        if let Some((path, known)) = self.cached_object(&kind)? {
+            self.register(value, frame);
+            if let Some((layout, sort)) = known
+                && self.text_known_object(value, &kind, &path, &layout, sort, frame)?
+            {
+                return Ok(());
+            }
+            return self.text_object_rest(value, &kind, path, frame);
+        }
+        let encoder = self.encoder_of(&kind)?;
+        self.text_run(encoder, value, &kind, frame)
+    }
+
+    /// ``reference`` written: ``false`` when ``frame`` is inside an escaped key.
+    fn text_reference(&mut self, at: u32) -> Text<bool> {
+        let mut steps = Vec::new();
+        let mut frame = at;
+        while frame != ROOT {
+            if frame == IN_KEY {
+                return Ok(false);
+            }
+            let here = &self.frames[frame as usize];
+            steps.push(here.step.clone());
+            frame = here.parent;
+        }
+        // An object's member names may be other than strs; ``json`` writes
+        // what the writer does not.
+        if steps
+            .iter()
+            .any(|step| matches!(step, Slot::Key(key) if tp(key) != t_str()))
+        {
+            let tree = self
+                .reference(at)?
+                .expect("a place outside every key has a reference");
+            self.text_tree(tree);
+            return Ok(true);
+        }
+        self.w.open_tag(b"py/ref");
+        self.w.raw(b"[");
+        for (index, step) in steps.iter().rev().enumerate() {
+            if index > 0 {
+                self.w.item_sep();
+            }
+            match step {
+                Slot::Index(at) => self.w.uint(*at as u64),
+                Slot::Key(key) => self.w.str(key),
+            }
+        }
+        self.w.raw(b"]}");
+        Ok(true)
+    }
+
+    /// The items ``list(value)`` gives.
+    fn values_of(&mut self, value: &B<'py>) -> PyResult<Vec<B<'py>>> {
+        let py = self.py;
+        let kind = tp(value);
+        let op = value.as_ptr();
+        // Read at once with no Python code between, as ``list`` copies them.
+        if kind == t_list() {
+            let len = unsafe { ffi::PyList_GET_SIZE(op) };
+            let mut values = self.spare_values.pop().unwrap_or_default();
+            values.extend(
+                (0..len).map(|at| unsafe {
+                    Bound::from_borrowed_ptr(py, ffi::PyList_GET_ITEM(op, at))
+                }),
+            );
+            return Ok(values);
+        }
+        if kind == t_tuple() {
+            let len = unsafe { ffi::PyTuple_GET_SIZE(op) };
+            let mut values = self.spare_values.pop().unwrap_or_default();
+            values.extend(
+                (0..len).map(|at| unsafe {
+                    Bound::from_borrowed_ptr(py, ffi::PyTuple_GET_ITEM(op, at))
+                }),
+            );
+            return Ok(values);
+        }
+        Ok(self.snapshot(value)?.iter().collect())
+    }
+
+    fn text_run(
+        &mut self,
+        encoder: Enc<'py>,
+        value: &B<'py>,
+        kind: &B<'py>,
+        frame: u32,
+    ) -> Text<()> {
+        let py = self.py;
+        let nat = match encoder {
+            Enc::Foreign(_) => {
+                let tree = self.foreign(value, frame)?;
+                self.text_tree(tree);
+                return Ok(());
+            }
+            Enc::Native(nat) => nat,
+        };
+        match nat {
+            Nat::Float => self.text_float_of(value),
+            Nat::Complex => {
+                // Rare enough to build: the tree walk's own steps, in its order.
+                let real = self.encode_float(&value.getattr(intern!(py, "real"))?)?;
+                let imag = self.encode_float(&value.getattr(intern!(py, "imag"))?)?;
+                let parts = PyList::new(py, [real, imag])?.into_any();
+                let tree = self.tagged(intern!(py, "py/complex"), parts)?;
+                self.text_tree(tree);
+                Ok(())
+            }
+            Nat::Bytes => {
+                let text = self
+                    .b(&self.g.b64encode)
+                    .call1((value,))?
+                    .call_method0(intern!(py, "decode"))?;
+                self.text_tagged("py/b64", &text)
+            }
+            Nat::List => self.text_list(value, frame),
+            Nat::Tuple => {
+                let mark = self.w.buf.len();
+                if all_leaf_items(value) {
+                    self.w.open_tag(b"py/tuple");
+                    if self.text_leaf_items(value)? {
+                        self.w.raw(b"}");
+                        return Ok(());
+                    }
+                    self.w.buf.truncate(mark);
+                }
+                let items = self.values_of(value)?;
+                self.w.open_tag(b"py/tuple");
+                self.w.raw(b"[");
+                self.text_open(
+                    Items::Values(items),
+                    frame,
+                    false,
+                    Close::Tagged("py/tuple"),
+                );
+                Ok(())
+            }
+            Nat::Set => self.text_set(value, frame),
+            Nat::FrozenSet => {
+                let items = self.ordered_values(value, frame)?;
+                self.w.open_tag(b"py/frozenset");
+                self.w.raw(b"[");
+                self.text_open(
+                    Items::Values(items),
+                    frame,
+                    false,
+                    Close::Tagged("py/frozenset"),
+                );
+                Ok(())
+            }
+            Nat::Dict => self.text_dict(value, frame),
+            Nat::MappingProxy => {
+                self.register(value, frame);
+                let tag = intern!(py, "py/mappingproxy").clone().into_any();
+                let copied = self.b(&self.g.dict_type).call1((value,))?;
+                self.w.raw(b"{");
+                self.text_open(
+                    Items::Entries(vec![(tag, copied, false)]),
+                    frame,
+                    false,
+                    Close::Dict,
+                );
+                Ok(())
+            }
+            Nat::Function => {
+                let owner = optional_attr(value, intern!(py, "__self__").as_any())?
+                    .unwrap_or_else(|| py.None().into_bound(py));
+                if !(owner.is_none() || owner.is_instance(self.b(&self.g.paths.module_type))?) {
+                    return self.text_reduce(value, kind, frame);
+                }
+                match self.import_path(value) {
+                    Ok((path, _)) => self.text_tagged("py/function", &path),
+                    Err(error)
+                        if error.is_instance_of::<PyTypeError>(py)
+                            && kind.is(self.b(&self.g.builtin_function_type)) =>
+                    {
+                        self.text_reduce(value, kind, frame)
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            Nat::Type => {
+                let path = if is_class(value) {
+                    self.class_path(value)?
+                } else {
+                    self.import_path(value)?.0
+                };
+                self.text_tagged("py/type", &path)
+            }
+            Nat::Reduce => self.text_reduce(value, kind, frame),
+            Nat::Path => self.text_tagged("py/path", value.str()?.as_any()),
+            Nat::Uuid => self.text_tagged("py/uuid", value.str()?.as_any()),
+            Nat::Datetime => {
+                let mut text = value.call_method0(intern!(py, "isoformat"))?;
+                let zone = value.getattr(intern!(py, "tzinfo"))?;
+                if zone.is_instance(self.b(&self.g.zoneinfo))? {
+                    let key = zone.getattr(intern!(py, "key"))?;
+                    text = pystr(
+                        py,
+                        &format!("{}[{}]", text.str()?.to_cow()?, key.str()?.to_cow()?),
+                    );
+                }
+                self.text_tagged("py/datetime", &text)
+            }
+            Nat::Object => self.text_object(value, kind, frame),
+            Nat::Hooked => self.text_hooked(value, kind, frame),
+            Nat::Unreduced => self.text_unreduced(value, frame),
+        }
+    }
+
+    /// An exact list or tuple whose items are all leaves the writer writes,
+    /// written whole as ``[...]``: ``false``, with nothing written, for any
+    /// other. Writing a leaf runs no Python code, so the items cannot change
+    /// meanwhile.
+    fn text_leaf_items(&mut self, value: &B<'py>) -> Text<bool> {
+        if !all_leaf_items(value) {
+            return Ok(false);
+        }
+        let py = self.py;
+        let op = value.as_ptr();
+        let list = tp(value) == t_list();
+        let len = unsafe {
+            if list {
+                ffi::PyList_GET_SIZE(op)
+            } else {
+                ffi::PyTuple_GET_SIZE(op)
+            }
+        };
+        let item = |at| unsafe {
+            Bound::from_borrowed_ptr(
+                py,
+                if list {
+                    ffi::PyList_GET_ITEM(op, at)
+                } else {
+                    ffi::PyTuple_GET_ITEM(op, at)
+                },
+            )
+        };
+        let mark = self.w.buf.len();
+        self.w.raw(b"[");
+        for at in 0..len {
+            if at > 0 {
+                self.w.item_sep();
+            }
+            if self.text_leaf(&item(at))? != Leaf::Written {
+                self.w.buf.truncate(mark);
+                return Ok(false);
+            }
+        }
+        self.w.raw(b"]");
+        Ok(true)
+    }
+
+    /// An exact dict of plain keys to leaves the writer writes, written
+    /// whole: ``false``, with nothing written, for any other. Neither the key
+    /// checks nor writing a leaf runs Python code, so the dict cannot change
+    /// meanwhile.
+    fn text_leaf_dict(&mut self, value: &B<'py>) -> Text<bool> {
+        let py = self.py;
+        let op = value.as_ptr();
+        let next = |position: &mut ffi::Py_ssize_t| {
+            let mut key: *mut ffi::PyObject = std::ptr::null_mut();
+            let mut item: *mut ffi::PyObject = std::ptr::null_mut();
+            unsafe {
+                (ffi::PyDict_Next(op, position, &mut key, &mut item) != 0).then(|| {
+                    (
+                        Bound::from_borrowed_ptr(py, key),
+                        Bound::from_borrowed_ptr(py, item),
+                    )
+                })
+            }
+        };
+        let mut position = 0;
+        while let Some((key, item)) = next(&mut position) {
+            if !is_leaf_value(&item) || !is_plain_key(&key)? {
+                return Ok(false);
+            }
+        }
+        let mark = self.w.buf.len();
+        self.w.raw(b"{");
+        let mut position = 0;
+        let mut first = true;
+        while let Some((key, item)) = next(&mut position) {
+            if !first {
+                self.w.item_sep();
+            }
+            first = false;
+            self.w.str(&key);
+            self.w.key_sep();
+            if self.text_leaf(&item)? != Leaf::Written {
+                self.w.buf.truncate(mark);
+                return Ok(false);
+            }
+        }
+        self.w.raw(b"}");
+        Ok(true)
+    }
+
+    fn text_list(&mut self, value: &B<'py>, frame: u32) -> Text<()> {
+        self.register(value, frame);
+        if self.text_leaf_items(value)? {
+            return Ok(());
+        }
+        let items = self.values_of(value)?;
+        self.w.raw(b"[");
+        self.text_open(Items::Values(items), frame, false, Close::List);
+        Ok(())
+    }
+
+    fn text_set(&mut self, value: &B<'py>, frame: u32) -> Text<()> {
+        self.register(value, frame);
+        let items = self.ordered_values(value, frame)?;
+        self.w.open_tag(b"py/set");
+        self.w.raw(b"[");
+        self.text_open(Items::Values(items), frame, false, Close::Tagged("py/set"));
+        Ok(())
+    }
+
+    /// A dict node the tree walk finishes, its entries, raw keys to be
+    /// escaped as each is reached, already read as it reads them; its tree
+    /// is written.
+    fn text_escaped(&mut self, entries: Vec<(B<'py>, B<'py>, bool)>, frame: u32) -> Text<()> {
+        let node = PyDict::new(self.py);
+        let base = self.stack.len();
+        for (key, item, raw) in entries.into_iter().rev() {
+            self.stack.push(Entry::Part {
+                value: item,
+                node: node.clone().into_any(),
+                slot: Slot::Key(key),
+                raw,
+                parent: frame,
+            });
+        }
+        let root = unsafe { Bound::from_borrowed_ptr(self.py, ffi::Py_None()) };
+        let done = self.drain_from(root, base);
+        self.stack.truncate(base);
+        done?;
+        self.text_tree(node.into_any());
+        Ok(())
+    }
+
+    fn text_dict(&mut self, value: &B<'py>, frame: u32) -> Text<()> {
+        let py = self.py;
+        self.register(value, frame);
+        let exact = tp(value) == t_dict();
+        if exact && self.text_leaf_dict(value)? {
+            return Ok(());
+        }
+        if exact {
+            // Read whole before any key check; checking an exact dict's keys
+            // runs no Python code, so the entries cannot change meanwhile.
+            let mut entries = self.spare_entries.pop().unwrap_or_default();
+            let mut position: ffi::Py_ssize_t = 0;
+            let mut key: *mut ffi::PyObject = std::ptr::null_mut();
+            let mut item: *mut ffi::PyObject = std::ptr::null_mut();
+            unsafe {
+                while ffi::PyDict_Next(value.as_ptr(), &mut position, &mut key, &mut item) != 0 {
+                    entries.push((
+                        Bound::from_borrowed_ptr(py, key),
+                        Bound::from_borrowed_ptr(py, item),
+                        false,
+                    ));
+                }
+            }
+            // Two keys of a dict that escape alike leave one entry in its
+            // tree, which text already written cannot follow. Distinct keys
+            // ``leaf_key_text`` escapes escape apart, and apart from every
+            // other key; with any other key escaped, the tree walk finishes
+            // the dict.
+            let mut alike = false;
+            for entry in &mut entries {
+                entry.2 = !is_plain_key(&entry.0)?;
+                alike = alike || entry.2 && !is_leaf_key(&entry.0);
+            }
+            if alike {
+                return self.text_escaped(entries, frame);
+            }
+            self.w.raw(b"{");
+            self.text_open(Items::Entries(entries), frame, false, Close::Dict);
+            return Ok(());
+        }
+        let mut plain = true;
+        for key in value.try_iter()? {
+            if !is_plain_key(&key?)? {
+                plain = false;
+                break;
+            }
+        }
+        let mut entries = Vec::new();
+        let mut items = MapItems::new(value)?;
+        while let Some(entry) = items.next_item()? {
+            entries.push(entry);
+        }
+        if !plain {
+            // Another mapping may list a key twice, which escapes alike.
+            let mut marked = Vec::with_capacity(entries.len());
+            for (key, item) in entries {
+                let raw = !is_plain_key(&key)?;
+                marked.push((key, item, raw));
+            }
+            return self.text_escaped(marked, frame);
+        }
+        // The tree's dict keeps one entry per key, in first place with the
+        // last value; another mapping may list a key twice.
+        let node = PyDict::new(py);
+        for (key, item) in &entries {
+            node.set_item(key, item)?;
+        }
+        let entries = dict_entries(&node)
+            .into_iter()
+            .map(|(key, item)| (key, item, false))
+            .collect();
+        self.w.raw(b"{");
+        self.text_open(Items::Entries(entries), frame, false, Close::Dict);
+        Ok(())
+    }
+
+    /// ``text_object``'s members read from ``layout`` with no code run, under
+    /// ``Reading::Slots`` or ``Reading::Dict``: written, and ``true``; else
+    /// ``false``, with nothing written, for ``object_members`` to read.
+    fn text_known_object(
+        &mut self,
+        value: &B<'py>,
+        kind: &B<'py>,
+        path: &B<'py>,
+        layout: &Layout,
+        sort: bool,
+        frame: u32,
+    ) -> Text<bool> {
+        if tp(path) != t_str() {
+            return Ok(false);
+        }
+        match layout.reading {
+            Reading::Slots => self.text_slots(value, path, layout, frame).map(|()| true),
+            Reading::Dict => self.text_dict_members(value, kind, path, layout, sort, frame),
+            Reading::Hooked | Reading::Generic => Ok(false),
+        }
+    }
+
+    // Perf: exp000 json_dumps, lockstep: ~1.1x.
+    /// ``text_object`` for a ``Reading::Slots`` class: leaf members are
+    /// written as they are read, each name from its prepared text; from the
+    /// first other member on, the rest are queued as ``text_object`` queues
+    /// them.
+    fn text_slots(
+        &mut self,
+        value: &B<'py>,
+        path: &B<'py>,
+        layout: &Layout,
+        frame: u32,
+    ) -> Text<()> {
+        let py = self.py;
+        let pending = self.g.pending.as_ptr();
+        self.w.open_tag(b"py/object");
+        self.w.str(path);
+        let count = layout.len();
+        let mut index = 0;
+        while index < count {
+            let offset = layout.offsets[index].expect("all slots have offsets");
+            let Some(member) = read_slot(value, offset) else {
+                index += 1;
+                continue;
+            };
+            if member.as_ptr() == pending {
+                index += 1;
+                continue;
+            }
+            if !is_leaf_value(&member) {
+                break;
+            }
+            let mark = self.w.buf.len();
+            self.w.item_sep();
+            match &layout.key_texts[index] {
+                Some(text) => self.w.raw(text),
+                None => self.w.str(&layout.name(py, index)),
+            }
+            self.w.key_sep();
+            if self.text_leaf(&member)? != Leaf::Written {
+                self.w.buf.truncate(mark);
+                break;
+            }
+            index += 1;
+        }
+        if index == count {
+            self.w.raw(b"}");
+            return Ok(());
+        }
+        let mut members = self.spare_entries.pop().unwrap_or_default();
+        for at in index..count {
+            let offset = layout.offsets[at].expect("all slots have offsets");
+            if let Some(member) = read_slot(value, offset)
+                && member.as_ptr() != pending
+            {
+                members.push((layout.name(py, at), member, false));
+            }
+        }
+        self.text_open(Items::Entries(members), frame, true, Close::Dict);
+        Ok(())
+    }
+
+    // Perf: rows json_dumps, lockstep: flat and frozen ~2.2x.
+    /// ``text_slots`` for a ``Reading::Dict`` class, members read by
+    /// ``dict_read``; ``false``, with nothing written, where that declines.
+    fn text_dict_members(
+        &mut self,
+        value: &B<'py>,
+        kind: &B<'py>,
+        path: &B<'py>,
+        layout: &Layout,
+        sort: bool,
+        frame: u32,
+    ) -> Text<bool> {
+        let py = self.py;
+        let mut found = [std::ptr::null_mut(); DICT_LIMIT];
+        let Some((_dict, keys)) = self.dict_read(value, kind, layout, sort, &mut found)? else {
+            return Ok(false);
+        };
+        let pending = self.g.pending.as_ptr();
+        self.w.open_tag(b"py/object");
+        self.w.str(path);
+        // Writing a leaf runs no code, so the dict, held here, holds each
+        // member until ``text_open`` takes its own reference.
+        let mut at = 0;
+        while let Some((index, text)) = keys.members.get(at) {
+            let member = found[*index as usize];
+            if member == pending {
+                at += 1;
+                continue;
+            }
+            let member = unsafe { B::from_borrowed_ptr(py, member) };
+            if !is_leaf_value(&member) {
+                break;
+            }
+            let mark = self.w.buf.len();
+            self.w.item_sep();
+            match text {
+                Some(text) => self.w.raw(text),
+                None => self.w.str(keys.keys[*index as usize].bind(py)),
+            }
+            self.w.key_sep();
+            if self.text_leaf(&member)? != Leaf::Written {
+                self.w.buf.truncate(mark);
+                break;
+            }
+            at += 1;
+        }
+        if at == keys.members.len() {
+            self.w.raw(b"}");
+            return Ok(true);
+        }
+        let mut members = self.spare_entries.pop().unwrap_or_default();
+        for &(index, _) in &keys.members[at..] {
+            let member = found[index as usize];
+            if member != pending {
+                members.push((
+                    keys.keys[index as usize].bind(py).clone(),
+                    unsafe { B::from_borrowed_ptr(py, member) },
+                    false,
+                ));
+            }
+        }
+        self.text_open(Items::Entries(members), frame, true, Close::Dict);
+        Ok(true)
+    }
+
+    fn text_object(&mut self, value: &B<'py>, kind: &B<'py>, frame: u32) -> Text<()> {
+        self.register(value, frame);
+        let path = self.class_path(kind)?;
+        self.text_object_rest(value, kind, path, frame)
+    }
+
+    /// ``text_object`` with its class path already read, as ``cached_object``
+    /// reads it from a probe of the class cache.
+    fn text_object_rest(
+        &mut self,
+        value: &B<'py>,
+        kind: &B<'py>,
+        path: B<'py>,
+        frame: u32,
+    ) -> Text<()> {
+        if let Some((layout, sort)) = self.known_layout(kind)?
+            && self.text_known_object(value, kind, &path, &layout, sort, frame)?
+        {
+            return Ok(());
+        }
+        let members = self.object_members(value, kind)?;
+        // A name that is not an exact str other than ``py/object`` changes the
+        // dict in ways only its tree shows, so the tree walk builds the node.
+        let clean = tp(&path) == t_str() && members.iter().all(|(name, _)| is_clean_name(name));
+        if !clean {
+            let py = self.py;
+            let base = self.stack.len();
+            let node = if members.iter().all(|(name, _)| tp(name) == t_str()) {
+                self.node_from(Some((intern!(py, "py/object"), path)), members, frame)?
+            } else {
+                let node = PyDict::new(py);
+                node.set_item(intern!(py, "py/object"), path)?;
+                for (name, member) in members {
+                    node.set_item(name, member)?;
+                }
+                self.push_values(&node, frame)?;
+                node
+            };
+            let root = unsafe { Bound::from_borrowed_ptr(self.py, ffi::Py_None()) };
+            let done = self.drain_from(root, base);
+            self.stack.truncate(base);
+            done?;
+            self.text_tree(node.into_any());
+            return Ok(());
+        }
+        let mut entries = self.spare_entries.pop().unwrap_or_default();
+        entries.extend(
+            members
+                .into_iter()
+                .map(|(name, member)| (name, member, false)),
+        );
+        self.w.open_tag(b"py/object");
+        self.w.str(&path);
+        self.text_open(Items::Entries(entries), frame, true, Close::Dict);
+        Ok(())
+    }
+
+    fn text_hooked(&mut self, value: &B<'py>, kind: &B<'py>, frame: u32) -> Text<()> {
+        let encode_hook = self.hooks.get_item(kind)?.get_item(0)?;
+        self.register(value, frame);
+        let path = self.class_path(kind)?;
+        let raw = encode_hook.call1((value,))?;
+        self.w.open_tag(b"py/hook");
+        self.w.raw(b"[");
+        self.text_open(
+            Items::Values(vec![path, raw]),
+            frame,
+            false,
+            Close::Tagged("py/hook"),
+        );
+        Ok(())
+    }
+
+    fn text_reduce(&mut self, value: &B<'py>, kind: &B<'py>, frame: u32) -> Text<()> {
+        let mut parts = match self.recipe(value, kind)? {
+            Recipe::Unreduced => return self.text_unreduced(value, frame),
+            Recipe::Path(path) => return self.text_tagged("py/type", &path),
+            Recipe::Parts(parts) => parts,
+        };
+        let mark = self.alive.len();
+        if is_unhashable(value)? || parts.iter().skip(2).any(|part| !part.is_none()) {
+            self.register(value, frame);
+        }
+        // A recipe starts with a callable, so trailing ``None``s never empty it.
+        while parts.last().is_some_and(|last| last.is_none()) {
+            parts.pop();
+        }
+        self.text_stack.push(TextEntry::TextCheck {
+            value: value.clone(),
+            mark,
+            offset: self.w.buf.len(),
+            frame,
+        });
+        self.w.open_tag(b"py/reduce");
+        self.w.raw(b"[");
+        self.text_open(
+            Items::Values(parts),
+            frame,
+            false,
+            Close::Tagged("py/reduce"),
+        );
+        Ok(())
+    }
+
+    fn text_unreduced(&mut self, value: &B<'py>, frame: u32) -> Text<()> {
+        let py = self.py;
+        let kind = value.get_type();
+        let name = kind.getattr(intern!(py, "__name__"))?;
+        if kind.hasattr(intern!(py, "__dataclass_fields__"))?
+            || kind
+                .getattr(intern!(py, "__dict__"))?
+                .contains(intern!(py, "__slots__"))?
+        {
+            return self.text_object(value, kind.as_any(), frame);
+        }
+        if kind.is_subclass(self.b(&self.g.mapping))? {
+            return self.text_dict(value, frame);
+        }
+        if kind.is_subclass(self.b(&self.g.sequence))?
+            && !kind.is_subclass(self.b(&self.g.str_bytes))?
+        {
+            return self.text_list(value, frame);
+        }
+        if kind.is_subclass(self.b(&self.g.abstract_set))? {
+            return self.text_set(value, frame);
+        }
+        let shown = name.str()?.to_cow()?.into_owned();
+        Err(PyTypeError::new_err(format!(
+            "Cannot serialize leaf of type {}. Pass hooks={{{}: (encode, decode)}} to to_plain().",
+            repr(&name)?,
+            shown
+        )))
+    }
+}
+
+// Perf: exp000, min per call: 782 us vs 1,938 for json.dumps(to_plain) (2.5x) and 1,157 for
+// to_plain plus json.rs's writer.
+/// ``json.dumps(to_plain(obj, ...), ...)`` written in one walk, or ``None``,
+/// before any user code runs, where the tree must be built and written
+/// instead. ``style`` is what ``options``, ``json.dumps``' own keyword
+/// arguments, ask for: one line, keys in tree order. The caller has checked
+/// that ``json.dumps`` is ``json``'s own; one that user code puts in its
+/// place during the walk is not called, as the walk cannot be undone.
+#[allow(clippy::too_many_arguments)]
+pub fn to_json<'py>(
+    py: Python<'py>,
+    obj: &B<'py>,
+    dialect: Option<B<'py>>,
+    hooks: Option<B<'py>>,
+    sort: Option<B<'py>>,
+    style: json::Style,
+    options: [Option<&B<'py>>; 4],
+) -> PyResult<Option<B<'py>>> {
+    let Some(globals) = ENC.cloned(py) else {
+        return Err(PyTypeError::new_err(
+            "treekle._rust.setup_encode was not called",
+        ));
+    };
+    let g = &*globals;
+    let dialect = dialect.unwrap_or_else(|| g.default_dialect.bind(py).clone());
+    let python_dialect = match (tp(&dialect) == t_str()).then(|| utf8(&dialect)).flatten() {
+        Some(b"json") => false,
+        Some(b"python") => true,
+        // Let the tree walk raise or read an unusual dialect.
+        _ => return Ok(None),
+    };
+    let hooks = hooks.unwrap_or_else(|| g.default_hooks.bind(py).clone());
+    let classes = CLASSES.take(py).unwrap_or_default();
+    let mut encoder = Encoder::new(
+        py,
+        g,
+        dialect,
+        python_dialect,
+        hooks,
+        Flag::new(sort, true),
+        classes,
+        Writer::new(style),
+    )?;
+    let done = encoder.text_walk(obj);
+    let Encoder {
+        classes,
+        frames,
+        stack,
+        seen,
+        alive,
+        w: mut writer,
+        holes,
+        ..
+    } = encoder;
+    Buffers::give(py, frames, stack, seen, alive);
+    let stale = CLASSES.replace(py, Some(classes));
+    drop(stale);
+    done?;
+    if !holes.is_empty() {
+        fill(py, &mut writer, holes, options)?;
+    }
+    writer.finish(py).map(Some)
+}
+
+/// Write each hole's text as ``json.dumps`` of the whole tree would write
+/// it, or raise what that raises, first hole first: the text around the
+/// holes is what ``json`` writes there, so only a hole can fail.
+///
+/// ``json``'s own ``dumps`` writes the holes, called once for each. The text
+/// walk runs only while ``json.dumps`` is that function, which then stands
+/// in for Python's one call on the whole tree as the writer does: it reads
+/// each part of the tree once, in the same order, so code it runs (a dict
+/// subclass's ``items``) runs as often as there.
+///
+/// Each hole's tree is dumped inside containers of the same kinds, on the
+/// same path, as in the whole tree, each holding only what comes before it
+/// (``None`` for the items before an index): ``json`` then nests as deep and
+/// fails, notes and all, as it would there. The hole's text is what falls
+/// between the path's openings and closings, which the writer writes as
+/// ``json`` does.
+#[cold]
+fn fill<'py>(
+    py: Python<'py>,
+    writer: &mut Writer,
+    holes: Vec<Hole<'py>>,
+    options: [Option<&B<'py>>; 4],
+) -> PyResult<()> {
+    let [ensure_ascii, separators, indent, sort_keys] = options;
+    let dumps = json::own_dumps(py)?;
+    let none = py.None().into_bound(py);
+    let mut texts = Vec::with_capacity(holes.len());
+    for hole in holes {
+        let mut opening = Writer::new(writer.style.clone());
+        let mut closing = Vec::with_capacity(hole.path.len());
+        for step in &hole.path {
+            match step {
+                Step::Item(at) => {
+                    opening.raw(b"[");
+                    for _ in 0..*at {
+                        opening.raw(b"null");
+                        opening.item_sep();
+                    }
+                    closing.push(b']');
+                }
+                Step::Key(key) => {
+                    opening.raw(b"{");
+                    opening.str(key);
+                    opening.key_sep();
+                    closing.push(b'}');
+                }
+            }
+        }
+        closing.reverse();
+        let mut tree = hole.tree.clone();
+        for step in hole.path.iter().rev() {
+            tree = match step {
+                Step::Item(at) => {
+                    let list = PyList::new(py, std::iter::repeat_n(&none, *at))?;
+                    list.append(tree)?;
+                    list.into_any()
+                }
+                Step::Key(key) => {
+                    let node = PyDict::new(py);
+                    node.set_item(key, &tree)?;
+                    node.into_any()
+                }
+            };
+        }
+        let text = json::call_dumps(&dumps, &tree, ensure_ascii, separators, indent, sort_keys)?;
+        let bytes = text_bytes(&text)?;
+        let Some(inner) = bytes
+            .strip_prefix(opening.buf.as_slice())
+            .and_then(|rest| rest.strip_suffix(closing.as_slice()))
+        else {
+            // Only a ``json`` whose encoder was changed after import writes
+            // a container otherwise; the text around the hole would then be
+            // wrong too.
+            return Err(PyRuntimeError::new_err(
+                "json.dumps wrote a list or dict otherwise than json writes it; was json's encoder replaced after treekle was imported?",
+            ));
+        };
+        texts.push((hole.offset, inner.to_vec()));
+    }
+    writer.splice(texts);
+    Ok(())
+}
+
+/// A str's text as the writer holds it: UTF-8, lone surrogates as their
+/// three bytes.
+fn text_bytes(text: &B<'_>) -> PyResult<Vec<u8>> {
+    let bytes = unsafe {
+        Bound::from_owned_ptr_or_err(
+            text.py(),
+            ffi::PyUnicode_AsEncodedString(
+                text.as_ptr(),
+                c"utf-8".as_ptr(),
+                c"surrogatepass".as_ptr(),
+            ),
+        )?
+    };
+    Ok(bytes
+        .cast_into::<pyo3::types::PyBytes>()?
+        .as_bytes()
+        .to_vec())
+}
+
+/// A key ``leaf_key_text`` escapes, from its value alone: distinct keys of
+/// one dict escape to distinct texts, none of which another key escapes to.
+#[inline]
+fn is_leaf_key(key: &B<'_>) -> bool {
+    let kind = tp(key);
+    kind == t_int()
+        || kind == t_bool()
+        || kind == t_none()
+        || kind == t_float() && unsafe { ffi::PyFloat_AS_DOUBLE(key.as_ptr()) }.is_finite()
 }

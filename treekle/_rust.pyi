@@ -61,3 +61,31 @@ def from_plain(
     allow_imports: bool = ...,
     strict: bool = ...,
 ) -> object: ...
+def json_dumps_plain(
+    tree: object,
+    *,
+    ensure_ascii: bool = ...,
+    separators: tuple[str, str] | None = ...,
+    indent: int | str | None = ...,
+    sort_keys: bool = ...,
+) -> str: ...
+def json_loads_plain(text: str | bytes) -> MutablePlainTree: ...
+def json_loads_typed(
+    text: str | bytes,
+    target: object,
+    *,
+    hooks: Hooks = ...,
+    allow_imports: bool = ...,
+    strict: bool = ...,
+) -> object: ...
+def json_dumps(
+    obj: object,
+    *,
+    dialect: Dialect = ...,
+    hooks: Hooks = ...,
+    sort: bool = ...,
+    ensure_ascii: bool = ...,
+    separators: tuple[str, str] | None = ...,
+    indent: int | str | None = ...,
+    sort_keys: bool = ...,
+) -> str: ...

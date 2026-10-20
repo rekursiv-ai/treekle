@@ -13,7 +13,7 @@ import sys
 
 import pytest
 
-from treekle import deserialize, serialize
+from treekle import deserialize, serialize, wire
 
 
 if TYPE_CHECKING:
@@ -43,7 +43,7 @@ def implementation(
     request: pytest.FixtureRequest,
     monkeypatch: pytest.MonkeyPatch,
 ) -> str:
-    """Bind ``to_plain``/``from_plain`` everywhere to the implementation under test."""
+    """Bind the walkers and ``wire``'s JSON functions to the implementation under test."""
     param = cast("str", request.param)
     if param == "native":
         return param
@@ -57,4 +57,8 @@ def implementation(
         for name, function in _NATIVE.items():
             if getattr(module, name, None) is function:
                 monkeypatch.setattr(module, name, _PYTHON[name])
+    # ``wire`` also holds the core's JSON functions; without them it reads and
+    # writes through ``json`` and the walkers above.
+    for name in ("_loads", "_dumps", "_typed_loads"):
+        monkeypatch.setattr(wire, name, None)
     return param
