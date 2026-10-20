@@ -3725,7 +3725,7 @@ def test_json_dumps_reads_separators_after_hooks_run(kind: type) -> None:
 
 def _float_samples() -> list[float]:
     """Return float edges, then random bit patterns and random magnitudes, all finite."""
-    rng = random.Random(20261018)  # noqa: S311 -- Seeded test data, not secrets.
+    rng = random.Random(20_261_018)  # noqa: S311 -- Seeded test data, not secrets.
     samples = [
         0.0,
         -0.0,

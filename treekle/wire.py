@@ -8,8 +8,9 @@ one format -- or, with the Rust core, skips the tree entirely.
 from __future__ import annotations
 
 from types import MappingProxyType
-from typing import TYPE_CHECKING, cast, overload
+from typing import TYPE_CHECKING, Final, cast, overload
 
+import importlib
 import json
 import warnings
 
@@ -19,6 +20,8 @@ from treekle.serialize import _python_to_plain, to_plain
 
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from treekle.types import Dialect, Hooks, MutablePlainTree
 
 
@@ -86,18 +89,17 @@ def json_loads(
     """
     # Perf: rows, best of 3: reading typed records straight from the text is 2.0-2.4x
     # over parsing then from_plain.
-    if target is not ABSENT and _typed_loads is not None:
-        return _typed_loads(
+    typed_loads = _CORE_JSON.get("typed_loads")
+    if target is not ABSENT and typed_loads is not None:
+        return typed_loads(
             text,
             target,
             hooks=hooks,
             allow_imports=allow_imports,
             strict=strict,
         )
-    tree = cast(
-        "MutablePlainTree",
-        _loads(text) if _loads is not None else json.loads(text),
-    )
+    loads = _CORE_JSON.get("loads", json.loads)
+    tree = cast("MutablePlainTree", loads(text))
     if target is ABSENT:
         return tree
     return from_plain(
@@ -143,16 +145,20 @@ def json_dumps(
     """
     # Perf: exp000, min per call: the core's fused writer is 2.5x over
     # json.dumps(to_plain(obj)).
-    if _dumps is not None:
-        return _dumps(
-            obj,
-            dialect=dialect,
-            hooks=hooks,
-            sort=sort,
-            ensure_ascii=ensure_ascii,
-            separators=separators,
-            indent=indent,
-            sort_keys=sort_keys,
+    dumps = _CORE_JSON.get("dumps")
+    if dumps is not None:
+        return cast(
+            "str",
+            dumps(
+                obj,
+                dialect=dialect,
+                hooks=hooks,
+                sort=sort,
+                ensure_ascii=ensure_ascii,
+                separators=separators,
+                indent=indent,
+                sort_keys=sort_keys,
+            ),
         )
     return json.dumps(
         to_plain(obj, dialect=dialect, hooks=hooks, sort=sort),
@@ -163,42 +169,39 @@ def json_dumps(
     )
 
 
-def _replaced(walker: object, python: object) -> bool:
-    """Return whether the Rust core's walker serves in place of ``python``."""
-    return walker is not python
-
-
-# The core's JSON functions, or None where Python's ``json`` serves. Either
-# way ``json.loads`` and ``json.dumps`` are looked up at each call, so one
-# replaced after import is the one used.
-_loads = None
-_dumps = None
-_typed_loads = None
-_core_writes = _replaced(to_plain, _python_to_plain)
-_core_reads = _replaced(from_plain, _python_from_plain)
-
 # The core's JSON functions serve only where its walkers do: the writer needs
-# the encoder set up and the fused reader the decoder, so under
+# the encoder set up and the typed reader the decoder, so under
 # ``TREEKLE_PURE_PYTHON``, or with a core that failed to set up, Python serves.
-if _core_writes or _core_reads:
+# Either way ``json.loads`` and ``json.dumps`` are looked up at each call, so
+# one replaced after import is the one used.
+def _core_json() -> dict[str, Callable[..., object]]:
+    """Return the core's JSON functions that serve, by name; empty where ``json`` does."""
+    writes = to_plain is not _python_to_plain
+    reads = from_plain is not _python_from_plain
+    if not (writes or reads):
+        return {}
+    package = cast("str", __package__)
     try:
-        from treekle._rust import (
-            json_dumps as _rust_dumps,
-            json_loads_plain as _rust_loads,
-            json_loads_typed as _rust_typed_loads,
-        )
-    except Exception as error:  # noqa: BLE001
-        # A core built from other sources may lack these functions; Python's
-        # json must still serve rather than fail import, as the walkers do.
+        core = importlib.import_module(f"{package}._rust")
+        found = {
+            "loads": cast("Callable[..., object]", core.json_loads_plain),
+            "dumps": cast("Callable[..., object]", core.json_dumps),
+            "typed_loads": cast("Callable[..., object]", core.json_loads_typed),
+        }
+    except Exception as error:  # noqa: BLE001 -- Any failure of a stale core falls back to json.
         warnings.warn(
-            f"treekle's Rust core does not match this treekle ({error}); "
+            f"{package}'s Rust core does not match this {package} ({error}); "
             "using the json module until the core is rebuilt",
             RuntimeWarning,
-            stacklevel=2,
+            stacklevel=3,
         )
-    else:
-        _loads = _rust_loads
-        if _core_writes:
-            _dumps = _rust_dumps
-        if _core_reads:
-            _typed_loads = _rust_typed_loads
+        return {}
+    if not writes:
+        del found["dumps"]
+    if not reads:
+        del found["typed_loads"]
+    return found
+
+
+_CORE_JSON: Final = _core_json()
+"""The core's ``loads``, ``dumps`` and ``typed_loads`` that serve, by name."""
