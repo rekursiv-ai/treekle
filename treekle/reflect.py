@@ -19,6 +19,7 @@ __all__ = [
     "attribute_names",
     "is_mutable",
     "resolve_import",
+    "resolves_to",
     "slot_names",
 ]
 
@@ -68,6 +69,30 @@ def resolve_import(path: str) -> object:
     raise ImportError(f"Cannot resolve path: {path!r}")
 
 
+def resolves_to(path: str, value: object) -> bool:
+    """Return whether ``path`` names ``value`` now, as ``resolve_import`` walks it.
+
+    Imports nothing: a path ``resolve_import`` once resolved has its module
+    loaded, so this walk from the longest loaded prefix is the walk it would
+    take. A cache of resolved paths asks it on every hit, so a name rebound
+    after the first read is seen.
+
+    Args:
+      path: A dotted ``module.attr`` path.
+      value: The object ``path`` named when it was cached.
+
+    Returns:
+      holds: Whether ``path`` still names ``value`` itself.
+
+    """
+    parts = path.split(".")
+    for split in range(len(parts) - 1, 0, -1):
+        module = sys.modules.get(".".join(parts[:split]))
+        if module is not None:
+            return _walk(module, parts[split:]) is value
+    return False
+
+
 # A class that sets ``__hash__ = None`` (``bytearray``, ``array``) is mutable by
 # Python's own convention, so two occurrences of one are one object, not two values.
 def is_mutable(value: object) -> bool:
@@ -92,12 +117,12 @@ def slot_names(kind: type) -> tuple[str, ...]:
         return cached
     names: dict[str, None] = {}
     for base in kind.__mro__:
-        slots: object = getattr(base, "__slots__", ())
+        slots = cast("object", vars(base).get("__slots__", ()))
         for slot in (
             (slots,) if isinstance(slots, str) else cast("Iterable[str]", slots)
         ):
             if slot not in SKIPPED_ATTRIBUTES:
-                names.setdefault(slot)
+                names.setdefault(_mangled(slot, base))
     result = tuple(names)
     _SLOT_NAMES[kind] = result
     return result
@@ -133,6 +158,17 @@ def _sorted_slots(kind: type) -> tuple[str, ...]:
     result = tuple(sorted(slot_names(kind)))
     _SORTED_SLOT_NAMES[kind] = result
     return result
+
+
+# ``__slots__`` lists a private name as written, but CPython stores the slot,
+# as it compiles every access, under ``_<Class>__name``; read unmangled, the
+# slot looks unset and its state is silently dropped.
+def _mangled(name: str, owner: type) -> str:
+    """Return slot ``name`` as CPython names it inside class ``owner``."""
+    if not name.startswith("__") or name.endswith("__"):
+        return name
+    stripped = owner.__name__.lstrip("_")
+    return f"_{stripped}{name}" if stripped else name
 
 
 def _walk(start: object, parts: Iterable[str]) -> object:

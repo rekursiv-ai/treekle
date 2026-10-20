@@ -22,7 +22,8 @@ use pyo3::types::{
 
 use crate::attrs::{FieldSlots, HasTable, SetTable};
 use crate::class::{
-    Stamp, member_of, object_new, own_namespace, store_offsets, type_lookup, version_tag,
+    PathCheck, PathGlobals, Stamp, member_of, object_new, own_namespace, store_offsets,
+    type_lookup, version_tag,
 };
 use crate::errors::*;
 use crate::places::{Loc, Paths, PlacedTable, ROOT, Spare, StepRef};
@@ -250,6 +251,8 @@ pub struct DecGlobals {
     /// Whether ``_decoder_for(float)`` is the float decoder, so an int read
     /// as ``float`` converts without a plan.
     fast_float: bool,
+    /// What ``PathCheck`` reads to recheck a kept resolved path.
+    paths: PathGlobals,
 }
 
 /// Shared, so a call keeps the globals it started with even if a hook reloads
@@ -453,6 +456,10 @@ pub fn setup(module: &Bound<'_, PyDict>) -> PyResult<()> {
         ast_name: ast.getattr("Name")?.unbind(),
         ast_load: ast.getattr("Load")?.unbind(),
         fast_float,
+        paths: PathGlobals {
+            sys_dict: py.import("sys")?.dict().unbind(),
+            module_type: py.import("types")?.getattr("ModuleType")?.unbind(),
+        },
     };
     let stale = (DEC.replace(py, Some(Rc::new(globals))), CACHES.take(py));
     drop(stale);
@@ -758,7 +765,11 @@ enum Built<'py> {
 /// What a ``_Steps`` frame builds from its parts.
 enum Done<'py> {
     Complex,
-    Hooked { rebuild: B<'py>, index: usize },
+    Hooked {
+        rebuild: B<'py>,
+        path: B<'py>,
+        index: usize,
+    },
 }
 
 enum Body<'py> {
@@ -886,8 +897,9 @@ struct Caches {
     /// arguments, and so every object whose address its shape names.
     shapes: HashMap<Shape, (Py<PyAny>, Rc<Plan>)>,
     /// What ``_RESOLVED`` held for each exact-str path met, by the path's
-    /// address (the entry keeps the path alive), as of ``resolved_at``.
-    resolved: HashMap<usize, (Py<PyAny>, Py<PyAny>)>,
+    /// address (the entry keeps the path alive), as of ``resolved_at``, with
+    /// the check that it still names what it held.
+    resolved: HashMap<usize, (Py<PyAny>, Py<PyAny>, PathCheck)>,
     /// The ``sync::DECODE`` generation ``resolved`` was read at, and the
     /// ``_RESOLVED`` dict it was read from.
     resolved_at: Option<(u64, usize)>,
@@ -2203,13 +2215,17 @@ impl<'py, 'g> Decoder<'py, 'g> {
             self.caches.resolved_at = Some((now, dict));
             drop(stale);
         }
+        // A path the check cannot read natively is asked of Python each time.
+        let Ok(Some(check)) = PathCheck::loaded(&self.g.paths, path) else {
+            return;
+        };
         if self.caches.resolved.len() >= TABLE_LIMIT {
             let stale = std::mem::take(&mut self.caches.resolved);
             drop(stale);
         }
         let stale = self.caches.resolved.insert(
             path.as_ptr() as usize,
-            (path.clone().unbind(), found.clone().unbind()),
+            (path.clone().unbind(), found.clone().unbind(), check),
         );
         drop(stale);
     }
@@ -2221,13 +2237,16 @@ impl<'py, 'g> Decoder<'py, 'g> {
         let py = self.py;
         // While neither the module globals nor ``_RESOLVED`` has changed, the
         // two lookups below give what they gave before for the same str.
+        // ``_resolve`` trusts an entry only while ``resolves_to`` says its path
+        // still names it; the check is read natively where the path allows.
         let generation = crate::sync::DECODE.generation();
         let exact = tp(path) == t_str();
         if exact
             && let Some(now) = generation
             && let Some((then, _)) = self.caches.resolved_at
             && then == now
-            && let Some((_, found)) = self.caches.resolved.get(&(path.as_ptr() as usize))
+            && let Some((_, found, check)) = self.caches.resolved.get(&(path.as_ptr() as usize))
+            && check.holds(&self.g.paths, found.bind(py))? == Some(true)
         {
             return Ok(found.bind(py).clone());
         }
@@ -2235,7 +2254,11 @@ impl<'py, 'g> Decoder<'py, 'g> {
         let resolved = interned_item(module, pyo3::intern!(py, "_RESOLVED"))?
             .cast_into::<PyDict>()
             .map_err(PyErr::from)?;
-        if let Some(found) = resolved.get_item(path)? {
+        if let Some(found) = resolved.get_item(path)?
+            && interned_item(module, pyo3::intern!(py, "resolves_to"))?
+                .call1((path, &found))?
+                .is_truthy()?
+        {
             if exact {
                 self.remember_resolved(generation, &resolved, path, &found);
             }
@@ -2744,7 +2767,7 @@ impl<'py, 'g> Decoder<'py, 'g> {
         keys: Option<&TagKeys>,
     ) -> DR<Start<'py>> {
         let value = match tag {
-            Tag::Float => self.decode_float(data)?,
+            Tag::Float => self.decode_float_tag(data)?,
             Tag::Complex => return self.decode_complex(data, at),
             Tag::B64 | Tag::Path | Tag::Uuid | Tag::Datetime => {
                 let func = self
@@ -3231,9 +3254,27 @@ impl<'py, 'g> Decoder<'py, 'g> {
                     };
                     Ok(self.b(&self.g.complex_type).call1((real, imag))?)
                 }
-                Done::Hooked { rebuild, index } => {
+                Done::Hooked {
+                    rebuild,
+                    path,
+                    index,
+                } => {
                     let decoded = values.into_iter().next().expect("a hook reads one payload");
-                    let value = rebuild.call1((decoded,))?;
+                    let value = match rebuild.call1((decoded,)) {
+                        Ok(value) => value,
+                        Err(error)
+                            if error.is_instance_of::<PyTypeError>(py)
+                                || error.is_instance_of::<PyValueError>(py) =>
+                        {
+                            let message = format!(
+                                "hook {} failed: {}",
+                                self.shown(&path)?,
+                                err_text(py, &error)?
+                            );
+                            return fail_from(message, error);
+                        }
+                        Err(error) => return Err(error.into()),
+                    };
                     self.replace(index, at, &value)?;
                     Ok(value)
                 }
@@ -3751,21 +3792,26 @@ impl<'py, 'g> Decoder<'py, 'g> {
         if is_int(data) && tp(data) != t_bool() {
             return Ok(self.b(&self.g.float_type).call1((data,))?);
         }
-        if is_str(data) {
+        if is_str(data) && !self.strict.get()? {
             let stripped = data.call_method0(pyo3::intern!(self.py, "strip"))?;
-            let number = match self.b(&self.g.float_type).call1((stripped,)) {
-                Ok(number) => Some(number),
-                Err(error) if error.is_instance_of::<PyValueError>(self.py) => None,
+            match self.b(&self.g.float_type).call1((stripped,)) {
+                Ok(number) => return Ok(number),
+                Err(error) if error.is_instance_of::<PyValueError>(self.py) => {}
                 Err(error) => return Err(error.into()),
-            };
-            if let Some(number) = number {
-                let value: f64 = number.extract()?;
-                if !value.is_finite() || !self.strict.get()? {
-                    return Ok(number);
-                }
             }
         }
         fail(format!("cannot read {} as float", self.shown(data)?))
+    }
+
+    /// ``_decode_float_tag``: a ``py/float`` payload, the ``repr`` of a
+    /// non-finite float.
+    fn decode_float_tag(&self, data: &B<'py>) -> DR<B<'py>> {
+        if is_str(data)
+            && let Some(value) = utf8(data).and_then(non_finite_repr)
+        {
+            return Ok(pyo3::types::PyFloat::new(self.py, value).into_any());
+        }
+        fail(format!("invalid py/float payload: {}", self.shown(data)?))
     }
 
     fn decode_complex(&mut self, data: &B<'py>, at: Loc<'_, 'py>) -> DR<Start<'py>> {
@@ -4646,12 +4692,7 @@ impl<'py, 'g> Decoder<'py, 'g> {
         {
             return None;
         }
-        let value = match unsafe { utf8_ptr(payload) }? {
-            b"inf" => f64::INFINITY,
-            b"-inf" => f64::NEG_INFINITY,
-            b"nan" => f64::NAN,
-            _ => return None,
-        };
+        let value = non_finite_repr(unsafe { utf8_ptr(payload) }?)?;
         Some(pyo3::types::PyFloat::new(py, value).into_any())
     }
 
@@ -5618,6 +5659,7 @@ impl<'py, 'g> Decoder<'py, 'g> {
                 values: Vec::with_capacity(1),
                 done: Done::Hooked {
                     rebuild,
+                    path,
                     index: position,
                 },
             },
@@ -6411,13 +6453,18 @@ fn special_float<'py>(raw: &B<'py>) -> Option<B<'py>> {
         return None;
     }
     let each = unsafe { Bound::from_borrowed_ptr(py, each) };
-    let value = match text_of(&each)? {
-        b"inf" => f64::INFINITY,
-        b"-inf" => f64::NEG_INFINITY,
-        b"nan" => f64::NAN,
-        _ => return None,
-    };
+    let value = non_finite_repr(text_of(&each)?)?;
     unsafe { Bound::from_owned_ptr_or_opt(py, ffi::PyFloat_FromDouble(value)) }
+}
+
+/// The float ``_NON_FINITE_REPRS`` text names: ``repr`` of a non-finite float.
+fn non_finite_repr(text: &[u8]) -> Option<f64> {
+    match text {
+        b"inf" => Some(f64::INFINITY),
+        b"-inf" => Some(f64::NEG_INFINITY),
+        b"nan" => Some(f64::NAN),
+        _ => None,
+    }
 }
 
 /// A tuple's items: a list as written untagged, or a ``py/tuple`` payload.

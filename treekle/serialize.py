@@ -52,6 +52,7 @@ from treekle.reflect import (
     attribute_names,
     is_mutable,
     resolve_import,
+    resolves_to,
 )
 from treekle.types import (
     Dialect,
@@ -115,8 +116,8 @@ def to_plain(
 
     Raises:
       ValueError: ``dialect`` names no known format.
-      TypeError: A leaf has no conversion and no hook, or a dict key holds a
-        cycle.
+      TypeError: A leaf has no conversion and no hook, a hook returns the type
+        it encodes, or a dict key holds a cycle.
 
     """
     if dialect not in get_args(Dialect.__value__):
@@ -443,6 +444,8 @@ def _ordered(members: AbstractSet[object], state: _Encoding) -> object:
     return node
 
 
+# The encoding leads: a default ``repr`` holds the object's address, so ordering
+# by it first made a set's text differ from run to run.
 def _set_order_key(value: object, state: _Encoding) -> tuple[str, str]:
     """Return a set member's sort key without registering anything it reaches."""
     mark = len(state.alive)
@@ -450,7 +453,7 @@ def _set_order_key(value: object, state: _Encoding) -> tuple[str, str]:
         encoded = _encode(value, state)
     finally:
         _rollback(state, mark)
-    return repr(value), json.dumps(encoded, sort_keys=True)
+    return json.dumps(encoded, sort_keys=True), repr(value)
 
 
 def _encode_dict(value: object, state: _Encoding) -> object:
@@ -539,12 +542,20 @@ def _encode_object(value: object, state: _Encoding) -> object:
 
 def _encode_hooked(value: object, state: _Encoding) -> object:
     """Encode a value through its caller-supplied hook as ``py/hook``."""
-    encode_hook = state.hooks[type(value)][0]
+    kind = type(value)
+    encode_hook = state.hooks[kind][0]
     _register(value, state)
     # The payload is arbitrary caller data, so it takes the same walk as any
     # other value: it may hold non-finite floats or tag-like keys.
-    path = _import_path(type(value))
-    node: list[object] = [path, encode_hook(value)]
+    path = _import_path(kind)
+    payload = encode_hook(value)
+    # A payload of the hooked type is hooked again, and a new one each time, so
+    # no ``py/ref`` stops it: the walk would never end.
+    if type(payload) is kind:
+        raise TypeError(
+            f"Cannot serialize {path}: its encode hook returned a {kind.__name__}.",
+        )
+    node: list[object] = [path, payload]
     _push_items(node, state)
     return {"py/hook": node}
 
@@ -639,7 +650,7 @@ def _canonical_reduce(
 def _import_path(value: type | Callable[..., object]) -> str:
     """Return the verified dotted import path of a class or function, cached."""
     cached = _IMPORT_PATHS.get(id(value))
-    if cached is not None and cached[0] is value:
+    if cached is not None and cached[0] is value and resolves_to(cached[1], value):
         return cached[1]
     module: object = getattr(value, "__module__", None)
     qualname: object = getattr(value, "__qualname__", None)
@@ -708,7 +719,8 @@ _ENCODER_CACHE: Final[weakref.WeakKeyDictionary[type, _Encoder]] = (
 
 # Keyed by ``id`` rather than weakly: a builtin function such as ``max`` cannot
 # be weakly referenced. Each entry keeps its object, so the ``id`` is never
-# reused while the entry stands.
+# reused while the entry stands. A hit is trusted only while its path still
+# names the object, so a rebound or reloaded name is verified again.
 _IMPORT_PATHS: Final[dict[int, tuple[object, str]]] = {}
 
 

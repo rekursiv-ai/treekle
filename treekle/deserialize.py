@@ -35,7 +35,7 @@ from enum import Enum
 from functools import partial
 from itertools import islice, repeat
 from numbers import Real
-from pathlib import Path
+from pathlib import Path, PurePath
 from types import GenericAlias, MappingProxyType, SimpleNamespace, UnionType
 from typing import (
     TYPE_CHECKING,
@@ -61,7 +61,6 @@ import binascii
 import importlib
 import inspect
 import json
-import math
 import reprlib
 import sys
 import typing
@@ -69,7 +68,13 @@ import weakref
 
 from treekle.absent import ABSENT
 from treekle.native import native
-from treekle.reflect import PENDING, is_mutable, resolve_import, slot_names
+from treekle.reflect import (
+    PENDING,
+    is_mutable,
+    resolve_import,
+    resolves_to,
+    slot_names,
+)
 from treekle.types import (
     FieldPath,
     Hooks,
@@ -430,6 +435,8 @@ def _decoder_for(target: object) -> _Decoder:
         return _decode_any
     if Enum in origin.__mro__:
         return _decode_enum
+    if PurePath in origin.__mro__:
+        return _decode_path
     if is_dataclass(origin):
         return _decode_object
     if is_typeddict(origin):
@@ -771,20 +778,33 @@ def _decode_float(
     at: FieldPath,
     state: _Decoding,
 ) -> float:
-    """Decode a float from an int, a float, or a ``py/float`` payload."""
+    """Decode a float from an int or a float; lax also reads float text."""
     del target, at
     if isinstance(data, float):
         return data
     if isinstance(data, int) and not isinstance(data, bool):
         return float(data)
-    if isinstance(data, str):
+    if isinstance(data, str) and not state.strict:
         try:
-            number = float(data.strip())
+            return float(data.strip())
         except ValueError:
-            number = None
-        if number is not None and (not math.isfinite(number) or not state.strict):
-            return number
+            pass
     raise ReadError(f"cannot read {_shown(data)} as float")
+
+
+def _decode_float_tag(
+    data: PlainTree,
+    target: object,
+    at: FieldPath,
+    state: _Decoding,
+) -> float:
+    """Decode a ``py/float`` payload: the ``repr`` of a non-finite float."""
+    del target, at, state
+    # The tag is the one place strict data spells a float as text, so it reads
+    # only what ``to_plain`` writes there; lax text is ``_decode_float``'s.
+    if isinstance(data, str) and data in _NON_FINITE_REPRS:
+        return float(data)
+    raise ReadError(f"invalid py/float payload: {_shown(data)}")
 
 
 def _decode_complex(
@@ -831,12 +851,13 @@ def _decode_path(
     target: object,
     at: FieldPath,
     state: _Decoding,
-) -> Path:
-    """Decode a ``Path`` from text."""
-    del target, at, state
+) -> PurePath:
+    """Decode text as the ``PurePath`` class ``target`` names, else as a ``Path``."""
+    del at, state
+    kind = target if isinstance(target, type) and issubclass(target, PurePath) else Path
     if isinstance(data, str):
-        return Path(data)
-    raise ReadError(f"cannot read {_shown(data)} as Path")
+        return kind(data)
+    raise ReadError(f"cannot read {_shown(data)} as {kind.__name__}")
 
 
 def _decode_uuid(
@@ -1370,7 +1391,14 @@ def _decode_hooked(
     return _Steps(
         at,
         jobs=[(payload, object, (*at, 1))],
-        done=partial(_hooked, decode=hook[1], index=index, at=at, state=state),
+        done=partial(
+            _hooked,
+            decode=hook[1],
+            path=path,
+            index=index,
+            at=at,
+            state=state,
+        ),
     )
 
 
@@ -1378,12 +1406,18 @@ def _hooked(
     parts: list[object],
     *,
     decode: Callable[..., object],
+    path: PlainTree,
     index: int,
     at: FieldPath,
     state: _Decoding,
 ) -> object:
     """Rebuild a hooked value from its decoded payload and fill its reserved slot."""
-    value = decode(parts[0])
+    # A hook refusing its payload is bad data, as a reduce call refusing its
+    # arguments is: the rest of the tree still reads.
+    try:
+        value = decode(parts[0])
+    except (TypeError, ValueError) as error:
+        raise ReadError(f"hook {_shown(path)} failed: {error}") from error
     _replace(index, value, at, state)
     return value
 
@@ -2073,7 +2107,7 @@ def _resolve(path: str, state: _Decoding) -> object:
     if not state.allow_imports:
         raise ReadError(f"{path!r} needs allow_imports=True")
     resolved = _RESOLVED.get(path, PENDING)
-    if resolved is PENDING:
+    if resolved is PENDING or not resolves_to(path, resolved):
         try:
             resolved = resolve_import(path)
         except (AttributeError, ImportError) as error:
@@ -2400,6 +2434,10 @@ _PLAIN_LEAVES: Final = frozenset[object](
 """The exact :data:`Plain` types, which read as ``object`` unchanged."""
 
 
+_NON_FINITE_REPRS: Final = frozenset(("inf", "-inf", "nan"))
+"""What ``repr`` writes for a non-finite float, the only ``py/float`` payloads."""
+
+
 _LAX_BOOLS: Final[Mapping[str, int]] = MappingProxyType(
     {"true": 1, "false": 0, "1": 1, "0": 0},
 )
@@ -2482,12 +2520,12 @@ _DECODERS: Final[Mapping[object, _Decoder]] = MappingProxyType(
         typing.Union: _decode_union,  # pyright: ignore[reportDeprecated] -- A runtime origin key, not an annotation.
     },
 )
-"""Decoders by origin; ``_decoder_for`` adds Enum, dataclass, and Protocol targets."""
+"""Decoders by origin; ``_decoder_for`` adds Enum, path, dataclass, and Protocol targets."""
 
 
 _TAG_DECODERS: Final[Mapping[str, _Decoder]] = MappingProxyType(
     {
-        "py/float": _decode_float,
+        "py/float": _decode_float_tag,
         "py/complex": _decode_complex,
         "py/b64": _decode_bytes,
         "py/path": _decode_path,
@@ -2508,6 +2546,7 @@ _TAG_DECODERS: Final[Mapping[str, _Decoder]] = MappingProxyType(
 
 
 _RESOLVED: Final[dict[str, object]] = {}
+"""What each path last resolved to, trusted only while the path still names it."""
 
 
 _FIELD_TYPES: Final[weakref.WeakKeyDictionary[type, Mapping[str, object]]] = (

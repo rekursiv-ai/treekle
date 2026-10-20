@@ -24,6 +24,9 @@ pub type Done<T> = Result<T, Bail>;
 /// to ``json``.
 const MAX_DEPTH: u32 = 200;
 
+/// The widest integer indent the writer lays out itself; ``json`` takes wider.
+const MAX_INDENT: i64 = 1 << 16;
+
 /// For each Latin-1 character, the letter after the backslash that escapes
 /// it, or zero when it is written as itself; ``u`` means ``\u00XX``, and
 /// ``x`` a character ``ensure_ascii`` escapes: DEL or any non-ASCII one.
@@ -91,10 +94,13 @@ impl Style {
         let indent = match indent.filter(|indent| !indent.is_none()) {
             None => None,
             Some(indent) if tp(indent) == t_int() => {
-                let Ok(width) = indent.extract::<i64>() else {
-                    return Ok(Err(Bail));
-                };
-                Some(vec![b' '; width.max(0) as usize])
+                // ``json`` builds its indent as ``" " * indent``, which raises
+                // ``MemoryError`` for a huge width; allocating it here would
+                // abort the process instead, so a huge width is left to it.
+                match indent.extract::<i64>() {
+                    Ok(width) if width <= MAX_INDENT => Some(vec![b' '; width.max(0) as usize]),
+                    _ => return Ok(Err(Bail)),
+                }
             }
             Some(indent) if tp(indent) == t_str() => match utf8(indent) {
                 Some(text) => Some(text.to_vec()),

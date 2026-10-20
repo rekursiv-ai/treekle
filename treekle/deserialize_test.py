@@ -9,7 +9,7 @@ from dataclasses import dataclass, field, make_dataclass
 from decimal import Decimal
 from enum import Enum
 from fractions import Fraction
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
 from types import GenericAlias, MappingProxyType, ModuleType, SimpleNamespace, UnionType
 from typing import (
     TYPE_CHECKING,
@@ -539,7 +539,7 @@ class TestTypedDecode:
             (1, type(None), "cannot read 1 as None"),
             (1, None, "cannot read 1 as None"),
             ("x", float, "cannot read 'x' as float"),
-            ({"py/float": "1.0"}, float, "cannot read '1.0' as float"),
+            ({"py/float": "1.0"}, float, "invalid py/float payload: '1.0'"),
             ([1], dict[str, int], "cannot read [1] as dict[str, int]"),
             ({"a": 1}, list[int], "cannot read {'a': 1} as list[int]"),
             ("x", list[int], "cannot read 'x' as list[int]"),
@@ -659,6 +659,26 @@ class TestCapabilities:
     def test_every_executable_tag_is_gated(self, tree: MutablePlainTree) -> None:
         with pytest.raises(ReadError, match="allow_imports"):
             from_plain(tree, object)
+
+    @pytest.mark.parametrize(
+        "target",
+        [Path, PurePosixPath, PureWindowsPath, type(Path())],
+        ids=["Path", "PurePosixPath", "PureWindowsPath", "concrete"],
+    )
+    def test_text_reads_as_the_path_class_asked_for(
+        self,
+        target: type[PurePath],
+    ) -> None:
+        value = from_plain("a/b", target)
+
+        assert value == target("a/b")
+        assert type(value) is type(target("a/b"))
+
+    def test_a_path_tag_reads_as_the_path_class_asked_for(self) -> None:
+        value = from_plain({"py/path": "a/b"}, PurePosixPath)
+
+        assert value == PurePosixPath("a/b")
+        assert type(value) is PurePosixPath
 
     def test_a_path_resolving_to_a_class_decodes(self) -> None:
         assert from_plain(
@@ -1879,6 +1899,25 @@ class TestHooked:
     def test_a_bad_hook_names_why(self, payload: MutablePlainTree, reason: str) -> None:
         assert _bad_of({"r": {"py/hook": payload}}, hooks=_HOOKS) == {("r",): reason}
 
+    @pytest.mark.parametrize("error", [ValueError, TypeError], ids=repr)
+    def test_a_hook_that_fails_to_decode_is_a_bad_part(
+        self,
+        error: type[Exception],
+    ) -> None:
+        def refuse(values: object) -> Tensor:
+            raise error(f"refused {values!r}")
+
+        hooks: Hooks = {Tensor: (_tensor_values, refuse)}
+        tree: MutablePlainTree = [{"py/hook": [f"{__name__}.Tensor", [1.0]]}, 2]
+
+        with pytest.raises(ReadError) as raised:
+            from_plain(tree, object, hooks=hooks)
+
+        assert {at: bad.reason for at, bad in raised.value.bad.items()} == {
+            (0,): f"hook '{__name__}.Tensor' failed: refused [1.0]",
+        }
+        assert raised.value.partial == [raised.value.bad[0,], 2]
+
     def test_a_hooked_value_is_placed_before_its_payload_reads(self) -> None:
         tree: MutablePlainTree = {
             "r": {"py/hook": [f"{__name__}.Tensor", [{"py/ref": ["r"]}]]},
@@ -1968,25 +2007,17 @@ class TestTypeTags:
             allow_imports=True,
         ) == {"r": max}
 
-    def test_a_resolved_path_is_cached_by_its_path(self) -> None:
+    def test_a_path_rebound_after_a_read_resolves_to_its_new_object(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
         path = f"{__name__}.Bare"
-        deserialize._RESOLVED.pop(path, None)
+        tree: MutablePlainTree = {"py/type": path}
+        assert from_plain(tree, object, allow_imports=True) is Bare
 
-        assert from_plain(
-            {"r": {"py/type": path}},
-            dict[str, object],
-            allow_imports=True,
-        ) == {"r": Bare}
-        assert deserialize._RESOLVED[path] is Bare
-        deserialize._RESOLVED[path] = Square
-        try:
-            assert from_plain(
-                {"r": {"py/type": path}},
-                dict[str, object],
-                allow_imports=True,
-            ) == {"r": Square}
-        finally:
-            del deserialize._RESOLVED[path]
+        monkeypatch.setitem(globals(), "Bare", Square)
+
+        assert from_plain(tree, object, allow_imports=True) is Square
 
 
 class TestBadParts:
@@ -2647,6 +2678,24 @@ class TestLax:
     def test_strict_is_the_default(self) -> None:
         with pytest.raises(ReadError):
             from_plain("3", int)
+
+    @pytest.mark.parametrize("raw", ["inf", "-inf", "nan", " nan ", "Infinity"])
+    def test_strict_float_refuses_text_a_tag_alone_carries(self, raw: str) -> None:
+        with pytest.raises(ReadError, match=r"^cannot read .* as float$"):
+            from_plain(raw, float)
+
+    @pytest.mark.parametrize("raw", ["inf", "-inf", "nan", "Infinity"])
+    def test_lax_float_reads_non_finite_text(self, raw: str) -> None:
+        assert isinstance(from_plain(raw, float, strict=False), float)
+
+    def test_lax_float_refuses_text_that_is_no_number(self) -> None:
+        with pytest.raises(ReadError, match=r"^cannot read 'x' as float$"):
+            from_plain("x", float, strict=False)
+
+    @pytest.mark.parametrize("raw", [" inf", "Infinity", "1.5", 1])
+    def test_a_float_tag_holds_only_a_non_finite_repr(self, raw: PlainTree) -> None:
+        with pytest.raises(ReadError, match="invalid py/float payload"):
+            from_plain({"py/float": raw}, float)
 
     def test_lax_reaches_nested_fields(self) -> None:
         assert from_plain({"a": "3"}, dict[str, int], strict=False) == {"a": 3}

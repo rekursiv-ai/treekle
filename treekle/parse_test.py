@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from enum import Enum
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Literal
 from uuid import UUID
 
@@ -55,6 +55,8 @@ class TestParse:
             ("a", Literal["a", "b"], "a"),
             ("/data/x", Path, Path("/data/x")),
             ('"/data/x"', Path, Path("/data/x")),
+            ("data/x", PurePosixPath, PurePosixPath("data/x")),
+            ("data\\x", PureWindowsPath, PureWindowsPath("data\\x")),
             ("00000000-0000-0000-0000-000000000001", UUID, UUID(int=1)),
             (
                 "2026-01-02T03:04:05+00:00",

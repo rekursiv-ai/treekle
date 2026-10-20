@@ -883,11 +883,15 @@ def test_planted_cache_entries_encode_as_python_does(
         value,
         sort=sort,
     )
+    # A planted path wins only while it still names the class, so it is an
+    # alias the module really binds.
+    alias = f"{__name__}._SlottedPairAlias"
+    monkeypatch.setitem(globals(), "_SlottedPairAlias", _SlottedPair)
     if planted == "import path":
         monkeypatch.setitem(
             serialize._IMPORT_PATHS,
             id(_SlottedPair),
-            (_SlottedPair, "a.b"),
+            (_SlottedPair, alias),
         )
     elif planted == "stale import path":
         monkeypatch.setitem(
@@ -903,8 +907,28 @@ def test_planted_cache_entries_encode_as_python_does(
 
     assert serialize.to_plain(value, sort=sort) == expected
     assert isinstance(expected, dict)
-    assert (expected["py/object"] == "a.b") == (planted == "import path")
+    assert (expected["py/object"] == alias) == (planted == "import path")
     assert ("a" in expected) == (planted != "slots")
+
+
+@needs_rust
+def test_a_planted_path_that_names_another_object_is_verified_again(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    value = _SlottedPair(1, 2)
+    serialize._python_to_plain(value)
+    serialize.to_plain(value)
+    monkeypatch.setitem(
+        serialize._IMPORT_PATHS,
+        id(_SlottedPair),
+        (_SlottedPair, "a.b"),
+    )
+
+    expected = serialize._python_to_plain(value)
+
+    assert serialize.to_plain(value) == expected
+    assert isinstance(expected, dict)
+    assert expected["py/object"] == f"{__name__}._SlottedPair"
 
 
 @pytest.mark.parametrize("sort", [True, False])
@@ -920,9 +944,10 @@ def test_cache_entries_planted_before_a_first_encode_win(
     module = ModuleType(f"treekle_parity_planted_{planted[0]}{sort:d}")
     monkeypatch.setitem(sys.modules, module.__name__, module)
     pair = dataclass(slots=True)(_class(module.__name__, "Pair", a=int, b=int))
-    vars(module)["Pair"] = pair
+    vars(module)["Pair"] = vars(module)["Alias"] = pair
+    alias = f"{module.__name__}.Alias"
     if planted == "import path":
-        monkeypatch.setitem(serialize._IMPORT_PATHS, id(pair), (pair, "a.b"))
+        monkeypatch.setitem(serialize._IMPORT_PATHS, id(pair), (pair, alias))
     if planted == "slots":
         monkeypatch.setitem(reflect._SLOT_NAMES, pair, ("b",))
     if planted != "import path":
@@ -936,7 +961,7 @@ def test_cache_entries_planted_before_a_first_encode_win(
 
     assert actual == expected
     assert isinstance(expected, dict)
-    assert (expected["py/object"] == "a.b") == (planted == "import path")
+    assert (expected["py/object"] == alias) == (planted == "import path")
     dropped = planted == "slots" or (planted == "sorted slots" and sort)
     assert ("a" in expected) != dropped
 
@@ -2581,6 +2606,7 @@ def test_a_resolved_cache_replaced_many_times_is_still_read() -> None:
     # Each replacement is another dict for the reader to watch.
     printed = _run_python(
         """
+        import collections
         import os
         import treekle.deserialize as deserialize
 
@@ -2591,6 +2617,8 @@ def test_a_resolved_cache_replaced_many_times_is_still_read() -> None:
             kept.append(deserialize._RESOLVED)
             for _ in range(2):
                 deserialize.from_plain({"py/type": path}, object, allow_imports=True)
+        # An entry serves while its path still names it, so the name moves too.
+        collections.OrderedDict = os.PathLike
         deserialize._RESOLVED[path] = os.PathLike
         print(deserialize.from_plain({"py/type": path}, object, allow_imports=True))
         """,

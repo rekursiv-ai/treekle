@@ -262,6 +262,9 @@ unsafe extern "C" fn changed(
     _new_value: *mut ffi::PyObject,
 ) -> c_int {
     MODULES.generation.fetch_add(1, Ordering::Relaxed);
+    if event == PY_DICT_EVENT_DEALLOCATED {
+        forget_namespace(dict as usize);
+    }
     if is_decode_dict(dict as usize) {
         DECODE.generation.fetch_add(1, Ordering::Relaxed);
         if event == PY_DICT_EVENT_DEALLOCATED {
@@ -301,6 +304,49 @@ pub static MODULES: Watch = Watch::new();
 /// changes move ``DECODE`` alone, so resolving an import leaves the
 /// encoder's kept facts standing.
 pub static DECODE: Watch = Watch::new();
+
+/// Module namespaces a kept import path was read from, by address, watched
+/// so a rebound name moves ``MODULES``, as every watched dict's change does;
+/// ``changed`` takes one for an ``ENCODE`` dict like any other.
+static NAMESPACES: std::sync::Mutex<Option<std::collections::HashSet<usize>>> =
+    std::sync::Mutex::new(None);
+
+/// Past this many namespaces, a new one is not watched and its paths are
+/// rechecked at each use instead.
+const NAMESPACE_LIMIT: usize = 1 << 12;
+
+/// Watch module namespace ``dict`` so its changes move ``MODULES``; ``false``
+/// when it cannot be watched.
+pub fn watch_namespace(py: Python<'_>, dict: &Bound<'_, PyDict>) -> bool {
+    let address = dict.as_ptr() as usize;
+    let Ok(mut held) = NAMESPACES.lock() else {
+        return false;
+    };
+    let held = held.get_or_insert_with(Default::default);
+    if held.contains(&address) {
+        return true;
+    }
+    if held.len() >= NAMESPACE_LIMIT {
+        return false;
+    }
+    let Some(id) = MODULES.id(py) else {
+        return false;
+    };
+    held.insert(address);
+    // Watching fails only for a non-dict or a bad id, and neither is passed.
+    unsafe { PyDict_Watch(id, dict.as_ptr()) };
+    true
+}
+
+/// A freed namespace forgets its address, so a dict made there later is
+/// watched before a path read from it is trusted.
+fn forget_namespace(address: usize) {
+    if let Ok(mut held) = NAMESPACES.lock()
+        && let Some(held) = held.as_mut()
+    {
+        held.remove(&address);
+    }
+}
 
 /// The dicts ``DECODE`` watches, by address; 0 marks a free entry.
 static DECODE_DICTS: [AtomicUsize; 4] = [const { AtomicUsize::new(0) }; 4];
