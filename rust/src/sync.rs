@@ -305,9 +305,10 @@ pub static MODULES: Watch = Watch::new();
 /// encoder's kept facts standing.
 pub static DECODE: Watch = Watch::new();
 
-/// Module namespaces a kept import path was read from, by address, watched
-/// so a rebound name moves ``MODULES``, as every watched dict's change does;
-/// ``changed`` takes one for an ``ENCODE`` dict like any other.
+/// Module namespaces a kept import path was read from, by address. Each is
+/// watched, so rebinding a name in one moves ``MODULES``. ``changed`` does
+/// not tell them apart from ``ENCODE``'s dicts, so their changes move
+/// ``ENCODE`` too.
 static NAMESPACES: std::sync::Mutex<Option<std::collections::HashSet<usize>>> =
     std::sync::Mutex::new(None);
 

@@ -81,28 +81,28 @@ class ReadError(TypeError, ValueError):
         self.partial = partial
         self.bad = bad
 
-    # ``BaseException`` pickles its ``args`` alone, so a process pool would hand
-    # back an error with neither ``partial`` nor ``bad``; ``bad`` is often a
-    # ``MappingProxyType``, which cannot be pickled at all.
+    # ``BaseException`` pickles its ``args`` alone and rebuilds by calling the
+    # class on them, so a process pool would hand back an error with neither
+    # ``partial`` nor ``bad``, or fail on a subclass whose ``__init__`` takes
+    # more; and ``bad`` is often a ``MappingProxyType``, which cannot pickle.
     @override
     def __reduce__(self) -> tuple[object, ...]:
-        state = cast("dict[str, object]", vars(self))
-        rest = {
-            name: value
-            for name, value in state.items()
-            if name not in {"partial", "bad"}
-        }
-        return (
-            _rebuilt_read_error,
-            (str(self), self.partial, dict(self.bad)),
-            rest or None,
-        )
+        state = dict(cast("dict[str, object]", vars(self)))
+        state["bad"] = dict(self.bad)
+        return (_rebuilt_read_error, (type(self), self.args), state)
+
+    @override
+    def __setstate__(self, state: object) -> None:
+        """Restore what ``__reduce__`` kept, ``bad`` read-only again."""
+        assert isinstance(state, dict)
+        kept = cast("dict[str, object]", state)
+        bad = cast("dict[FieldPath, Invalid]", kept.pop("bad", {}))
+        vars(self).update(kept)
+        self.bad = MappingProxyType(bad)
 
 
-def _rebuilt_read_error(
-    message: str,
-    partial: object,
-    bad: dict[FieldPath, Invalid],
-) -> ReadError:
-    """Rebuild a pickled :class:`ReadError` from its parts."""
-    return ReadError(message, partial=partial, bad=MappingProxyType(bad))
+def _rebuilt_read_error(kind: type[ReadError], args: tuple[object, ...]) -> ReadError:
+    """Allocate a pickled :class:`ReadError` without its ``__init__``."""
+    error = kind.__new__(kind)
+    error.args = args
+    return error

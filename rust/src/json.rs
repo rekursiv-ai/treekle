@@ -67,6 +67,17 @@ pub struct Style {
 }
 
 impl Style {
+    /// The style of ``json.dumps`` called with no layout arguments.
+    pub fn plain() -> Self {
+        Self {
+            ensure_ascii: true,
+            item_sep: b", ".to_vec(),
+            key_sep: b": ".to_vec(),
+            indent: None,
+            sort_keys: false,
+        }
+    }
+
     /// The style ``json.dumps`` reads from its keyword arguments, or ``Bail``
     /// for an argument only ``json`` reads exactly. Reads only arguments
     /// whose reading runs no Python code: flags that are exact bools, ints
@@ -394,15 +405,23 @@ pub struct Writer {
 
 impl Writer {
     pub fn new(style: Style) -> Self {
-        let ascii = style.ensure_ascii
+        let mut writer = Self {
+            buf: Vec::with_capacity(4096),
+            ascii: false,
+            style,
+        };
+        writer.restart();
+        writer
+    }
+
+    /// Empty again, for another text in the same style.
+    pub fn restart(&mut self) {
+        let Self { buf, ascii, style } = self;
+        buf.clear();
+        *ascii = style.ensure_ascii
             && style.item_sep.is_ascii()
             && style.key_sep.is_ascii()
             && style.indent.as_ref().is_none_or(|indent| indent.is_ascii());
-        Self {
-            buf: Vec::with_capacity(4096),
-            ascii,
-            style,
-        }
     }
 
     /// A writer that is never written to, which allocates nothing.

@@ -19,15 +19,17 @@ All notable treekle changes are documented here. This project follows
 ### Fixed
 
 - A private slot (`__x`) is written and read under its mangled name instead
-  of being dropped.
-- `ReadError` pickles with its `partial` and `bad`.
+  of being dropped, also on a class renamed after it was created.
+- `ReadError` and its subclasses pickle as themselves, with `partial`, `bad`,
+  and any attributes a subclass set.
 - `PurePosixPath`, `PureWindowsPath`, and every other `PurePath` class read
   as that class.
 - An encode hook returning the type it encodes raises `TypeError` instead of
   looping forever; a decode hook raising `TypeError` or `ValueError` is a bad
   part of `ReadError`.
 - An import path cached for a class or function is rechecked, so a name
-  rebound or reloaded since is not written or read stale.
+  rebound or reloaded since, on its module or on a class it is nested in, is
+  not written or read stale.
 - `json_dumps` with a huge `indent` raises `MemoryError` as `json.dumps` does,
   where the Rust core aborted the process.
 

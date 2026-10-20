@@ -921,8 +921,9 @@ pub fn native_import_path_in<'py>(
     Ok(Some(PyString::new(py, &path).into_any()))
 }
 
-// Perf: a kept path is rechecked at each use, so the check reads three dicts by
-// strs whose hashes they cache, and builds nothing.
+// Perf: rows to_plain, perf stat instructions: +0.5% over checking the
+// ``MODULES`` generation alone. A recheck is one atomic load and one stamp compare per class the
+// path passes through; see ``holds``.
 /// How to ask, with no Python code run, whether a kept import path still
 /// names its object, as ``reflect.resolves_to`` would answer.
 ///
@@ -930,6 +931,11 @@ pub fn native_import_path_in<'py>(
 /// while no longer prefix is a loaded module, and the module's own entry for
 /// the first name, then each class's own MRO entry for the next, leads there.
 /// A dunder name may be a descriptor that runs code, so it is never read.
+///
+/// Its answer depends on ``sys.modules``, the module's namespace, and each
+/// class walked through to reach the last name. The first two are watched
+/// dicts, so a change to either moves ``sync::MODULES``; a class's version
+/// tag moves whenever it or a base gains, loses, or rebinds an attribute.
 pub struct PathCheck {
     /// Each dotted prefix longer than the module's name.
     longer: Vec<Py<PyString>>,
@@ -939,12 +945,14 @@ pub struct PathCheck {
     /// generation: until ``sys.modules`` changes, the path's module part
     /// resolves to it again, so only its names are read.
     found: std::cell::RefCell<Option<(u64, Py<PyDict>)>>,
-    /// The ``sync::MODULES`` generation the path last held at. ``MODULES``
-    /// moves on every change to every watched dict, the module's namespace
-    /// among them once ``sync::watch_namespace`` watched it, so while it
-    /// stands the path still holds.
-    held: std::cell::Cell<Option<u64>>,
+    /// The ``sync::MODULES`` generation the path last held at, with the
+    /// stamp of each class the walk passed through: while the generation
+    /// stands and every stamp holds, the path still holds.
+    held: std::cell::RefCell<Option<(u64, Through)>>,
 }
+
+/// Each class a path's walk passed through, with its stamp at the time.
+type Through = Vec<(Py<PyAny>, Stamp)>;
 
 /// A class's path kept with its facts, and how to recheck it.
 pub struct KeptPath {
@@ -1005,7 +1013,7 @@ impl PathCheck {
                 .map(|name| PyString::intern(py, name).unbind())
                 .collect(),
             found: std::cell::RefCell::new(None),
-            held: std::cell::Cell::new(None),
+            held: std::cell::RefCell::new(None),
         })
     }
 
@@ -1040,8 +1048,14 @@ impl PathCheck {
     /// The check is only ever asked about the one object it was made for.
     #[inline]
     pub fn holds(&self, g: &PathGlobals, value: &B<'_>) -> PyResult<Option<bool>> {
-        let generation = sync::MODULES.generation();
-        if generation.is_some() && self.held.get() == generation {
+        let py = value.py();
+        if let Some(generation) = sync::MODULES.generation()
+            && let Some((at, through)) = &*self.held.borrow()
+            && *at == generation
+            && through
+                .iter()
+                .all(|(class, stamp)| stamp.holds(class.bind(py)))
+        {
             return Ok(Some(true));
         }
         self.held_now(g, value)
@@ -1050,22 +1064,35 @@ impl PathCheck {
     #[cold]
     fn held_now(&self, g: &PathGlobals, value: &B<'_>) -> PyResult<Option<bool>> {
         let py = value.py();
-        let verdict = self.walk(g, value)?;
-        // Kept only once every dict the walk read is watched: ``sys.modules``
-        // by ``namespace``, the module's namespace here. A class read on the
-        // way changes its version tag, which the caller's stamp sees.
+        let mut through = Vec::with_capacity(self.attrs.len().saturating_sub(1));
+        let verdict = self.walk(g, value, &mut through)?;
+        // Kept only once each dict the walk read is watched (``sys.modules``
+        // by ``namespace``, the module's namespace here) and each class it
+        // passed through is stamped, its stamp taken before it was read.
         let watched = self
             .found
             .borrow()
             .as_ref()
             .is_some_and(|(_, namespace)| sync::watch_namespace(py, namespace.bind(py)));
-        if verdict == Some(true) && watched {
-            self.held.set(sync::MODULES.generation());
-        }
+        let kept = if verdict == Some(true) && watched {
+            sync::MODULES.generation().map(|now| (now, through))
+        } else {
+            None
+        };
+        let stale = self.held.replace(kept);
+        drop(stale);
         Ok(verdict)
     }
 
-    fn walk(&self, g: &PathGlobals, value: &B<'_>) -> PyResult<Option<bool>> {
+    /// The walk ``holds`` trusts, each class it passes through recorded in
+    /// ``through`` with the stamp taken before its entry was read; ``None``
+    /// where a class cannot be stamped or only Python can say.
+    fn walk(
+        &self,
+        g: &PathGlobals,
+        value: &B<'_>,
+        through: &mut Through,
+    ) -> PyResult<Option<bool>> {
         let py = value.py();
         let namespace = match self.namespace(g, py)? {
             Some(namespace) => namespace,
@@ -1086,6 +1113,9 @@ impl PathCheck {
             if ob_type(found.as_ptr()) != &raw mut ffi::PyType_Type {
                 return Ok(None);
             }
+            // A tag of 0 never holds, so a class out of tags is read each time.
+            let stamp = Stamp::always(&found);
+            through.push((found.clone().unbind(), stamp));
             let entry = unsafe { type_lookup(found.as_ptr().cast(), name.as_ptr()) };
             if entry.is_null() {
                 return Ok(None);

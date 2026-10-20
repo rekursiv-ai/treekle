@@ -396,6 +396,18 @@ class Moved:
     """A class whose module name is later rebound to another class."""
 
 
+class Nest:
+    """Holds a dataclass and a function whose names under it are later rebound."""
+
+    @dataclass(frozen=True, kw_only=True, slots=True)
+    class Inner:
+        a: int = 1
+
+    def method_like(self) -> None:
+        """Do nothing; read through the class, it is a plain function."""
+        del self
+
+
 def _ranked(z: int, a: int, label: str = "") -> MutablePlainTree:
     return {"py/object": f"{__name__}.Ranked", "z": z, "a": a, "label": label}
 
@@ -1358,6 +1370,41 @@ class TestImportPath:
             match=_unresolved(type(value), f"{__name__}.Point"),
         ):
             to_plain(value)
+
+    def test_a_rebound_nested_class_path_is_rejected_once_encoded_before(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # The name is rebound on the outer class, not on the module.
+        value = Nest.Inner()
+        for _ in range(3):
+            assert to_plain(value) == {"py/object": f"{__name__}.Nest.Inner", "a": 1}
+
+        monkeypatch.setattr(Nest, "Inner", Bare)
+
+        with pytest.raises(
+            TypeError,
+            match=_unresolved(type(value), f"{__name__}.Nest.Inner"),
+        ):
+            to_plain(value)
+
+    def test_a_rebound_nested_function_path_is_rejected(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        function = Nest.method_like
+        for _ in range(3):
+            assert to_plain(function) == {
+                "py/function": f"{__name__}.Nest.method_like",
+            }
+
+        monkeypatch.setattr(Nest, "method_like", _fake_encoder)
+
+        with pytest.raises(
+            TypeError,
+            match=_unresolved(function, f"{__name__}.Nest.method_like"),
+        ):
+            to_plain(function)
 
     def test_a_reused_id_holding_another_object_is_recomputed(
         self,

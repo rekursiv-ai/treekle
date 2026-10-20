@@ -2326,12 +2326,10 @@ impl<'py, 'g> Encoder<'py, 'g> {
             // writes it: it encodes to itself, or to a fixed ``py/float``, and
             // ``json``'s own ``dumps`` runs no code for either.
             let mut keyed: Vec<([B<'py>; 2], B<'py>)> = Vec::with_capacity(all.len());
+            let mut writer = Writer::new(json::Style::plain());
             for member in all {
                 let encoded = self.walk(&member, frame)?;
-                let Ok(style) = json::Style::from_options(None, None, None, None)? else {
-                    unreachable!("the default style reads natively");
-                };
-                let mut writer = Writer::new(style);
+                writer.restart();
                 let text = match writer.plain(&encoded, 0) {
                     Ok(()) => writer.finish(py)?,
                     Err(json::Bail) => json::own_dumps(py)?.call1((&encoded,))?,
