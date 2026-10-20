@@ -2259,20 +2259,22 @@ impl<'py, 'g> Decoder<'py, 'g> {
             } else {
                 None
             };
-            let holds = match check
-                .as_ref()
-                .map(|check| check.holds(&self.g.paths, &found))
-            {
-                Some(Ok(Some(holds))) => holds,
-                Some(Err(error)) => return Err(error.into()),
-                Some(Ok(None)) | None => interned_item(module, pyo3::intern!(py, "resolves_to"))?
-                    .call1((path, &found))?
-                    .is_truthy()?,
+            let native = match &check {
+                Some(check) => check.holds(&self.g.paths, &found)?,
+                None => None,
             };
-            if holds {
-                if let Some(check) = check {
-                    self.remember_resolved(generation, &resolved, path, &found, check);
-                }
+            if native == Some(true)
+                && let Some(check) = check
+            {
+                self.remember_resolved(generation, &resolved, path, &found, check);
+                return Ok(found);
+            }
+            // Only a native answer is kept: Python's may run code first.
+            if native.is_none()
+                && interned_item(module, pyo3::intern!(py, "resolves_to"))?
+                    .call1((path, &found))?
+                    .is_truthy()?
+            {
                 return Ok(found);
             }
         }

@@ -67,6 +67,7 @@ Clashing = type("Clashing", (), {"__slots__": ("__x", "_Clashing__y", "x")})
 PrivateWeak = type("PrivateWeak", (), {"__slots__": ("__weakref__", "__p")})
 Bereft = type("Bereft", (), {"__slots__": ("__p", "q")})
 delattr(Bereft, "_Bereft__p")
+Shadowed = type("Shadowed", (), {"__slots__": ("__x", "_Q__x")})
 
 
 class Unslotted:
@@ -336,6 +337,8 @@ class TestSlotNames:
             (PrivateWeak, ("_PrivateWeak__p",)),
             # With every private descriptor deleted, the current name decides.
             (Bereft, ("_Bereft__p", "q")),
+            # A public slot ending in a private one's name is not its mangling.
+            (Shadowed, ("_Shadowed__x", "_Q__x")),
             (WeakSlot, ("w",)),
             (Unslotted, ()),
             (int, ()),

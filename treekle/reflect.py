@@ -172,10 +172,17 @@ def _sorted_slots(kind: type) -> tuple[str, ...]:
 def _mangling_prefix(owner: type, declared: Iterable[str]) -> str:
     """Return the ``_<Class>`` CPython put before ``owner``'s private slots."""
     namespace = cast("Mapping[str, object]", vars(owner))
-    for slot in declared:
+    names = frozenset(declared)
+    for slot in names:
         if _is_private(slot):
             for key, entry in namespace.items():
-                if key.endswith(slot) and isinstance(entry, MemberDescriptorType):
+                # A declared name is stored as written, so it is no mangling.
+                if (
+                    key.endswith(slot)
+                    and key not in names
+                    and isinstance(entry, MemberDescriptorType)
+                    and entry.__objclass__ is owner
+                ):
                     prefix = key.removesuffix(slot)
                     if prefix.startswith("_") and not prefix.startswith("__"):
                         return prefix
