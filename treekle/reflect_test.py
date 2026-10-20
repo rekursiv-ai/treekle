@@ -20,6 +20,7 @@ from treekle.reflect import (
     attribute_names,
     is_mutable,
     resolve_import,
+    resolves_to,
     slot_names,
 )
 
@@ -58,6 +59,8 @@ StringSlot = type("StringSlot", (), {"__slots__": "only"})
 Repeated = type("Repeated", (Slotted,), {"__slots__": ("__dict__x",)})
 Twice = type("Twice", (Repeated,), {"__slots__": ("a2",)})
 WeakSlot = type("WeakSlot", (), {"__slots__": ("__weakref__", "w")})
+Underscored = type("__Underscored", (), {"__slots__": ("__p",)})
+Underscores = type("___", (), {"__slots__": ("__p",)})
 
 
 class Unslotted:
@@ -230,6 +233,46 @@ class TestResolveImport:
             resolve_import("no_such_module_xyz.thing")
 
 
+class TestResolvesTo:
+    @pytest.mark.parametrize(
+        ("path", "value"),
+        [
+            (f"{__name__}.Holder", Holder),
+            (f"{__name__}.Holder.__init__", Holder.__init__),
+            ("email.mime.text.MIMEText", mime_text.MIMEText),
+            ("builtins.max", max),
+        ],
+        ids=["class", "method", "submodule", "builtin"],
+    )
+    def test_a_path_naming_the_value_holds(self, path: str, value: object) -> None:
+        assert resolves_to(path, value) is True
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            f"{__name__}.Slotted",
+            f"{__name__}.no_such_name",
+            "no_such_module_xyz.Holder",
+        ],
+        ids=repr,
+    )
+    def test_a_path_naming_anything_else_does_not(self, path: str) -> None:
+        assert resolves_to(path, Holder) is False
+
+    def test_a_rebound_name_no_longer_holds(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        path, original = f"{__name__}.Holder", Holder
+        monkeypatch.setitem(globals(), "Holder", Slotted)
+
+        assert resolves_to(path, original) is False
+
+    def test_an_unloaded_module_is_not_imported(self) -> None:
+        assert resolves_to("treekle_never_imported_xyz.thing", None) is False
+        assert "treekle_never_imported_xyz" not in sys.modules
+
+
 class TestSlotNames:
     @pytest.fixture(autouse=True)
     def empty_cache(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -247,8 +290,11 @@ class TestSlotNames:
         ("kind", "expected"),
         [
             (StringSlot, ("only",)),
-            (Repeated, ("__dict__x", "a")),
-            (Twice, ("a2", "__dict__x", "a")),
+            # A private slot is named as CPython stores it, mangled by its class.
+            (Repeated, ("_Repeated__dict__x", "a")),
+            (Twice, ("a2", "_Repeated__dict__x", "a")),
+            (Underscored, ("_Underscored__p",)),
+            (Underscores, ("__p",)),
             (WeakSlot, ("w",)),
             (Unslotted, ()),
             (int, ()),

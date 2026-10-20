@@ -1504,7 +1504,9 @@ impl<'py, 'g> Encoder<'py, 'g> {
         let Some(path) = &info.path else {
             return Ok(None);
         };
-        let path = path.bind(self.py).clone();
+        let Some(path) = path.current(&self.g.paths, kind)? else {
+            return Ok(None);
+        };
         let pre = match self.sort {
             Flag::Known(sort) if self.env.names_own => info.layouts[usize::from(sort)]
                 .clone()
@@ -1546,20 +1548,20 @@ impl<'py, 'g> Encoder<'py, 'g> {
             return Ok(None);
         }
         let sort = self.sort.get()?;
-        let py = self.py;
-        let plan = move |info: &ClassInfo| {
-            let layout = info.layouts[usize::from(sort)].as_ref()?;
-            match (&info.encoder, &info.path) {
-                (Some(Kept::Native(Nat::Object)), Some(path))
-                    if matches!(layout.reading, Reading::Slots | Reading::Dict) =>
-                {
-                    Some((path.bind(py).clone(), layout.clone()))
-                }
-                _ => None,
-            }
-        };
+        let paths = &self.g.paths;
         let planned = match (self.known(kind, now), now) {
-            (Some(info), _) => plan(info),
+            (Some(info), _) => {
+                let layout = info.layouts[usize::from(sort)].as_ref();
+                match (&info.encoder, &info.path, layout) {
+                    (Some(Kept::Native(Nat::Object)), Some(path), Some(layout))
+                        if matches!(layout.reading, Reading::Slots | Reading::Dict) =>
+                    {
+                        path.current(paths, kind)?
+                            .map(|path| (path, layout.clone()))
+                    }
+                    _ => None,
+                }
+            }
             (None, Some(now)) => {
                 return self.first_sight(value, kind, frame, now, sort);
             }
@@ -1694,7 +1696,7 @@ impl<'py, 'g> Encoder<'py, 'g> {
                 stamp,
                 generation: now,
                 encoder: Some(Kept::Native(Nat::Object)),
-                path: Some(path.clone().unbind()),
+                path: Some(KeptPath::new(&path, kind)?),
                 layouts,
                 enum_member: None,
                 own_reduce: None,
@@ -1832,6 +1834,10 @@ impl<'py, 'g> Encoder<'py, 'g> {
     /// ``_import_path(value)``, and whether ``_IMPORT_PATHS`` answered.
     fn import_path(&self, value: &B<'py>) -> PyResult<(B<'py>, bool)> {
         let py = self.py;
+        // ``_import_path`` trusts an entry only while its path still names the
+        // value (``resolves_to``), which is read natively where it can be; any
+        // other entry is ``_import_path``'s to judge, below.
+        let mut entry = false;
         if let Some(paths) = &self.env.import_paths
             && let Some(cached) = paths
                 .bind(py)
@@ -1839,10 +1845,17 @@ impl<'py, 'g> Encoder<'py, 'g> {
             && !cached.is_none()
             && cached.get_item(0)?.is(value)
         {
-            return Ok((cached.get_item(1)?, true));
+            entry = true;
+            let path = cached.get_item(1)?;
+            if let Some(check) = PathCheck::loaded(&self.g.paths, &path)?
+                && check.holds(&self.g.paths, value)? == Some(true)
+            {
+                return Ok((path, true));
+            }
         }
         // Kept with the class's facts rather than in ``_IMPORT_PATHS``.
-        if self.env.import_paths.is_some()
+        if !entry
+            && self.env.import_paths.is_some()
             && let Some(path) = self.native_import_path(value)?
         {
             return Ok((path, true));
@@ -1859,14 +1872,18 @@ impl<'py, 'g> Encoder<'py, 'g> {
     fn class_path(&mut self, kind: &B<'py>) -> PyResult<B<'py>> {
         let now = self.current()?;
         if let Some(info) = self.known(kind, now)
-            && let Some(path) = &info.path
+            && let Some(kept) = &info.path
+            && let Some(path) = kept.current(&self.g.paths, kind)?
         {
-            return Ok(path.bind(self.py).clone());
+            return Ok(path);
         }
         let before = Stamp::always(kind);
         let (path, keepable) = self.import_path(kind)?;
-        if keepable && let Some(info) = self.keep(kind, now, &before) {
-            info.path = Some(path.clone().unbind());
+        if keepable {
+            let kept = KeptPath::new(&path, kind)?;
+            if let Some(info) = self.keep(kind, now, &before) {
+                info.path = Some(kept);
+            }
         }
         Ok(path)
     }
@@ -2300,30 +2317,39 @@ impl<'py, 'g> Encoder<'py, 'g> {
         self.tagged(intern!(self.py, "py/set"), items.into_any())
     }
 
-    /// ``_ordered``: a set's members sorted by ``(repr, encoded JSON)``.
+    /// ``_ordered``: a set's members sorted by ``(encoded JSON, repr)``.
     fn ordered(&mut self, members: &B<'py>, frame: u32) -> PyResult<Bound<'py, PyList>> {
+        let py = self.py;
         let all: Vec<B<'py>> = members.try_iter()?.collect::<PyResult<_>>()?;
-        if all.iter().all(is_leaf_value) && json::current_dumps(self.py)?.1 {
-            // Distinct leaves have distinct reprs, except NaNs, which also
-            // encode alike; so the JSON half of the key would decide nothing,
-            // and it is skipped. Python still calls ``json.dumps`` for each
-            // member, so a replaced one is called here as there.
-            let keyed: Vec<([B<'py>; 1], B<'py>)> = all
-                .into_iter()
-                .map(|member| Ok(([member.repr()?.into_any()], member)))
-                .collect::<PyResult<_>>()?;
-            return PyList::new(self.py, sorted_by_keys(self.py, keyed)?);
+        if all.iter().all(is_leaf_value) && json::current_dumps(py)?.1 {
+            // A leaf's JSON is written here as ``json.dumps(..., sort_keys=True)``
+            // writes it: it encodes to itself, or to a fixed ``py/float``, and
+            // ``json``'s own ``dumps`` runs no code for either.
+            let mut keyed: Vec<([B<'py>; 2], B<'py>)> = Vec::with_capacity(all.len());
+            for member in all {
+                let encoded = self.walk(&member, frame)?;
+                let Ok(style) = json::Style::from_options(None, None, None, None)? else {
+                    unreachable!("the default style reads natively");
+                };
+                let mut writer = Writer::new(style);
+                let text = match writer.plain(&encoded, 0) {
+                    Ok(()) => writer.finish(py)?,
+                    Err(json::Bail) => json::own_dumps(py)?.call1((&encoded,))?,
+                };
+                keyed.push(([text, member.repr()?.into_any()], member));
+            }
+            return PyList::new(py, sorted_by_keys(py, keyed)?);
         }
         let mut keyed = Vec::with_capacity(all.len());
         for member in all {
-            let (shown, text) = self.set_order_key(&member, frame)?;
-            keyed.push(([shown, text], member));
+            let (text, shown) = self.set_order_key(&member, frame)?;
+            keyed.push(([text, shown], member));
         }
-        PyList::new(self.py, sorted_by_keys(self.py, keyed)?)
+        PyList::new(py, sorted_by_keys(py, keyed)?)
     }
 
     /// ``_set_order_key``: encode the member, forgetting what it registers,
-    /// then take its ``repr`` and the encoding's sorted JSON.
+    /// then take the encoding's sorted JSON and the member's ``repr``.
     fn set_order_key(&mut self, value: &B<'py>, frame: u32) -> PyResult<(B<'py>, B<'py>)> {
         let py = self.py;
         let _guard = Recursion::enter(py, c" while encoding")?;
@@ -2331,14 +2357,14 @@ impl<'py, 'g> Encoder<'py, 'g> {
         let encoded = self.walk(value, frame);
         self.rollback(mark)?;
         let encoded = encoded?;
-        let shown = value.repr()?.into_any();
         let kwargs = PyDict::new(py);
         kwargs.set_item("sort_keys", true)?;
         let text = self
             .b(&self.g.json)
             .getattr(intern!(py, "dumps"))?
             .call((encoded,), Some(&kwargs))?;
-        Ok((shown, text))
+        // ``repr`` second, as Python's tuple builds it: it may run code.
+        Ok((text, value.repr()?.into_any()))
     }
 
     /// ``encode_dict`` for an exact dict whose keys are all plain: copied
@@ -2806,7 +2832,7 @@ impl<'py, 'g> Encoder<'py, 'g> {
         // The payload is arbitrary caller data, so it takes the same walk as
         // any other value: it may hold non-finite floats or tag-like keys.
         let path = self.class_path(kind)?;
-        let raw = encode_hook.call1((value,))?;
+        let raw = hook_payload(&encode_hook, value, kind, &path)?;
         let node = PyList::new(py, [path, raw])?;
         self.push_items(&node, frame)?;
         self.tagged(intern!(py, "py/hook"), node.into_any())
@@ -3249,6 +3275,26 @@ impl<'py, 'g> Encoder<'py, 'g> {
         self.linked_frames.insert(place.as_ptr() as usize, frame);
         self.linked[slot] = Some(place);
     }
+}
+
+/// ``encode_hook(value)``, refused when it is of the hooked type itself, as
+/// ``_encode_hooked`` refuses it: that payload would be hooked again forever.
+fn hook_payload<'py>(
+    encode_hook: &B<'py>,
+    value: &B<'py>,
+    kind: &B<'py>,
+    path: &B<'py>,
+) -> PyResult<B<'py>> {
+    let payload = encode_hook.call1((value,))?;
+    if payload.get_type().is(kind) {
+        let name = kind.getattr(intern!(value.py(), "__name__"))?;
+        return Err(PyTypeError::new_err(format!(
+            "Cannot serialize {}: its encode hook returned a {}.",
+            text(path)?,
+            text(&name)?
+        )));
+    }
+    Ok(payload)
 }
 
 /// ``json.dumps`` of a key that encodes to itself, where that is known
@@ -4293,7 +4339,7 @@ impl<'py> Encoder<'py, '_> {
         let encode_hook = self.hooks.get_item(kind)?.get_item(0)?;
         self.register(value, frame);
         let path = self.class_path(kind)?;
-        let raw = encode_hook.call1((value,))?;
+        let raw = hook_payload(&encode_hook, value, kind, &path)?;
         self.w.open_tag(b"py/hook");
         self.w.raw(b"[");
         self.text_open(

@@ -119,8 +119,8 @@ fn setup_encode(module: &Bound<'_, PyDict>) -> PyResult<()> {
 ///
 /// Raises:
 ///   ValueError: ``dialect`` names no known format.
-///   TypeError: A leaf has no conversion and no hook, or a dict key holds a
-///     cycle.
+///   TypeError: A leaf has no conversion and no hook, a hook returns the type
+///     it encodes, or a dict key holds a cycle.
 #[pyfunction]
 #[pyo3(
     signature = (obj, *, dialect = Maybe(None), mutable = Maybe(None), hooks = Maybe(None), sort = Maybe(None)),

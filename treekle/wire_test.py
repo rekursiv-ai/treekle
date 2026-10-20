@@ -115,6 +115,33 @@ class TestJsonDumps:
         )
         assert json_dumps(attributes) != json_dumps(attributes, sort=False)
 
+    def test_an_indent_too_wide_to_allocate_raises_as_json_does(self) -> None:
+        # Run apart: a failed native allocation aborts the whole process.
+        completed = subprocess.run(  # noqa: S603 -- Runs this interpreter on the test's own script.
+            [
+                sys.executable,
+                "-c",
+                textwrap.dedent(
+                    """
+                    import json
+                    from treekle import json_dumps
+
+                    for dumps in (json.dumps, json_dumps):
+                        try:
+                            dumps([1], indent=2**60)
+                        except MemoryError:
+                            print("MemoryError")
+                    """,
+                ),
+            ],
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=60,
+        )
+        assert completed.returncode == 0, completed.stderr
+        assert completed.stdout.split() == ["MemoryError", "MemoryError"]
+
     @pytest.mark.parametrize("dialect", ["yaml"])
     def test_an_unknown_dialect_is_rejected(self, dialect: str) -> None:
         with pytest.raises(ValueError, match="dialect"):

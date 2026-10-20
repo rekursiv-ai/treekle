@@ -191,8 +191,9 @@ pub struct ClassInfo {
     pub stamp: Stamp,
     pub generation: u64,
     pub encoder: Option<Kept>,
-    /// The class's own verified import path.
-    pub path: Option<Py<PyAny>>,
+    /// The class's own verified import path, trusted while it still names
+    /// the class: a module can rebind the name without changing the class.
+    pub path: Option<KeptPath>,
     /// How its instances' attributes are named and read, unsorted then sorted.
     pub layouts: [Option<Rc<Layout>>; 2],
     /// Whether it reduces as ``Enum.__reduce_ex__`` does, read natively.
@@ -693,6 +694,9 @@ pub unsafe fn own_offsets(
             {
                 return None;
             }
+            // ``ht_slots`` holds a private slot mangled while ``__slots__``
+            // keeps it as written, so the unsorted order cannot be read from
+            // the two; such a class is left to ``slot_names``.
             let text = utf8_ptr(name)?;
             if text.starts_with(b"__") || text.starts_with(b"py/") || text.starts_with(b"json://") {
                 return None;
@@ -915,6 +919,227 @@ pub fn native_import_path_in<'py>(
         return Ok(None);
     }
     Ok(Some(PyString::new(py, &path).into_any()))
+}
+
+// Perf: a kept path is rechecked at each use, so the check reads three dicts by
+// strs whose hashes they cache, and builds nothing.
+/// How to ask, with no Python code run, whether a kept import path still
+/// names its object, as ``reflect.resolves_to`` would answer.
+///
+/// The path is its module's name, then attribute names. It names its object
+/// while no longer prefix is a loaded module, and the module's own entry for
+/// the first name, then each class's own MRO entry for the next, leads there.
+/// A dunder name may be a descriptor that runs code, so it is never read.
+pub struct PathCheck {
+    /// Each dotted prefix longer than the module's name.
+    longer: Vec<Py<PyString>>,
+    module: Py<PyString>,
+    attrs: Vec<Py<PyString>>,
+    /// The module's namespace, found while ``sync::MODULES`` stood at this
+    /// generation: until ``sys.modules`` changes, the path's module part
+    /// resolves to it again, so only its names are read.
+    found: std::cell::RefCell<Option<(u64, Py<PyDict>)>>,
+    /// The ``sync::MODULES`` generation the path last held at. ``MODULES``
+    /// moves on every change to every watched dict, the module's namespace
+    /// among them once ``sync::watch_namespace`` watched it, so while it
+    /// stands the path still holds.
+    held: std::cell::Cell<Option<u64>>,
+}
+
+/// A class's path kept with its facts, and how to recheck it.
+pub struct KeptPath {
+    pub path: Py<PyAny>,
+    pub check: Option<PathCheck>,
+}
+
+impl KeptPath {
+    /// ``path`` for ``kind``, rechecked from ``kind.__module__``.
+    pub fn new(path: &B<'_>, kind: &B<'_>) -> PyResult<Self> {
+        let module = kind.getattr(intern!(path.py(), "__module__"))?;
+        Ok(Self {
+            path: path.clone().unbind(),
+            check: PathCheck::new(path, &module),
+        })
+    }
+
+    /// The path, while it still names ``kind``.
+    #[inline]
+    pub fn current<'py>(&self, g: &PathGlobals, kind: &B<'py>) -> PyResult<Option<B<'py>>> {
+        let py = kind.py();
+        let Some(check) = &self.check else {
+            return Ok(None);
+        };
+        Ok((check.holds(g, kind)? == Some(true)).then(|| self.path.bind(py).clone()))
+    }
+}
+
+impl PathCheck {
+    /// The check for ``path`` read in module ``module``, or ``None`` where
+    /// only Python can tell.
+    pub fn new(path: &B<'_>, module: &B<'_>) -> Option<Self> {
+        let py = path.py();
+        let text =
+            std::str::from_utf8((tp(path) == t_str()).then(|| utf8(path)).flatten()?).ok()?;
+        let module_text =
+            std::str::from_utf8((tp(module) == t_str()).then(|| utf8(module)).flatten()?).ok()?;
+        let rest = text.strip_prefix(module_text)?.strip_prefix('.')?;
+        let names: Vec<&str> = rest.split('.').collect();
+        if names
+            .iter()
+            .any(|name| name.is_empty() || name.starts_with("__"))
+        {
+            return None;
+        }
+        let mut longer = Vec::with_capacity(names.len());
+        let mut prefix = module_text.to_owned();
+        for name in &names {
+            prefix.push('.');
+            prefix.push_str(name);
+            longer.push(PyString::new(py, &prefix).unbind());
+        }
+        Some(Self {
+            longer,
+            module: PyString::intern(py, module_text).unbind(),
+            attrs: names
+                .iter()
+                .map(|name| PyString::intern(py, name).unbind())
+                .collect(),
+            found: std::cell::RefCell::new(None),
+            held: std::cell::Cell::new(None),
+        })
+    }
+
+    /// The check for ``path`` read from its longest loaded prefix, as
+    /// ``resolves_to`` reads it, or ``None`` where only Python can tell.
+    pub fn loaded(g: &PathGlobals, path: &B<'_>) -> PyResult<Option<Self>> {
+        let py = path.py();
+        let Some(text) = (tp(path) == t_str()).then(|| utf8(path)).flatten() else {
+            return Ok(None);
+        };
+        let Ok(text) = std::str::from_utf8(text) else {
+            return Ok(None);
+        };
+        let Some(modules) = g
+            .sys_dict
+            .bind(py)
+            .get_item(intern!(py, "modules"))?
+            .and_then(|modules| modules.cast_into_exact::<PyDict>().ok())
+        else {
+            return Ok(None);
+        };
+        for (at, _) in text.rmatch_indices('.') {
+            let module = PyString::new(py, &text[..at]);
+            if modules.contains(&module)? {
+                return Ok(Self::new(path, &module));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Whether the path names ``value`` now; ``None`` where Python must say.
+    /// The check is only ever asked about the one object it was made for.
+    #[inline]
+    pub fn holds(&self, g: &PathGlobals, value: &B<'_>) -> PyResult<Option<bool>> {
+        let generation = sync::MODULES.generation();
+        if generation.is_some() && self.held.get() == generation {
+            return Ok(Some(true));
+        }
+        self.held_now(g, value)
+    }
+
+    #[cold]
+    fn held_now(&self, g: &PathGlobals, value: &B<'_>) -> PyResult<Option<bool>> {
+        let py = value.py();
+        let verdict = self.walk(g, value)?;
+        // Kept only once every dict the walk read is watched: ``sys.modules``
+        // by ``namespace``, the module's namespace here. A class read on the
+        // way changes its version tag, which the caller's stamp sees.
+        let watched = self
+            .found
+            .borrow()
+            .as_ref()
+            .is_some_and(|(_, namespace)| sync::watch_namespace(py, namespace.bind(py)));
+        if verdict == Some(true) && watched {
+            self.held.set(sync::MODULES.generation());
+        }
+        Ok(verdict)
+    }
+
+    fn walk(&self, g: &PathGlobals, value: &B<'_>) -> PyResult<Option<bool>> {
+        let py = value.py();
+        let namespace = match self.namespace(g, py)? {
+            Some(namespace) => namespace,
+            None => return Ok(None),
+        };
+        let (first, rest) = self.attrs.split_first().expect("a path names an attribute");
+        // An absent entry may come from a module ``__getattr__``. An exact str
+        // key's lookup in an exact dict runs no code and cannot fail.
+        let entry = unsafe { dict_borrowed(namespace.as_ptr(), first.as_ptr()) };
+        if entry.is_null() {
+            return Ok(None);
+        }
+        if rest.is_empty() {
+            return Ok(Some(entry == value.as_ptr()));
+        }
+        let mut found = unsafe { Bound::from_borrowed_ptr(py, entry) };
+        for name in rest {
+            if ob_type(found.as_ptr()) != &raw mut ffi::PyType_Type {
+                return Ok(None);
+            }
+            let entry = unsafe { type_lookup(found.as_ptr().cast(), name.as_ptr()) };
+            if entry.is_null() {
+                return Ok(None);
+            }
+            let entry = unsafe { Bound::from_borrowed_ptr(py, entry) };
+            // A descriptor found there could answer ``getattr`` itself.
+            if !is_class(&entry) && !entry.is(value) {
+                return Ok(None);
+            }
+            found = entry;
+        }
+        Ok(Some(found.is(value)))
+    }
+
+    /// The namespace of the module the path is read from, kept while
+    /// ``sys.modules`` is unchanged; ``None`` where Python must say.
+    fn namespace<'py>(
+        &self,
+        g: &PathGlobals,
+        py: Python<'py>,
+    ) -> PyResult<Option<Bound<'py, PyDict>>> {
+        if let Some(generation) = sync::MODULES.generation()
+            && let Some((at, namespace)) = &*self.found.borrow()
+            && *at == generation
+        {
+            return Ok(Some(namespace.bind(py).clone()));
+        }
+        let modules = g.sys_dict.bind(py).get_item(intern!(py, "modules"))?;
+        let Some(modules) = modules.and_then(|modules| modules.cast_into_exact::<PyDict>().ok())
+        else {
+            return Ok(None);
+        };
+        // Watched before it is read, so a change from here on is seen.
+        let watched = sync::MODULES.watch(py, &modules);
+        for prefix in &self.longer {
+            if modules.contains(prefix.bind(py))? {
+                return Ok(None);
+            }
+        }
+        let Some(module) = modules.get_item(self.module.bind(py))? else {
+            return Ok(None);
+        };
+        if module.get_type().as_ptr() != g.module_type.as_ptr() {
+            return Ok(None);
+        }
+        let namespace = module_dict(&module);
+        if watched && let Some(generation) = sync::MODULES.generation() {
+            let stale = self
+                .found
+                .replace(Some((generation, namespace.clone().unbind())));
+            drop(stale);
+        }
+        Ok(Some(namespace))
+    }
 }
 
 /// An exact ``types.ModuleType``'s namespace, which is always its own dict.

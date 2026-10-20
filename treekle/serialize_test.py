@@ -362,11 +362,45 @@ class Shadowed:
         raise TypeError("no reduce")
 
 
+class Private:
+    """A private slot, which Python stores under its mangled name."""
+
+    __slots__ = ("__secret", "shown")
+
+    def __init__(self, secret: int, shown: int) -> None:
+        self.__secret = secret
+        self.shown = shown
+
+    def secret(self) -> int:
+        return self.__secret
+
+    @override
+    def __reduce_ex__(self, protocol: SupportsIndex) -> str | tuple[object, ...]:
+        raise TypeError("no reduce")
+
+
+class Faceless:
+    """A set member with the default, address-bearing ``repr``."""
+
+    __slots__ = ("n",)
+
+    def __init__(self, n: int) -> None:
+        self.n = n
+
+    @override
+    def __reduce_ex__(self, protocol: SupportsIndex) -> str | tuple[object, ...]:
+        raise TypeError("no reduce")
+
+
+class Moved:
+    """A class whose module name is later rebound to another class."""
+
+
 def _ranked(z: int, a: int, label: str = "") -> MutablePlainTree:
     return {"py/object": f"{__name__}.Ranked", "z": z, "a": a, "label": label}
 
 
-# Equal reprs leave the encoded tree to break the tie. Sorting by ``a`` (the
+# Members order by their encoded tree with sorted keys. Sorting by ``a`` (the
 # first sorted key), by ``z`` (the first written key), and CPython's iteration
 # order give three different orders for these members.
 _RANKED = (Ranked(z=3, a=1), Ranked(z=2, a=2), Ranked(z=1, a=3))
@@ -423,6 +457,14 @@ _NODE_TREE: MutablePlainTree = {
     "name": "n",
     "children": [],
 }
+
+
+def _newobj(kind: type) -> MutablePlainTree:
+    """Return the reduce recipe of a stateless instance of ``kind``."""
+    return [
+        {"py/function": "copyreg.__newobj__"},
+        {"py/tuple": [{"py/type": f"{__name__}.{kind.__qualname__}"}]},
+    ]
 
 
 _BARE_TREE: MutablePlainTree = {
@@ -790,16 +832,35 @@ class TestToPlain:
             (frozenset(_RANKED), {"py/frozenset": _RANKED_TREES}),
             (
                 {Ranked(z=1, a=1, label="b"), Ranked(z=2, a=2, label="a")},
-                {"py/set": [_ranked(2, 2, "a"), _ranked(1, 1, "b")]},
+                {"py/set": [_ranked(1, 1, "b"), _ranked(2, 2, "a")]},
             ),
         ],
     )
-    def test_set_members_sort_by_repr_then_encoding(
+    def test_set_members_sort_by_encoding_then_repr(
         self,
         value: object,
         expected: MutablePlainTree,
     ) -> None:
         assert to_plain(value) == expected
+
+    def test_leaf_set_members_order_by_their_json_text(self) -> None:
+        # JSON escapes ``é`` to ``\u00e9``, which sorts before ``z``; its repr
+        # sorts after.
+        assert to_plain({"z", "\u00e9"}) == {"py/set": ["\u00e9", "z"]}
+
+    def test_set_members_order_by_encoding_not_by_address(self) -> None:
+        # A default ``repr`` holds the object's address, which differs per run.
+        trees = {
+            json.dumps(to_plain({Faceless(n) for n in (3, 1, 2)})) for _ in range(8)
+        }
+
+        assert len(trees) == 1
+        assert to_plain({Faceless(2), Faceless(1)}) == {
+            "py/set": [
+                {"py/object": f"{__name__}.Faceless", "n": 1},
+                {"py/object": f"{__name__}.Faceless", "n": 2},
+            ],
+        }
 
     def test_set_members_tie_on_their_encoding_with_sorted_keys(self) -> None:
         tree = to_plain({Alpha(a=2), Zed(a=1)})
@@ -1041,6 +1102,35 @@ class TestRoundTrip:
         assert isinstance(restored[0], Tensor)
         assert restored[0].values == [1.0, math.inf]
 
+    def test_a_hook_returning_the_type_it_encodes_is_rejected(self) -> None:
+        calls: list[Tensor] = []
+
+        def encode(tensor: Tensor) -> Tensor:
+            calls.append(tensor)
+            return Tensor(tensor.values)
+
+        hooks: Hooks = {Tensor: (encode, Tensor)}
+
+        with pytest.raises(
+            TypeError,
+            match=r"Tensor: its encode hook returned a Tensor\.$",
+        ):
+            to_plain([Tensor([1.0])], hooks=hooks)
+        assert len(calls) == 1
+
+    def test_a_private_slot_round_trips_under_its_mangled_name(self) -> None:
+        tree = to_plain(Private(secret=7, shown=1))
+
+        restored = _round_trip(Private(secret=7, shown=1))
+
+        assert tree == {
+            "py/object": f"{__name__}.Private",
+            "_Private__secret": 7,
+            "shown": 1,
+        }
+        assert isinstance(restored, Private)
+        assert restored.secret() == 7
+
     def test_immutable_trees_decode_alike(self) -> None:
         value = {"a": (1, {2}), "b": Point(x=1)}
 
@@ -1221,8 +1311,53 @@ class TestImportPath:
         path = serialize._import_path(Point)
 
         assert cache == {id(Point): (Point, path)}
-        cache[id(Point)] = (Point, "cached.Path")
-        assert serialize._import_path(Point) == "cached.Path"
+        # An alias the module also binds names the same object, so it is kept.
+        monkeypatch.setitem(globals(), "PointAlias", Point)
+        cache[id(Point)] = (Point, f"{__name__}.PointAlias")
+        assert serialize._import_path(Point) == f"{__name__}.PointAlias"
+
+    def test_a_cached_path_no_longer_naming_its_object_is_recomputed(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        cache = {id(Point): (cast("object", Point), "cached.Path")}
+        monkeypatch.setattr(serialize, "_IMPORT_PATHS", cache)
+
+        assert serialize._import_path(Point) == f"{__name__}.Point"
+        assert cache == {id(Point): (Point, f"{__name__}.Point")}
+
+    def test_a_path_rebound_to_another_object_is_rejected(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        value = Moved()
+        assert to_plain(value) == {"py/reduce": _newobj(Moved)}
+
+        monkeypatch.setitem(globals(), "Moved", Bare)
+
+        with pytest.raises(TypeError, match=_no_leaf("Moved")):
+            to_plain(value)
+
+    def test_a_rebound_dataclass_path_is_rejected_once_encoded_before(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Encoded several times first, so its path is kept with its facts.
+        value = Point(x=1)
+        for _ in range(3):
+            assert to_plain(value) == {
+                "py/object": f"{__name__}.Point",
+                "x": 1,
+                "y": 0.0,
+            }
+
+        monkeypatch.setitem(globals(), "Point", Node)
+
+        with pytest.raises(
+            TypeError,
+            match=_unresolved(type(value), f"{__name__}.Point"),
+        ):
+            to_plain(value)
 
     def test_a_reused_id_holding_another_object_is_recomputed(
         self,

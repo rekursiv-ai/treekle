@@ -9,6 +9,27 @@ All notable treekle changes are documented here. This project follows
 
 - Neither wheel ships `treekle.lib.testing`, whose modules import `pytest`, a
   test-only dependency.
+- Set members order by their encoding, then by `repr`; a set whose members
+  `repr` with their address no longer writes differently from run to run.
+  Stored sets of strings that need escaping may reorder.
+- A strict `from_plain(text, float)` refuses `"inf"`, `"nan"`, and other
+  float text, as it refuses all scalar text; `{"py/float": ...}` reads only
+  the `repr` of a non-finite float.
+
+### Fixed
+
+- A private slot (`__x`) is written and read under its mangled name instead
+  of being dropped.
+- `ReadError` pickles with its `partial` and `bad`.
+- `PurePosixPath`, `PureWindowsPath`, and every other `PurePath` class read
+  as that class.
+- An encode hook returning the type it encodes raises `TypeError` instead of
+  looping forever; a decode hook raising `TypeError` or `ValueError` is a bad
+  part of `ReadError`.
+- An import path cached for a class or function is rechecked, so a name
+  rebound or reloaded since is not written or read stale.
+- `json_dumps` with a huge `indent` raises `MemoryError` as `json.dumps` does,
+  where the Rust core aborted the process.
 
 ## 0.2.0 - 2026-10-17
 
