@@ -45,8 +45,9 @@ test = [
     "hypothesis>=6.155.1",
     "pytest-cov",
     "nodejs-wheel-binaries>=24.16.0",
-    # tests/pure_wheel_test.py builds the Python-only wheel, pinned to this version.
-    "hatchling==1.32.4",
+    # tests/pure_wheel_test.py holds scripts/build_pure_wheel.py's pin to the
+    # hatchling this resolves.
+    "hatchling>=1.32.4",
 ]
 typecheck = [
     "basedpyright>=1.40.1",
