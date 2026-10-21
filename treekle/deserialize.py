@@ -2275,7 +2275,9 @@ def _resolvable_hints(
         # Another thread may have dropped the entry since it was read.
         _PARTIAL_HINTS.pop(kind, None)
     try:
-        return get_type_hints(kind, include_extras=include_extras), True
+        return dict[str, object](
+            get_type_hints(kind, include_extras=include_extras),
+        ), True
     except (AttributeError, NameError, TypeError):
         pass
     hints: dict[str, object] = {}
