@@ -936,8 +936,6 @@ def test_cache_entries_planted_before_a_first_encode_win(
     planted: str,
     sort: bool,
 ) -> None:
-    from treekle import reflect  # noqa: PLC0415 -- Only this test reads it.
-
     # A class the core never met, so nothing native was kept for it.
     module = ModuleType(f"treekle_parity_planted_{planted[0]}{sort:d}")
     monkeypatch.setitem(sys.modules, module.__name__, module)
@@ -2414,7 +2412,7 @@ class _DictReduceBase:
         self.a = 1
 
 
-def _reduce_property(error: type[Exception] | None) -> object:
+def _reduce_property(error: type[Exception] | None) -> property:
     """Return a ``__reduce__`` property that raises ``error``, or gives a recipe."""
 
     def reduce(self: object) -> object:
@@ -2422,7 +2420,7 @@ def _reduce_property(error: type[Exception] | None) -> object:
             return lambda: (type(self), ())
         raise error("no reduce")
 
-    return property(reduce)
+    return property(reduce)  # pyrefly: ignore[bad-return] -- pyrefly types ``property(f)`` as ``f``.
 
 
 # Built with ``type`` because a checker rejects a property overriding a method.
