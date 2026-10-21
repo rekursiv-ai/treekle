@@ -2269,6 +2269,8 @@ impl<'py, 'g> Decoder<'py, 'g> {
                 self.remember_resolved(generation, &resolved, path, &found, check);
                 return Ok(found);
             }
+            // Perf: 2000 staticmethod py/function reads, perf stat instructions:
+            // 6% fewer than keeping entries only Python can recheck.
             // Only a native answer is kept: Python's may run code first.
             if native.is_none()
                 && interned_item(module, pyo3::intern!(py, "resolves_to"))?
