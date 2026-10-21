@@ -3,6 +3,13 @@
 All notable treekle changes are documented here. This project follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## 0.3.1 - 2026-10-21
+
+### Changed
+
+- The `typecheck` group requires `rekursiv-ai-typeshed` and `rekursiv-ai-typings`
+  0.1.6 or later.
+
 ## 0.3.0 - 2026-10-20
 
 ### Changed
