@@ -3,7 +3,7 @@
 All notable treekle changes are documented here. This project follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## Unreleased
+## 0.3.0 - 2026-10-20
 
 ### Changed
 
