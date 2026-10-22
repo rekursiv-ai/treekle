@@ -8,8 +8,8 @@ All notable treekle changes are documented here. This project follows
 ### Removed
 
 - `treekle.lib.worker_count` is no longer part of the package. It moved, with
-  the pre-commit gates that use it, to `tools/precommit/` at the repository
-  root, which the wheel does not ship.
+  the pre-commit gates that use it, to `tools/gate/` at the repository root,
+  which the wheel does not ship.
 
 ## 0.3.1 - 2026-10-21
 
