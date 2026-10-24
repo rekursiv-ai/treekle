@@ -9,6 +9,7 @@ from typing import Literal, cast, override
 
 
 __all__ = [
+    "Classes",
     "Dialect",
     "FieldPath",
     "Hooks",
@@ -35,6 +36,13 @@ type MutablePlainTree = Plain | list[MutablePlainTree] | dict[str, MutablePlainT
 
 type Hooks = Mapping[type, tuple[Callable[..., object], Callable[..., object]]]
 """Runtime types paired with their ``(encode, decode)`` callbacks."""
+
+
+type Classes = Mapping[str, type]
+"""Short names for classes, written in ``py/object`` in place of import paths.
+
+When given, they are the only classes a ``py/object`` tag may write or read.
+"""
 
 
 type FieldPath = tuple[str | int, ...]

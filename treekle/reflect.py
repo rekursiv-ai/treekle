@@ -18,6 +18,7 @@ __all__ = [
     "PENDING",
     "SKIPPED_ATTRIBUTES",
     "attribute_names",
+    "class_tags",
     "is_mutable",
     "resolve_import",
     "resolves_to",
@@ -96,6 +97,34 @@ def resolves_to(path: str, value: object) -> bool:
         if module is not None:
             return _walk(module, names) is value
     return False
+
+
+def class_tags(classes: Mapping[str, type]) -> dict[type, str]:
+    """Return each class in ``classes`` by its short name, checking the mapping.
+
+    Args:
+      classes: Short names to the classes they name.
+
+    Returns:
+      tags: Each class to its name.
+
+    Raises:
+      TypeError: A name is not a ``str``, or a value is not a class.
+      ValueError: One class has two names.
+
+    """
+    tags: dict[type, str] = {}
+    for name, kind in classes.items():
+        if type(name) is not str:
+            raise TypeError(f"classes keys must be str, not {type(name).__name__}")
+        if not isinstance(kind, type):
+            raise TypeError(f"classes[{name!r}] is not a class")
+        if kind in tags:
+            raise ValueError(
+                f"classes names one class twice: {tags[kind]!r} and {name!r}",
+            )
+        tags[kind] = name
+    return tags
 
 
 # A class that sets ``__hash__ = None`` (``bytearray``, ``array``) is mutable by

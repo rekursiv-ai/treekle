@@ -27,6 +27,7 @@ compile_error!(
 
 mod attrs;
 mod class;
+mod classes;
 mod decode;
 mod encode;
 mod errors;
@@ -64,6 +65,8 @@ fn setup_decode(module: &Bound<'_, PyDict>) -> PyResult<()> {
 ///   default: Returned when ``data`` is ``None`` (a missing or null field);
 ///     omit to read ``None`` like any other value.
 ///   hooks: The codecs ``to_plain`` used.
+///   classes: The short names ``to_plain`` wrote in ``py/object``; when given,
+///     a ``py/object`` tag builds only these classes, and imports nothing.
 ///   allow_imports: Whether tags may import modules and call code they name.
 ///     A ``py/object`` tag naming the target dataclass itself needs none.
 ///   strict: When false, also read numeric and boolean text (``"3"`` as
@@ -73,25 +76,40 @@ fn setup_decode(module: &Bound<'_, PyDict>) -> PyResult<()> {
 ///   value: ``data`` as a ``target``, or ``default``.
 ///
 /// Raises:
-///   ReadError: ``data`` does not fit ``target``, or a tag needs imports while
-///     ``allow_imports`` is false.
+///   ReadError: ``data`` does not fit ``target``, a tag needs imports while
+///     ``allow_imports`` is false, or a ``py/object`` tag is not in a given
+///     ``classes``.
+///   TypeError: ``classes`` has a key that is not a ``str``, or a value that
+///     is not a class.
+///   ValueError: ``classes`` names one class twice.
 #[pyfunction]
 #[pyo3(
-    signature = (data, target, *, default = Maybe(None), hooks = Maybe(None), allow_imports = Maybe(None), strict = Maybe(None)),
-    text_signature = "(data, target, *, default=..., hooks=..., allow_imports=False, strict=True)"
+    signature = (data, target, *, default = Maybe(None), hooks = Maybe(None), classes = Maybe(None), allow_imports = Maybe(None), strict = Maybe(None)),
+    text_signature = "(data, target, *, default=..., hooks=..., classes=..., allow_imports=False, strict=True)"
 )]
+#[allow(clippy::too_many_arguments)]
 fn from_plain<'py>(
     py: Python<'py>,
     data: &B<'py>,
     target: &B<'py>,
     default: Maybe<'py>,
     hooks: Maybe<'py>,
+    classes: Maybe<'py>,
     allow_imports: Maybe<'py>,
     strict: Maybe<'py>,
 ) -> PyResult<B<'py>> {
     let allow_imports = Flag::new(allow_imports.0, false);
     let strict = Flag::new(strict.0, true);
-    decode::from_plain(py, data, target, default.0, hooks.0, allow_imports, strict)
+    decode::from_plain(
+        py,
+        data,
+        target,
+        default.0,
+        hooks.0,
+        classes.0,
+        allow_imports,
+        strict,
+    )
 }
 
 /// Read the encoder's helpers and sentinels from ``treekle.serialize``'s globals.
@@ -110,6 +128,8 @@ fn setup_encode(module: &Bound<'_, PyDict>) -> PyResult<()> {
 ///   mutable: Build dicts and lists when true; ``MappingProxyType`` and tuples
 ///     when false.
 ///   hooks: Codecs for leaf types with no built-in conversion, such as tensors.
+///   classes: Short names to write in ``py/object`` in place of import paths;
+///     when given, no other class is written as ``py/object``.
 ///   sort: Order each object's attributes by name; when false, keep slots in
 ///     MRO order then ``__dict__`` keys in insertion order. A stored form that
 ///     must stay byte-stable sets this false.
@@ -118,13 +138,15 @@ fn setup_encode(module: &Bound<'_, PyDict>) -> PyResult<()> {
 ///   tree: Fresh plain data that ``from_plain`` turns back into ``obj``.
 ///
 /// Raises:
-///   ValueError: ``dialect`` names no known format.
+///   ValueError: ``dialect`` names no known format, or ``classes`` names one
+///     class twice.
 ///   TypeError: A leaf has no conversion and no hook, a hook returns the type
-///     it encodes, or a dict key holds a cycle.
+///     it encodes, a dict key holds a cycle, or ``classes`` is given and lacks
+///     a ``py/object`` class.
 #[pyfunction]
 #[pyo3(
-    signature = (obj, *, dialect = Maybe(None), mutable = Maybe(None), hooks = Maybe(None), sort = Maybe(None)),
-    text_signature = "(obj, *, dialect='json', mutable=True, hooks=..., sort=True)"
+    signature = (obj, *, dialect = Maybe(None), mutable = Maybe(None), hooks = Maybe(None), classes = Maybe(None), sort = Maybe(None)),
+    text_signature = "(obj, *, dialect='json', mutable=True, hooks=..., classes=..., sort=True)"
 )]
 fn to_plain<'py>(
     py: Python<'py>,
@@ -132,9 +154,10 @@ fn to_plain<'py>(
     dialect: Maybe<'py>,
     mutable: Maybe<'py>,
     hooks: Maybe<'py>,
+    classes: Maybe<'py>,
     sort: Maybe<'py>,
 ) -> PyResult<B<'py>> {
-    encode::to_plain(py, obj, dialect.0, mutable.0, hooks.0, sort.0)
+    encode::to_plain(py, obj, dialect.0, mutable.0, hooks.0, classes.0, sort.0)
 }
 
 /// ``json.dumps(tree, ...)`` for a plain tree, with the same text.
@@ -170,26 +193,35 @@ fn json_loads_plain<'py>(py: Python<'py>, text: &B<'py>) -> PyResult<B<'py>> {
 /// ``from_plain(json.loads(text), target, ...)``, with the same value or error.
 #[pyfunction]
 #[pyo3(
-    signature = (text, target, *, hooks = Maybe(None), allow_imports = Maybe(None), strict = Maybe(None)),
-    text_signature = "(text, target, *, hooks=..., allow_imports=False, strict=True)"
+    signature = (text, target, *, hooks = Maybe(None), classes = Maybe(None), allow_imports = Maybe(None), strict = Maybe(None)),
+    text_signature = "(text, target, *, hooks=..., classes=..., allow_imports=False, strict=True)"
 )]
 fn json_loads_typed<'py>(
     py: Python<'py>,
     text: &B<'py>,
     target: &B<'py>,
     hooks: Maybe<'py>,
+    classes: Maybe<'py>,
     allow_imports: Maybe<'py>,
     strict: Maybe<'py>,
 ) -> PyResult<B<'py>> {
-    decode::from_json(py, text, target, hooks.0, allow_imports.0, strict.0)
+    decode::from_json(
+        py,
+        text,
+        target,
+        hooks.0,
+        classes.0,
+        allow_imports.0,
+        strict.0,
+    )
 }
 
 /// ``json.dumps(to_plain(obj, ...), ...)`` in one walk, and ``json_loads``'s
 /// other half: one call from object to text or back.
 #[pyfunction]
 #[pyo3(
-    signature = (obj, *, dialect = Maybe(None), hooks = Maybe(None), sort = Maybe(None), ensure_ascii = Maybe(None), separators = Maybe(None), indent = Maybe(None), sort_keys = Maybe(None)),
-    text_signature = "(obj, *, dialect='json', hooks=..., sort=True, ensure_ascii=True, separators=None, indent=None, sort_keys=False)"
+    signature = (obj, *, dialect = Maybe(None), hooks = Maybe(None), classes = Maybe(None), sort = Maybe(None), ensure_ascii = Maybe(None), separators = Maybe(None), indent = Maybe(None), sort_keys = Maybe(None)),
+    text_signature = "(obj, *, dialect='json', hooks=..., classes=..., sort=True, ensure_ascii=True, separators=None, indent=None, sort_keys=False)"
 )]
 #[allow(clippy::too_many_arguments)]
 fn json_dumps<'py>(
@@ -197,6 +229,7 @@ fn json_dumps<'py>(
     obj: &B<'py>,
     dialect: Maybe<'py>,
     hooks: Maybe<'py>,
+    classes: Maybe<'py>,
     sort: Maybe<'py>,
     ensure_ascii: Maybe<'py>,
     separators: Maybe<'py>,
@@ -226,6 +259,7 @@ fn json_dumps<'py>(
             obj,
             dialect.0.clone(),
             hooks.0.clone(),
+            classes.0.clone(),
             sort.0.clone(),
             style,
             options,
@@ -235,7 +269,7 @@ fn json_dumps<'py>(
     }
     // The text walk declined before running any user code; the tree walk's
     // answer goes through ``json.dumps`` as it is once that code has run.
-    let tree = encode::to_plain(py, obj, dialect.0, None, hooks.0, sort.0)?;
+    let tree = encode::to_plain(py, obj, dialect.0, None, hooks.0, classes.0, sort.0)?;
     json::dumps(
         py,
         &tree,

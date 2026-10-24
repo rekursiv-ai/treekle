@@ -16,10 +16,10 @@ import types
 
 import pytest
 
-from treekle import json_dumps, json_loads, to_plain, wire
+from treekle import from_plain, json_dumps, json_loads, to_plain, wire
 from treekle.deserialize import _python_from_plain
 from treekle.serialize import _python_to_plain
-from treekle.types import Hooks, ReadError
+from treekle.types import Classes, Hooks, ReadError
 
 
 if TYPE_CHECKING:
@@ -35,6 +35,109 @@ pytestmark = pytest.mark.usefixtures("implementation")
 class AttributeOrder:
     z: int = 1
     a: int = 2
+
+
+@dataclass(frozen=True, kw_only=True, slots=True)
+class Said:
+    text: str
+
+
+@dataclass(frozen=True, kw_only=True, slots=True)
+class Heard:
+    text: str
+
+
+@dataclass(frozen=True, kw_only=True, slots=True)
+class Unlisted:
+    text: str
+
+
+def _malformed(classes: object) -> Classes:
+    """Pass a mapping the type forbids, for the checks that reject it at runtime."""
+    return cast(Classes, classes)
+
+
+class TestClasses:
+    """``classes``: short ``py/object`` names, and the only classes a tag builds."""
+
+    classes: Final = types.MappingProxyType({"said": Said, "heard": Heard})
+
+    def test_a_record_writes_its_short_name(self) -> None:
+        assert json_dumps(Said(text="hi"), classes=self.classes) == (
+            '{"py/object": "said", "text": "hi"}'
+        )
+        assert to_plain(Heard(text="hi"), classes=self.classes) == {
+            "py/object": "heard",
+            "text": "hi",
+        }
+
+    def test_look_alike_union_members_read_by_name(self) -> None:
+        records = [Heard(text="a"), Said(text="b"), Heard(text="c")]
+        text = json_dumps(records, classes=self.classes)
+        # Twice: a second read takes the paths a first read compiles and keeps.
+        for _ in range(2):
+            assert json_loads(text, list[Said | Heard], classes=self.classes) == records
+            assert (
+                from_plain(
+                    json.loads(text),
+                    list[Said | Heard],
+                    classes=self.classes,
+                )
+                == records
+            )
+
+    def test_a_record_reads_as_its_own_class_without_imports(self) -> None:
+        text = '{"py/object": "said", "text": "hi"}'
+        assert json_loads(text, Said, classes=self.classes) == Said(text="hi")
+        assert json_loads(text, object, classes=self.classes) == Said(text="hi")
+
+    def test_a_name_naming_another_class_reads_as_that_class(self) -> None:
+        with pytest.raises(ReadError, match="as"):
+            json_loads(
+                '{"py/object": "heard", "text": "hi"}',
+                Said,
+                classes=self.classes,
+            )
+
+    def test_a_class_outside_classes_is_not_written(self) -> None:
+        with pytest.raises(TypeError, match="not in classes"):
+            json_dumps(Unlisted(text="hi"), classes=self.classes)
+        with pytest.raises(TypeError, match="not in classes"):
+            to_plain([Unlisted(text="hi")], classes=self.classes)
+
+    def test_a_name_outside_classes_is_not_read(self) -> None:
+        with pytest.raises(ReadError, match="'unlisted' is not in classes"):
+            json_loads(
+                '{"py/object": "unlisted", "text": "hi"}',
+                object,
+                classes=self.classes,
+            )
+        path = f"{Unlisted.__module__}.{Unlisted.__qualname__}"
+        with pytest.raises(ReadError, match="is not in classes"):
+            json_loads(
+                json.dumps({"py/object": path, "text": "hi"}),
+                object,
+                classes=self.classes,
+                allow_imports=True,
+            )
+
+    def test_a_call_without_classes_still_uses_import_paths(self) -> None:
+        json_loads(
+            json_dumps([Said(text="a"), Heard(text="b")], classes=self.classes),
+            list[Said | Heard],
+            classes=self.classes,
+        )
+        text = json_dumps([Heard(text="a")])
+        assert f'"{Heard.__module__}.{Heard.__qualname__}"' in text
+        assert json_loads(text, list[Said | Heard]) == [Heard(text="a")]
+
+    def test_a_malformed_classes_is_rejected(self) -> None:
+        with pytest.raises(ValueError, match="names one class twice"):
+            json_dumps(Said(text="hi"), classes={"a": Said, "b": Said})
+        with pytest.raises(TypeError, match="is not a class"):
+            json_loads("[]", list[int], classes=_malformed({"a": 1}))
+        with pytest.raises(TypeError, match="keys must be str"):
+            to_plain(1, classes=_malformed({1: Said}))
 
 
 class TestJsonLoads:
@@ -196,11 +299,13 @@ def test_the_cores_json_functions_take_every_option(
     )
     assert json_loads("[1]") == "loads"
     hooks: Hooks = {Path: (str, Path)}
+    classes = {"said": Said}
     assert (
         json_dumps(
             [1],
             dialect="python",
             hooks=hooks,
+            classes=classes,
             sort=False,
             ensure_ascii=False,
             separators=(",", ":"),
@@ -210,7 +315,14 @@ def test_the_cores_json_functions_take_every_option(
         == "dumps"
     )
     assert (
-        json_loads("[1]", list[int], hooks=hooks, allow_imports=True, strict=False)
+        json_loads(
+            "[1]",
+            list[int],
+            hooks=hooks,
+            classes=classes,
+            allow_imports=True,
+            strict=False,
+        )
         == "typed_loads"
     )
     assert calls == [
@@ -221,6 +333,7 @@ def test_the_cores_json_functions_take_every_option(
             {
                 "dialect": "python",
                 "hooks": hooks,
+                "classes": classes,
                 "sort": False,
                 "ensure_ascii": False,
                 "separators": (",", ":"),
@@ -231,7 +344,12 @@ def test_the_cores_json_functions_take_every_option(
         (
             "typed_loads",
             ("[1]", list[int]),
-            {"hooks": hooks, "allow_imports": True, "strict": False},
+            {
+                "hooks": hooks,
+                "classes": classes,
+                "allow_imports": True,
+                "strict": False,
+            },
         ),
     ]
 

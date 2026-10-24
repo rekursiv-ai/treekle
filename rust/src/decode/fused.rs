@@ -31,10 +31,14 @@ pub fn from_json<'py>(
     text: &B<'py>,
     target: &B<'py>,
     hooks: Option<B<'py>>,
+    classes: Option<B<'py>>,
     allow_imports: Option<B<'py>>,
     strict: Option<B<'py>>,
 ) -> PyResult<B<'py>> {
+    // A ``classes`` that does not read is left to ``from_plain``, which raises
+    // only once ``json.loads`` has read the text, as Python does.
     if let Some(globals) = DEC.cloned(py)
+        && let Ok(class_names) = ClassNames::read(py, classes.as_ref())
         && json::current_loads(py)?.1
         && let Ok(bytes) = json::document(text)
         && let Some(&(b'{' | b'[')) = bytes.iter().find(|byte| !byte.is_ascii_whitespace())
@@ -48,6 +52,7 @@ pub fn from_json<'py>(
             Flag::new(allow_imports.clone(), false),
             Flag::new(strict.clone(), true),
             false,
+            class_names,
             caches,
         );
         let mut reader = Reader::open(py, bytes)?;
@@ -76,6 +81,7 @@ pub fn from_json<'py>(
         target,
         None,
         hooks,
+        classes,
         Flag::new(allow_imports, false),
         Flag::new(strict, true),
     )
@@ -343,8 +349,8 @@ impl<'py> Decoder<'py, '_> {
         }
         reader.at += 1;
         let tag = reader.string(false).map_err(|_| Miss::Stop)?;
-        let first = info
-            .import_names
+        let names = self.member_tags(plan, info).map_err(|_| Miss::Stop)?;
+        let first = names
             .iter()
             .position(|name| {
                 name.as_ref().is_some_and(|name| {
@@ -400,6 +406,7 @@ impl<'py> Decoder<'py, '_> {
         let Flag::Known(imports) = self.allow_imports else {
             return Err(Miss::Stop);
         };
+        let named = imports || self.class_names.is_some();
         if !plan.is_dataclass
             || !is_class(target)
             || !matches!(plan.fits, Fits::IsInstance(None))
@@ -448,11 +455,8 @@ impl<'py> Decoder<'py, '_> {
                         return Err(Miss::Stop);
                     }
                     let raw = reader.value(depth).map_err(|_| Miss::Stop)?;
-                    if imports {
-                        let own = plan
-                            .import_name
-                            .as_ref()
-                            .expect("classes have import names");
+                    if named {
+                        let own = self.own_tag(target, plan).ok_or(Miss::Stop)?;
                         if tp(&raw) != t_str() || !unsafe { same_text(raw.as_ptr(), own.as_ptr()) }
                         {
                             return Err(Miss::Stop);

@@ -50,11 +50,13 @@ from treekle.plain import immutable
 from treekle.reflect import (
     PENDING,
     attribute_names,
+    class_tags,
     is_mutable,
     resolve_import,
     resolves_to,
 )
 from treekle.types import (
+    Classes,
     Dialect,
     Hooks,
     MutablePlainTree,
@@ -74,6 +76,7 @@ def to_plain(
     dialect: Dialect = ...,
     mutable: Literal[True] = ...,
     hooks: Hooks = ...,
+    classes: Classes = ...,
     sort: bool = ...,
 ) -> MutablePlainTree: ...
 
@@ -85,6 +88,7 @@ def to_plain(
     dialect: Dialect = ...,
     mutable: bool,
     hooks: Hooks = ...,
+    classes: Classes = ...,
     sort: bool = ...,
 ) -> PlainTree: ...
 
@@ -95,6 +99,7 @@ def to_plain(
     dialect: Dialect = "json",
     mutable: bool = True,
     hooks: Hooks = MappingProxyType({}),
+    classes: Classes = MappingProxyType({}),
     sort: bool = True,
 ) -> PlainTree:
     """Convert a Python value to plain data, tagging what ``dialect`` lacks.
@@ -107,6 +112,8 @@ def to_plain(
       mutable: Build dicts and lists when true; ``MappingProxyType`` and tuples
         when false.
       hooks: Codecs for leaf types with no built-in conversion, such as tensors.
+      classes: Short names to write in ``py/object`` in place of import paths;
+        when given, no other class is written as ``py/object``.
       sort: Order each object's attributes by name; when false, keep slots in
         MRO order then ``__dict__`` keys in insertion order. A stored form that
         must stay byte-stable sets this false.
@@ -115,16 +122,19 @@ def to_plain(
       tree: Fresh plain data that ``from_plain`` turns back into ``obj``.
 
     Raises:
-      ValueError: ``dialect`` names no known format.
+      ValueError: ``dialect`` names no known format, or ``classes`` names one
+        class twice.
       TypeError: A leaf has no conversion and no hook, a hook returns the type
-        it encodes, or a dict key holds a cycle.
+        it encodes, a dict key holds a cycle, or ``classes`` is given and lacks
+        a ``py/object`` class.
 
     """
     if dialect not in get_args(Dialect.__value__):
         raise ValueError(f"unknown dialect {dialect!r}; expected 'json' or 'python'")
+    tags = class_tags(classes)
     tree = cast(
         "MutablePlainTree",
-        _encode(obj, _Encoding(dialect=dialect, hooks=hooks, sort=sort)),
+        _encode(obj, _Encoding(dialect=dialect, hooks=hooks, tags=tags, sort=sort)),
     )
     return tree if mutable else immutable(tree)
 
@@ -150,6 +160,7 @@ class _Encoding:
     Attributes:
       dialect: The target format.
       hooks: Codecs for leaf types with no built-in conversion.
+      tags: Each class's short name for ``py/object``; empty writes import paths.
       sort: Order each object's attributes by name, or keep declaration order.
       here: Where the value being encoded sits.
       node: The node the value being encoded is written into.
@@ -162,6 +173,7 @@ class _Encoding:
 
     dialect: Dialect
     hooks: Hooks
+    tags: Mapping[type, str] = field(default_factory=dict[type, str])
     sort: bool = True
     here: _Here = None
     node: _Node = field(default_factory=list[object])
@@ -530,8 +542,12 @@ def _encode_function(value: object, state: _Encoding) -> object:
 
 def _encode_object(value: object, state: _Encoding) -> object:
     """Encode a dataclass or slotted object as ``py/object`` with its state."""
+    kind = type(value)
+    if state.tags and kind not in state.tags:
+        raise TypeError(f"Cannot serialize {kind!r}: it is not in classes.")
     _register(value, state)
-    node: dict[str, object] = {"py/object": _import_path(type(value))}
+    name = state.tags[kind] if state.tags else _import_path(kind)
+    node: dict[str, object] = {"py/object": name}
     for name in attribute_names(value, sort=state.sort):
         member: object = getattr(value, name, PENDING)
         if member is not PENDING:

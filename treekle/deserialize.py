@@ -70,12 +70,14 @@ from treekle.absent import ABSENT
 from treekle.native import native
 from treekle.reflect import (
     PENDING,
+    class_tags,
     is_mutable,
     resolve_import,
     resolves_to,
     slot_names,
 )
 from treekle.types import (
+    Classes,
     FieldPath,
     Hooks,
     Invalid,
@@ -100,6 +102,7 @@ def from_plain[T](
     target: type[T],
     *,
     hooks: Hooks = ...,
+    classes: Classes = ...,
     allow_imports: bool = ...,
     strict: bool = ...,
 ) -> T: ...
@@ -112,6 +115,7 @@ def from_plain[T](
     *,
     default: None,
     hooks: Hooks = ...,
+    classes: Classes = ...,
     allow_imports: bool = ...,
     strict: bool = ...,
 ) -> T | None: ...
@@ -124,6 +128,7 @@ def from_plain[T](
     *,
     default: T,
     hooks: Hooks = ...,
+    classes: Classes = ...,
     allow_imports: bool = ...,
     strict: bool = ...,
 ) -> T: ...
@@ -136,6 +141,7 @@ def from_plain(
     *,
     default: object = ...,
     hooks: Hooks = ...,
+    classes: Classes = ...,
     allow_imports: bool = ...,
     strict: bool = ...,
 ) -> object: ...
@@ -147,6 +153,7 @@ def from_plain(
     *,
     default: object = ABSENT,
     hooks: Hooks = MappingProxyType({}),
+    classes: Classes = MappingProxyType({}),
     allow_imports: bool = False,
     strict: bool = True,
 ) -> object:
@@ -162,6 +169,8 @@ def from_plain(
       default: Returned when ``data`` is ``None`` (a missing or null field);
         omit to read ``None`` like any other value.
       hooks: The codecs ``to_plain`` used.
+      classes: The short names ``to_plain`` wrote in ``py/object``; when given,
+        a ``py/object`` tag builds only these classes, and imports nothing.
       allow_imports: Whether tags may import modules and call code they name.
         A ``py/object`` tag naming the target dataclass itself needs none.
       strict: When false, also read numeric and boolean text (``"3"`` as
@@ -171,14 +180,20 @@ def from_plain(
       value: ``data`` as a ``target``, or ``default``.
 
     Raises:
-      ReadError: ``data`` does not fit ``target``, or a tag needs imports while
-        ``allow_imports`` is false.
+      ReadError: ``data`` does not fit ``target``, a tag needs imports while
+        ``allow_imports`` is false, or a ``py/object`` tag is not in a given
+        ``classes``.
+      TypeError: ``classes`` has a key that is not a ``str``, or a value that
+        is not a class.
+      ValueError: ``classes`` names one class twice.
 
     """
     if data is None and default is not ABSENT:
         return default
     state = _Decoding(
         hooks=hooks,
+        classes=dict(classes),
+        tags=class_tags(classes),
         allow_imports=allow_imports,
         strict=strict,
         untagged=not _holds_tags(data),
@@ -211,6 +226,9 @@ class _Decoding:
 
     Attributes:
       hooks: The codecs ``to_plain`` used.
+      classes: Short ``py/object`` names to their classes; empty reads import
+        paths.
+      tags: Each class in ``classes`` to its short name.
       allow_imports: Whether tags may import modules and call code they name.
       strict: Whether scalars must arrive as their own plain kind.
       untagged: Whether the input holds no tag, so an ``object`` part is
@@ -227,6 +245,8 @@ class _Decoding:
 
     hooks: Hooks
     allow_imports: bool
+    classes: dict[str, type] = field(default_factory=dict[str, type])
+    tags: dict[type, str] = field(default_factory=dict[type, str])
     strict: bool = True
     untagged: bool = False
     built: list[object] = field(default_factory=list[object])
@@ -375,7 +395,7 @@ def _start_node(
             or (
                 tag == "py/object"
                 and decoder is _decode_any
-                and not state.allow_imports
+                and not _objects_named(state)
             )
         ):
             return decoder(data, target, at, state)
@@ -404,7 +424,7 @@ def _decode_tagged(
     if "py/id" in data:
         return _decode_reference(data, state)
     if "py/object" in data:
-        if not state.allow_imports:
+        if not _objects_named(state):
             return _decode_entries(data, object, object, at, state)
         return _decode_stored(data, at, state)
     if len(data) == 1:
@@ -1280,10 +1300,7 @@ def _decode_exact_object(
         if type(key) is not str:
             return None
         if key == "py/object":
-            if (
-                type(raw) is not str
-                or raw != f"{target.__module__}.{target.__qualname__}"
-            ):
+            if type(raw) is not str or raw != _class_tag(target, state):
                 return None
             stored = True
         elif key not in types:
@@ -1317,7 +1334,7 @@ def _decode_stored(
     path = data["py/object"]
     if not isinstance(path, str):
         raise ReadError(f"invalid py/object path: {_shown(path)}")
-    kind = _resolve(path, state)
+    kind = _object_class(path, state)
     if not isinstance(kind, type):
         raise ReadError(f"{_shown(path)} does not name a class")
     value = _allocate(kind)
@@ -1347,8 +1364,8 @@ def _with_defaults(
     return filled
 
 
-# It does when the tag names ``target``, or when imports are off: the tag's class cannot
-# be built then, and data written before a class moved still names its old path.
+# It does when the tag names ``target``, or when no tag names a class to build (imports
+# off, no ``classes``): data written before a class moved still names its old path.
 def _names_dataclass(
     data: Mapping[str, PlainTree],
     target: object,
@@ -1359,8 +1376,8 @@ def _names_dataclass(
         isinstance(target, type)
         and is_dataclass(target)
         and (
-            not state.allow_imports
-            or data.get("py/object") == f"{target.__module__}.{target.__qualname__}"
+            not _objects_named(state)
+            or data.get("py/object") == _class_tag(target, state)
         )
     )
 
@@ -1494,7 +1511,7 @@ def _decode_union(
         # cannot pick a sibling whose fields happen to fit too.
         path = cast("Mapping[str, PlainTree]", data).get("py/object")
         members = tuple(
-            sorted(members, key=lambda member: _import_name(member) != path),
+            sorted(members, key=lambda member: _class_tag(member, state) != path),
         )
     else:
         members = _union_candidates(data, members)
@@ -2100,6 +2117,28 @@ def _allocate(kind: type) -> object:
     """Allocate ``kind`` without running ``__init__``."""
     allocate = cast("Callable[[type], object]", kind.__new__)
     return allocate(kind)
+
+
+def _objects_named(state: _Decoding) -> bool:
+    """Return whether a ``py/object`` tag names a class to build."""
+    return bool(state.classes) or state.allow_imports
+
+
+def _class_tag(member: object, state: _Decoding) -> str | None:
+    """Return the ``py/object`` text naming class ``member``, if any."""
+    if state.classes:
+        return state.tags.get(member) if isinstance(member, type) else None
+    return _import_name(member)
+
+
+def _object_class(path: str, state: _Decoding) -> object:
+    """Return the class a ``py/object`` tag names: from ``classes``, else imported."""
+    if not state.classes:
+        return _resolve(path, state)
+    kind = state.classes.get(path)
+    if kind is None:
+        raise ReadError(f"{path!r} is not in classes")
+    return kind
 
 
 def _resolve(path: str, state: _Decoding) -> object:

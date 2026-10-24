@@ -428,6 +428,55 @@ class Doubled:
         object.__setattr__(self, "value", self.value * 2)
 
 
+@dataclass(frozen=True, kw_only=True, slots=True)
+class _Said:
+    text: str
+
+
+@dataclass(frozen=True, kw_only=True, slots=True)
+class _Heard:
+    text: str
+
+
+class TestClasses:
+    classes: Final = MappingProxyType({"said": _Said, "heard": _Heard})
+
+    def test_a_short_name_reads_as_its_class(self) -> None:
+        said = {"py/object": "said", "text": "hi"}
+        assert from_plain(said, _Said, classes=self.classes) == _Said(text="hi")
+        assert from_plain(said, object, classes=self.classes) == _Said(text="hi")
+
+    def test_look_alike_union_members_read_by_name(self) -> None:
+        rows = [
+            {"py/object": "heard", "text": "a"},
+            {"py/object": "said", "text": "b"},
+        ]
+        assert from_plain(rows, list[_Said | _Heard], classes=self.classes) == [
+            _Heard(text="a"),
+            _Said(text="b"),
+        ]
+
+    def test_a_name_outside_classes_does_not_read(self) -> None:
+        with pytest.raises(ReadError, match="'other' is not in classes"):
+            from_plain(
+                {"py/object": "other", "text": "hi"},
+                object,
+                classes=self.classes,
+            )
+
+    def test_a_malformed_classes_is_rejected(self) -> None:
+        with pytest.raises(ValueError, match="names one class twice"):
+            from_plain(None, object, classes={"a": _Said, "b": _Said})
+
+    def test_without_classes_or_imports_a_tag_is_ignored(self) -> None:
+        # Why ``classes`` exists: the first look-alike member wins.
+        heard = {"py/object": "heard", "text": "hi"}
+        assert from_plain(heard, _Said | _Heard) == _Said(text="hi")
+        assert from_plain(heard, _Said | _Heard, classes=self.classes) == _Heard(
+            text="hi",
+        )
+
+
 class TestTypedDecode:
     def test_a_dataclass_reads_untagged_fields(self) -> None:
         assert from_plain({"x": 1, "y": 2}, Point) == Point(x=1, y=2.0)
