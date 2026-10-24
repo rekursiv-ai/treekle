@@ -25,6 +25,7 @@ use crate::class::{
     PathCheck, PathGlobals, Stamp, member_of, object_new, own_namespace, store_offsets,
     type_lookup, version_tag,
 };
+use crate::classes::ClassNames;
 use crate::errors::*;
 use crate::places::{Loc, Paths, PlacedTable, ROOT, Spare, StepRef};
 use crate::py::*;
@@ -1026,6 +1027,8 @@ pub struct Decoder<'py, 'g> {
     allow_imports: Flag<'py>,
     strict: Flag<'py>,
     untagged: bool,
+    /// ``classes``' short names, when the call gave any.
+    class_names: Option<ClassNames>,
     built: Vec<B<'py>>,
     paths: Paths<'py>,
     placed: PlacedTable<'py>,
@@ -1181,6 +1184,7 @@ impl Reading {
 impl<'py, 'g> Decoder<'py, 'g> {
     // ------------------------------------------------------------ helpers --
 
+    #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'py>,
         g: &'g DecGlobals,
@@ -1188,6 +1192,7 @@ impl<'py, 'g> Decoder<'py, 'g> {
         allow_imports: Flag<'py>,
         strict: Flag<'py>,
         untagged: bool,
+        class_names: Option<ClassNames>,
         caches: Caches,
     ) -> Self {
         let (paths, placed, built) = match SPARE.take(py) {
@@ -1201,6 +1206,7 @@ impl<'py, 'g> Decoder<'py, 'g> {
             allow_imports,
             strict,
             untagged,
+            class_names,
             built,
             paths,
             placed,
@@ -2228,6 +2234,58 @@ impl<'py, 'g> Decoder<'py, 'g> {
         drop(stale);
     }
 
+    /// ``_objects_named``: whether a ``py/object`` tag names a class to build.
+    fn objects_named(&self) -> PyResult<bool> {
+        Ok(self.class_names.is_some() || self.allow_imports.get()?)
+    }
+
+    /// ``_class_tag(target)``: the ``py/object`` text naming class ``target``.
+    fn own_tag(&self, target: &B<'py>, plan: &Plan) -> Option<B<'py>> {
+        match &self.class_names {
+            Some(names) => names.tag(self.py, target).map(Bound::into_any),
+            None => plan
+                .import_name
+                .as_ref()
+                .map(|name| name.bind(self.py).clone()),
+        }
+    }
+
+    /// ``_class_tag`` of each of a union's members, in member order.
+    fn member_tags(&self, plan: &Plan, info: &UnionInfo) -> PyResult<Vec<Option<B<'py>>>> {
+        let py = self.py;
+        let Some(names) = &self.class_names else {
+            return Ok(info
+                .import_names
+                .iter()
+                .map(|name| name.as_ref().map(|name| name.bind(py).clone()))
+                .collect());
+        };
+        Ok(plan
+            .args
+            .bind(py)
+            .iter()
+            .map(|member| {
+                if is_class(&member) {
+                    names.tag(py, &member).map(Bound::into_any)
+                } else {
+                    None
+                }
+            })
+            .collect())
+    }
+
+    /// ``_object_class``: the class a ``py/object`` tag names, from
+    /// ``classes`` when given, else imported.
+    fn object_class(&mut self, path: &B<'py>) -> DR<B<'py>> {
+        let Some(names) = &self.class_names else {
+            return self.resolve(path);
+        };
+        match names.class(self.py, path)? {
+            Some(kind) => Ok(kind),
+            None => fail(format!("{} is not in classes", repr(path)?)),
+        }
+    }
+
     fn resolve(&mut self, path: &B<'py>) -> DR<B<'py>> {
         if !self.allow_imports.get()? {
             return fail(format!("{} needs allow_imports=True", repr(path)?));
@@ -2625,7 +2683,7 @@ impl<'py, 'g> Decoder<'py, 'g> {
                 return self.run_kind(data, target, plan, at, keys.as_ref());
             };
             if (plan.kind == Kind::Dict && tag != Tag::MappingProxy)
-                || (tag == Tag::Object && plan.kind == Kind::Any && !self.allow_imports.get()?)
+                || (tag == Tag::Object && plan.kind == Kind::Any && !self.objects_named()?)
             {
                 return self.run_kind(data, target, plan, at, keys.as_ref());
             }
@@ -2694,7 +2752,7 @@ impl<'py, 'g> Decoder<'py, 'g> {
             Some(keys) => keys.object,
             None => data.contains(pyo3::intern!(py, "py/object"))?,
         } {
-            if !self.allow_imports.get()? {
+            if !self.objects_named()? {
                 let object = self.object_plan.clone();
                 return self.decode_entries(any, &object, &object, at);
             }
@@ -4133,7 +4191,8 @@ impl<'py, 'g> Decoder<'py, 'g> {
             return Ok(None);
         }
         // Members the tag names sort first, in member order.
-        let Some(first) = info.import_names.iter().position(|name| {
+        let names = self.member_tags(plan, info)?;
+        let Some(first) = names.iter().position(|name| {
             name.as_ref().is_some_and(|name| {
                 ob_type(name.as_ptr()) == t_str() && unsafe { same_text(name.as_ptr(), tag) }
             })
@@ -4176,7 +4235,7 @@ impl<'py, 'g> Decoder<'py, 'g> {
             tagged |= text.starts_with(b"py/");
         }
         let first = if tagged {
-            info.import_names
+            self.member_tags(plan, info)?
                 .iter()
                 .position(Option::is_none)
                 .unwrap_or(0)
@@ -4375,6 +4434,7 @@ impl<'py, 'g> Decoder<'py, 'g> {
         let Flag::Known(imports) = self.allow_imports else {
             return Ok(None);
         };
+        let named = imports || self.class_names.is_some();
         if !plan.is_dataclass
             || !is_class(target)
             || !matches!(plan.fits, Fits::IsInstance(None))
@@ -4425,13 +4485,13 @@ impl<'py, 'g> Decoder<'py, 'g> {
                 return Ok(None);
             };
             if slot == TAG_SLOT {
-                // With imports on, the record reads by its own fields only
-                // when the tag names ``target``; else it names a class to import.
-                if imports {
-                    let own = plan
-                        .import_name
-                        .as_ref()
-                        .expect("classes have import names");
+                // Where a tag names a class to build, the record reads by its
+                // own fields only when the tag names ``target``.
+                if named {
+                    let Some(own) = self.own_tag(target, plan) else {
+                        self.rollback(mark)?;
+                        return Ok(None);
+                    };
                     if ob_type(raw) != t_str() || !unsafe { same_text(raw, own.as_ptr()) } {
                         self.rollback(mark)?;
                         return Ok(None);
@@ -5144,14 +5204,12 @@ impl<'py, 'g> Decoder<'py, 'g> {
         // taken without the dict copy Python makes of them.
         let mut snapshot: Option<Vec<(B<'py>, B<'py>)>> = None;
         if plan.is_dataclass && is_class(target) {
-            let names = !self.allow_imports.get()? || {
+            let names = !self.objects_named()? || {
                 let named = self.get_or_none(&data, key_object)?;
-                let own = plan
-                    .import_name
-                    .as_ref()
-                    .expect("classes have import names")
-                    .bind(py);
-                py_eq(&named, own)?
+                match self.own_tag(target, plan) {
+                    Some(own) => py_eq(&named, &own)?,
+                    None => py_eq(&named, &py.None().into_bound(py))?,
+                }
             };
             // Python copies every record it reads by the target's own fields,
             // keeping each key ``!= "py/object"``. For an exact dict without
@@ -5269,7 +5327,6 @@ impl<'py, 'g> Decoder<'py, 'g> {
         plan: &Rc<Plan>,
         at: Loc<'_, 'py>,
     ) -> DR<Option<Start<'py>>> {
-        let py = self.py;
         if tp(data) != t_dict() {
             return Ok(None);
         }
@@ -5282,12 +5339,10 @@ impl<'py, 'g> Decoder<'py, 'g> {
         if info.bytes.is_none() {
             return Ok(None);
         }
-        let own = plan
-            .import_name
-            .as_ref()
-            .expect("classes have import names")
-            .bind(py);
-        let Some(own) = (tp(own) == t_str()).then(|| utf8(own)).flatten() else {
+        let Some(own) = self.own_tag(target, plan) else {
+            return Ok(None);
+        };
+        let Some(own) = (tp(&own) == t_str()).then(|| utf8(&own)).flatten() else {
             return Ok(None);
         };
         let dict = unsafe { data.cast_unchecked::<PyDict>() };
@@ -5615,7 +5670,7 @@ impl<'py, 'g> Decoder<'py, 'g> {
         if !is_str(&path) {
             return fail(format!("invalid py/object path: {}", self.shown(&path)?));
         }
-        let kind = self.resolve(&path)?;
+        let kind = self.object_class(&path)?;
         if !is_class(&kind) {
             return fail(format!("{} does not name a class", self.shown(&path)?));
         }
@@ -5827,9 +5882,9 @@ impl<'py, 'g> Decoder<'py, 'g> {
             // cannot pick a sibling whose fields happen to fit too.
             let path = self.get_or_none(data, pyo3::intern!(py, "py/object"))?;
             let mut keyed = Vec::with_capacity(members.len());
-            for (index, name) in info.import_names.iter().enumerate() {
+            for (index, name) in self.member_tags(plan, info)?.iter().enumerate() {
                 let differs = match name {
-                    Some(name) => !py_eq(name.bind(py), &path)?,
+                    Some(name) => !py_eq(name, &path)?,
                     None => !path.is_none(),
                 };
                 keyed.push((differs, index));
@@ -6117,6 +6172,9 @@ fn text_of<'a>(obj: &'a B<'_>) -> Option<&'a [u8]> {
 struct Exec<'a, 'py> {
     py: Python<'py>,
     prog: &'a Program,
+    /// The call's ``classes``: a record's tag is checked against its class's
+    /// short name rather than the import name the program was compiled with.
+    class_names: Option<&'a ClassNames>,
     /// Whether the input holds no tag, or ``None`` before the tag scan: an
     /// ``object`` container is then neither the input itself nor a copy.
     untagged: Option<bool>,
@@ -6124,6 +6182,50 @@ struct Exec<'a, 'py> {
 }
 
 impl<'py> Exec<'_, 'py> {
+    /// Whether ``path``, a record's ``py/object``, names ``rec``'s class.
+    fn names_rec(&self, path: &B<'py>, rec: &Rec) -> bool {
+        let Some(text) = text_of(path) else {
+            return false;
+        };
+        match self.class_names {
+            Some(names) => names
+                .tag(self.py, rec.class.bind(self.py))
+                .is_some_and(|own| utf8(own.as_any()) == Some(text)),
+            None => text == &*rec.own,
+        }
+    }
+
+    /// The first member whose ``py/object`` text is ``path``; ``None``
+    /// matches the members that are not classes.
+    fn union_first(&self, union: &Union, path: Option<&[u8]>) -> usize {
+        let py = self.py;
+        let Some(names) = self.class_names else {
+            return union
+                .names
+                .iter()
+                .position(|name| name.as_deref() == path)
+                .unwrap_or(0);
+        };
+        union
+            .plan
+            .args
+            .bind(py)
+            .iter()
+            .position(|member| {
+                let tag = if is_class(&member) {
+                    names.tag(py, &member)
+                } else {
+                    None
+                };
+                match (tag, path) {
+                    (Some(tag), Some(path)) => utf8(tag.as_any()) == Some(path),
+                    (None, None) => true,
+                    _ => false,
+                }
+            })
+            .unwrap_or(0)
+    }
+
     #[inline]
     fn enter(&mut self, raw: &B<'py>) -> Result<(), Stop> {
         let address = raw.as_ptr() as usize;
@@ -6343,7 +6445,7 @@ impl<'py> Exec<'_, 'py> {
             }
             if !stored && key == pyo3::intern!(py, "py/object").as_ptr() {
                 let path = unsafe { Bound::from_borrowed_ptr(py, each) };
-                if text_of(&path) != Some(&*rec.own) {
+                if !self.names_rec(&path, rec) {
                     return Err(Stop::Abort);
                 }
                 stored = true;
@@ -6354,7 +6456,7 @@ impl<'py> Exec<'_, 'py> {
                 // ``py/object`` as a str not interned; no field has that name.
                 None if unsafe { utf8_ptr(key) } == Some(b"py/object".as_slice()) && !stored => {
                     let path = unsafe { Bound::from_borrowed_ptr(py, each) };
-                    if text_of(&path) != Some(&*rec.own) {
+                    if !self.names_rec(&path, rec) {
                         return Err(Stop::Abort);
                     }
                     stored = true;
@@ -6434,13 +6536,9 @@ impl<'py> Exec<'_, 'py> {
                         let Some(path) = text_of(&path) else {
                             return Err(Stop::Abort);
                         };
-                        union
-                            .names
-                            .iter()
-                            .position(|name| name.as_deref() == Some(path))
-                            .unwrap_or(0)
+                        self.union_first(union, Some(path))
                     }
-                    None => union.names.iter().position(Option::is_none).unwrap_or(0),
+                    None => self.union_first(union, None),
                 }));
             }
         } else {
@@ -6536,6 +6634,7 @@ impl<'py> Decoder<'py, '_> {
         let mut exec = Exec {
             py: self.py,
             prog: &program,
+            class_names: self.class_names.as_ref(),
             untagged,
             stack: Vec::new(),
         };
@@ -7332,12 +7431,14 @@ fn holds_tags_walk<'py>(g: &DecGlobals, data: &B<'py>) -> PyResult<bool> {
 
 // ------------------------------------------------------------ entry point --
 
+#[allow(clippy::too_many_arguments)]
 pub fn from_plain<'py>(
     py: Python<'py>,
     data: &B<'py>,
     target: &B<'py>,
     default: Option<B<'py>>,
     hooks: Option<B<'py>>,
+    classes: Option<B<'py>>,
     allow_imports: Flag<'py>,
     strict: Flag<'py>,
 ) -> PyResult<B<'py>> {
@@ -7353,6 +7454,7 @@ pub fn from_plain<'py>(
     {
         return Ok(default.clone());
     }
+    let class_names = ClassNames::read(py, classes.as_ref())?;
     let kind = tp(data);
     // ``_start_node``'s first rule: a leaf of exactly its declared kind reads
     // as itself, whatever the options, so no walk need be set up for it.
@@ -7371,7 +7473,16 @@ pub fn from_plain<'py>(
         }
     }
     let caches = CACHES.take(py).unwrap_or_else(|| new_caches(py));
-    let mut decoder = Decoder::new(py, g, hooks, allow_imports, strict, false, caches);
+    let mut decoder = Decoder::new(
+        py,
+        g,
+        hooks,
+        allow_imports,
+        strict,
+        false,
+        class_names,
+        caches,
+    );
     // The quick attempt runs no Python code, so trying it before the tag scan
     // changes nothing the scan or the walk would see.
     let mut scan_error = None;

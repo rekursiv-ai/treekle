@@ -1,6 +1,6 @@
 from typing import Literal, overload
 
-from treekle.types import Dialect, Hooks, MutablePlainTree, PlainTree
+from treekle.types import Classes, Dialect, Hooks, MutablePlainTree, PlainTree
 
 def setup_encode(module: dict[str, object]) -> None: ...
 def setup_decode(module: dict[str, object]) -> None: ...
@@ -11,6 +11,7 @@ def to_plain(
     dialect: Dialect = ...,
     mutable: Literal[True] = ...,
     hooks: Hooks = ...,
+    classes: Classes = ...,
     sort: bool = ...,
 ) -> MutablePlainTree: ...
 @overload
@@ -20,6 +21,7 @@ def to_plain(
     dialect: Dialect = ...,
     mutable: bool,
     hooks: Hooks = ...,
+    classes: Classes = ...,
     sort: bool = ...,
 ) -> PlainTree: ...
 @overload
@@ -28,6 +30,7 @@ def from_plain[T](
     target: type[T],
     *,
     hooks: Hooks = ...,
+    classes: Classes = ...,
     allow_imports: bool = ...,
     strict: bool = ...,
 ) -> T: ...
@@ -38,6 +41,7 @@ def from_plain[T](
     *,
     default: None,
     hooks: Hooks = ...,
+    classes: Classes = ...,
     allow_imports: bool = ...,
     strict: bool = ...,
 ) -> T | None: ...
@@ -48,6 +52,7 @@ def from_plain[T](
     *,
     default: T,
     hooks: Hooks = ...,
+    classes: Classes = ...,
     allow_imports: bool = ...,
     strict: bool = ...,
 ) -> T: ...
@@ -58,6 +63,7 @@ def from_plain(
     *,
     default: object = ...,
     hooks: Hooks = ...,
+    classes: Classes = ...,
     allow_imports: bool = ...,
     strict: bool = ...,
 ) -> object: ...
@@ -75,6 +81,7 @@ def json_loads_typed(
     target: object,
     *,
     hooks: Hooks = ...,
+    classes: Classes = ...,
     allow_imports: bool = ...,
     strict: bool = ...,
 ) -> object: ...
@@ -83,6 +90,7 @@ def json_dumps(
     *,
     dialect: Dialect = ...,
     hooks: Hooks = ...,
+    classes: Classes = ...,
     sort: bool = ...,
     ensure_ascii: bool = ...,
     separators: tuple[str, str] | None = ...,

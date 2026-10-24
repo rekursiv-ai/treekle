@@ -33,6 +33,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyInt, PyList, PyString, PyTuple, PyWeakrefReference};
 
 use crate::class::*;
+use crate::classes::ClassNames;
 use crate::freeze::freeze;
 use crate::json::{self, Writer};
 use crate::py::*;
@@ -1006,6 +1007,8 @@ struct Encoder<'py, 'g> {
     /// The generation ``env`` was read at.
     generation: Option<u64>,
     classes: Classes,
+    /// ``classes``' short names, when the call gave any.
+    class_names: Option<ClassNames>,
     /// The last module an import path was read from: its name, the
     /// ``sys.modules`` generation then, and its namespace.
     module_memo: ModuleMemo<'py>,
@@ -1044,6 +1047,7 @@ impl<'py, 'g> Encoder<'py, 'g> {
         hooks: B<'py>,
         sort: Flag<'py>,
         classes: Classes,
+        class_names: Option<ClassNames>,
         w: Writer,
     ) -> PyResult<Self> {
         let hooks_are_immutable_empty = hooks.is(g.default_hooks.bind(py)) && hooks.len()? == 0;
@@ -1076,6 +1080,7 @@ impl<'py, 'g> Encoder<'py, 'g> {
             env,
             generation,
             classes,
+            class_names,
             module_memo: std::cell::RefCell::new(None),
             shared: None,
             synced: 0,
@@ -1104,6 +1109,30 @@ impl<'py, 'g> Encoder<'py, 'g> {
                 return Err(PyErr::fetch(self.py));
             }
             Ok(node)
+        }
+    }
+
+    /// ``kind``'s name in ``classes``, where the call gave any: what its
+    /// ``py/object`` holds in place of its import path.
+    fn short_name(&self, kind: &B<'py>) -> PyResult<Option<B<'py>>> {
+        let Some(names) = &self.class_names else {
+            return Ok(None);
+        };
+        match names.tag(self.py, kind) {
+            Some(name) => Ok(Some(name.into_any())),
+            None => Err(PyTypeError::new_err(format!(
+                "Cannot serialize {}: it is not in classes.",
+                repr(kind)?
+            ))),
+        }
+    }
+
+    /// The text ``kind``'s ``py/object`` holds: its short name, else its
+    /// import path, which is then never read.
+    fn object_path(&mut self, kind: &B<'py>) -> PyResult<B<'py>> {
+        match self.short_name(kind)? {
+            Some(name) => Ok(name),
+            None => self.class_path(kind),
         }
     }
 
@@ -1570,6 +1599,7 @@ impl<'py, 'g> Encoder<'py, 'g> {
         let Some((path, layout)) = planned else {
             return Ok(None);
         };
+        let path = self.short_name(kind)?.unwrap_or(path);
         self.object_fast(value, kind, path, &layout, sort, frame, true)
     }
 
@@ -1718,6 +1748,8 @@ impl<'py, 'g> Encoder<'py, 'g> {
         if !sort && layout.is_none() {
             return Ok(None);
         }
+        // The class's facts keep its import path; the node takes its name.
+        let path = self.short_name(kind)?.unwrap_or(path);
         self.register(value, frame);
         let done = match &layout {
             Some(layout) => self.direct_object(value, path, layout, frame),
@@ -2499,7 +2531,7 @@ impl<'py, 'g> Encoder<'py, 'g> {
     fn encode_object(&mut self, value: &B<'py>, kind: &B<'py>, frame: u32) -> PyResult<B<'py>> {
         let py = self.py;
         self.register(value, frame);
-        let path = self.class_path(kind)?;
+        let path = self.object_path(kind)?;
         if self.env.names_own {
             let sort = self.sort.get()?;
             if let Some(layout) = self.layout(kind, sort)?
@@ -3161,6 +3193,9 @@ impl<'py, 'g> Encoder<'py, 'g> {
         let kwargs = PyDict::new(py);
         kwargs.set_item("dialect", &self.dialect)?;
         kwargs.set_item("hooks", &self.hooks)?;
+        if let Some(names) = &self.class_names {
+            kwargs.set_item("tags", names.tags_dict(py)?)?;
+        }
         kwargs.set_item("sort", self.sort.object(py))?;
         kwargs.set_item("here", self.linked_place(frame)?)?;
         kwargs.set_item("seen", &seen)?;
@@ -3323,6 +3358,7 @@ pub fn to_plain<'py>(
     dialect: Option<B<'py>>,
     mutable: Option<B<'py>>,
     hooks: Option<B<'py>>,
+    classes: Option<B<'py>>,
     sort: Option<B<'py>>,
 ) -> PyResult<B<'py>> {
     let Some(globals) = ENC.cloned(py) else {
@@ -3345,6 +3381,7 @@ pub fn to_plain<'py>(
             py_eq(&dialect, intern!(py, "python").as_any())?
         }
     };
+    let class_names = ClassNames::read(py, classes.as_ref())?;
     let kind = tp(obj);
     let tree = if kind == t_str() || kind == t_int() || kind == t_bool() || kind == t_none() {
         obj.clone()
@@ -3360,6 +3397,7 @@ pub fn to_plain<'py>(
             hooks,
             sort,
             classes,
+            class_names,
             Writer::idle(),
         )?;
         let tree = encoder.walk(obj, ROOT);
@@ -3712,6 +3750,7 @@ impl<'py> Encoder<'py, '_> {
             return self.text_hooked(value, &kind, frame);
         }
         if let Some((path, known)) = self.cached_object(&kind)? {
+            let path = self.short_name(&kind)?.unwrap_or(path);
             self.register(value, frame);
             if let Some((layout, sort)) = known
                 && self.text_known_object(value, &kind, &path, &layout, sort, frame)?
@@ -4278,7 +4317,7 @@ impl<'py> Encoder<'py, '_> {
 
     fn text_object(&mut self, value: &B<'py>, kind: &B<'py>, frame: u32) -> Text<()> {
         self.register(value, frame);
-        let path = self.class_path(kind)?;
+        let path = self.object_path(kind)?;
         self.text_object_rest(value, kind, path, frame)
     }
 
@@ -4425,6 +4464,7 @@ pub fn to_json<'py>(
     obj: &B<'py>,
     dialect: Option<B<'py>>,
     hooks: Option<B<'py>>,
+    classes: Option<B<'py>>,
     sort: Option<B<'py>>,
     style: json::Style,
     options: [Option<&B<'py>>; 4],
@@ -4442,6 +4482,7 @@ pub fn to_json<'py>(
         // Let the tree walk raise or read an unusual dialect.
         _ => return Ok(None),
     };
+    let class_names = ClassNames::read(py, classes.as_ref())?;
     let hooks = hooks.unwrap_or_else(|| g.default_hooks.bind(py).clone());
     let classes = CLASSES.take(py).unwrap_or_default();
     let mut encoder = Encoder::new(
@@ -4452,6 +4493,7 @@ pub fn to_json<'py>(
         hooks,
         Flag::new(sort, true),
         classes,
+        class_names,
         Writer::new(style),
     )?;
     let done = encoder.text_walk(obj);

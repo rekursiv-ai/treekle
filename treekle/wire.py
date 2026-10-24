@@ -22,7 +22,7 @@ from treekle.serialize import _python_to_plain, to_plain
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from treekle.types import Dialect, Hooks, MutablePlainTree
+    from treekle.types import Classes, Dialect, Hooks, MutablePlainTree
 
 
 __all__ = [
@@ -41,6 +41,7 @@ def json_loads[T](
     target: type[T],
     *,
     hooks: Hooks = ...,
+    classes: Classes = ...,
     allow_imports: bool = ...,
     strict: bool = ...,
 ) -> T: ...
@@ -52,6 +53,7 @@ def json_loads(
     target: object,
     *,
     hooks: Hooks = ...,
+    classes: Classes = ...,
     allow_imports: bool = ...,
     strict: bool = ...,
 ) -> object: ...
@@ -62,6 +64,7 @@ def json_loads(
     target: object = ABSENT,
     *,
     hooks: Hooks = MappingProxyType({}),
+    classes: Classes = MappingProxyType({}),
     allow_imports: bool = False,
     strict: bool = True,
 ) -> object:
@@ -76,6 +79,7 @@ def json_loads(
       text: JSON document.
       target: The type to read the document as; omit for the plain tree.
       hooks: The codecs ``to_plain`` used.
+      classes: The short names ``to_plain`` wrote in ``py/object``.
       allow_imports: Whether tags may import modules and call code they name.
       strict: When false, also read numeric and boolean text.
 
@@ -95,6 +99,7 @@ def json_loads(
             text,
             target,
             hooks=hooks,
+            classes=classes,
             allow_imports=allow_imports,
             strict=strict,
         )
@@ -106,6 +111,7 @@ def json_loads(
         tree,
         target,
         hooks=hooks,
+        classes=classes,
         allow_imports=allow_imports,
         strict=strict,
     )
@@ -116,6 +122,7 @@ def json_dumps(
     *,
     dialect: Dialect = "json",
     hooks: Hooks = MappingProxyType({}),
+    classes: Classes = MappingProxyType({}),
     sort: bool = True,
     ensure_ascii: bool = True,
     separators: tuple[str, str] | None = None,
@@ -133,6 +140,7 @@ def json_dumps(
       obj: The value to write; anything ``to_plain`` takes.
       dialect: Forwarded to ``to_plain``.
       hooks: The codecs ``to_plain`` uses.
+      classes: Short names to write in ``py/object``, as ``to_plain`` takes them.
       sort: Order each object's attributes by name, as ``to_plain`` does.
       ensure_ascii: Escape non-ASCII text, as ``json.dumps`` does.
       separators: ``(item, key)`` separators, as ``json.dumps`` takes them.
@@ -153,6 +161,7 @@ def json_dumps(
                 obj,
                 dialect=dialect,
                 hooks=hooks,
+                classes=classes,
                 sort=sort,
                 ensure_ascii=ensure_ascii,
                 separators=separators,
@@ -161,7 +170,7 @@ def json_dumps(
             ),
         )
     return json.dumps(
-        to_plain(obj, dialect=dialect, hooks=hooks, sort=sort),
+        to_plain(obj, dialect=dialect, hooks=hooks, classes=classes, sort=sort),
         ensure_ascii=ensure_ascii,
         separators=separators,
         indent=indent,

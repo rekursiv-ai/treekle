@@ -44,6 +44,7 @@ from treekle.parse import parse
 from treekle.plain import immutable, mutable
 from treekle.serialize import to_plain
 from treekle.types import (
+    Classes,
     Dialect,
     FieldPath,
     Hooks,
@@ -59,6 +60,7 @@ from treekle.wire import json_dumps, json_loads
 __all__ = [
     "ABSENT",
     "Absent",
+    "Classes",
     "Dialect",
     "FieldPath",
     "Hooks",
