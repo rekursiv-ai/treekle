@@ -41,7 +41,8 @@ class TestParse:
         [
             ("7", int, 7),
             ("3e-4", float, 3e-4),
-            ("2", float, 2.0),
+            ("2", float, 2),
+            ("2.0", float, 2.0),
             ("true", bool, True),
             ("[1, 2]", list[int], [1, 2]),
             ('{"a": 1}', dict[str, int], {"a": 1}),

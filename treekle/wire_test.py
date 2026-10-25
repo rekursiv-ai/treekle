@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, cast
@@ -16,10 +17,17 @@ import types
 
 import pytest
 
-from treekle import from_plain, json_dumps, json_loads, to_plain, wire
+from treekle import (
+    from_plain,
+    immutable,
+    json_dumps,
+    json_loads,
+    to_plain,
+    wire,
+)
 from treekle.deserialize import _python_from_plain
 from treekle.serialize import _python_to_plain
-from treekle.types import Classes, Hooks, ReadError
+from treekle.types import Classes, Hooks, PlainTree, ReadError
 
 
 if TYPE_CHECKING:
@@ -52,6 +60,16 @@ class Unlisted:
     text: str
 
 
+@dataclass(frozen=True, kw_only=True, slots=True)
+class Frozen:
+    extra: Mapping[str, PlainTree]
+
+
+_FROZEN: Final = types.MappingProxyType[type, type](
+    {Mapping: types.MappingProxyType, Sequence: tuple},
+)
+
+
 def _malformed(classes: object) -> Classes:
     """Pass a mapping the type forbids, for the checks that reject it at runtime."""
     return cast(Classes, classes)
@@ -79,7 +97,7 @@ class TestClasses:
             assert json_loads(text, list[Said | Heard], classes=self.classes) == records
             assert (
                 from_plain(
-                    json.loads(text),
+                    json_loads(text),
                     list[Said | Heard],
                     classes=self.classes,
                 )
@@ -251,6 +269,23 @@ class TestJsonDumps:
             json_dumps(1, dialect=cast("Dialect", dialect))
 
 
+def test_default_concrete_types_reach_both_walks() -> None:
+    value = Frozen(extra=immutable({"a": [1, {"b": 2}]}))
+
+    text = json_dumps(value, target=Frozen, default_concrete_types=_FROZEN)
+    read = json_loads(text, Frozen, default_concrete_types=_FROZEN)
+
+    assert text == json.dumps(
+        to_plain(value, target=Frozen, default_concrete_types=_FROZEN),
+    )
+    assert '"extra": {"a": [1, {"b": 2}]}' in text
+    assert read == value
+    assert isinstance(read.extra, types.MappingProxyType)
+    items = read.extra["a"]
+    assert isinstance(items, tuple)
+    assert isinstance(items[1], types.MappingProxyType)
+
+
 def test_json_is_used_as_it_is_at_each_call(monkeypatch: pytest.MonkeyPatch) -> None:
     # A replacement made after import serves, called once per document, as
     # Python's path names ``json.loads``/``json.dumps`` at the call.
@@ -307,6 +342,8 @@ def test_the_cores_json_functions_take_every_option(
             hooks=hooks,
             classes=classes,
             sort=False,
+            target=list[int],
+            default_concrete_types=_FROZEN,
             ensure_ascii=False,
             separators=(",", ":"),
             indent=2,
@@ -322,6 +359,7 @@ def test_the_cores_json_functions_take_every_option(
             classes=classes,
             allow_imports=True,
             strict=False,
+            default_concrete_types=_FROZEN,
         )
         == "typed_loads"
     )
@@ -335,6 +373,8 @@ def test_the_cores_json_functions_take_every_option(
                 "hooks": hooks,
                 "classes": classes,
                 "sort": False,
+                "target": list[int],
+                "default_concrete_types": _FROZEN,
                 "ensure_ascii": False,
                 "separators": (",", ":"),
                 "indent": 2,
@@ -349,6 +389,7 @@ def test_the_cores_json_functions_take_every_option(
                 "classes": classes,
                 "allow_imports": True,
                 "strict": False,
+                "default_concrete_types": _FROZEN,
             },
         ),
     ]

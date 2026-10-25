@@ -1,6 +1,13 @@
+from collections.abc import Mapping
 from typing import Literal, overload
 
-from treekle.types import Classes, Dialect, Hooks, MutablePlainTree, PlainTree
+from treekle.types import (
+    Classes,
+    Dialect,
+    Hooks,
+    MutablePlainTree,
+    PlainTree,
+)
 
 def setup_encode(module: dict[str, object]) -> None: ...
 def setup_decode(module: dict[str, object]) -> None: ...
@@ -13,6 +20,8 @@ def to_plain(
     hooks: Hooks = ...,
     classes: Classes = ...,
     sort: bool = ...,
+    target: object = ...,
+    default_concrete_types: Mapping[type, type] = ...,
 ) -> MutablePlainTree: ...
 @overload
 def to_plain(
@@ -23,6 +32,8 @@ def to_plain(
     hooks: Hooks = ...,
     classes: Classes = ...,
     sort: bool = ...,
+    target: object = ...,
+    default_concrete_types: Mapping[type, type] = ...,
 ) -> PlainTree: ...
 @overload
 def from_plain[T](
@@ -33,6 +44,7 @@ def from_plain[T](
     classes: Classes = ...,
     allow_imports: bool = ...,
     strict: bool = ...,
+    default_concrete_types: Mapping[type, type] = ...,
 ) -> T: ...
 @overload
 def from_plain[T](
@@ -44,6 +56,7 @@ def from_plain[T](
     classes: Classes = ...,
     allow_imports: bool = ...,
     strict: bool = ...,
+    default_concrete_types: Mapping[type, type] = ...,
 ) -> T | None: ...
 @overload
 def from_plain[T](
@@ -55,6 +68,7 @@ def from_plain[T](
     classes: Classes = ...,
     allow_imports: bool = ...,
     strict: bool = ...,
+    default_concrete_types: Mapping[type, type] = ...,
 ) -> T: ...
 @overload
 def from_plain(
@@ -66,6 +80,7 @@ def from_plain(
     classes: Classes = ...,
     allow_imports: bool = ...,
     strict: bool = ...,
+    default_concrete_types: Mapping[type, type] = ...,
 ) -> object: ...
 def json_dumps_plain(
     tree: object,
@@ -84,6 +99,7 @@ def json_loads_typed(
     classes: Classes = ...,
     allow_imports: bool = ...,
     strict: bool = ...,
+    default_concrete_types: Mapping[type, type] = ...,
 ) -> object: ...
 def json_dumps(
     obj: object,
@@ -92,6 +108,8 @@ def json_dumps(
     hooks: Hooks = ...,
     classes: Classes = ...,
     sort: bool = ...,
+    target: object = ...,
+    default_concrete_types: Mapping[type, type] = ...,
     ensure_ascii: bool = ...,
     separators: tuple[str, str] | None = ...,
     indent: int | str | None = ...,

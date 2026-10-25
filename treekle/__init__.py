@@ -23,6 +23,8 @@ What a dialect cannot carry natively is written as a ``py/*`` tag:
   function, by dotted import path.
 - ``py/tuple``, ``py/set``, ``py/frozenset``, ``py/mappingproxy``: containers a
   dialect flattens to lists or dicts.
+- ``py/dict``, ``py/list``: a dict or list where ``default_concrete_types``
+  makes an untagged mapping or sequence read as another type.
 - ``py/float``, ``py/complex``, ``py/b64``, ``py/path``, ``py/uuid``,
   ``py/datetime``: values a dialect lacks.
 - ``py/reduce``, ``py/hook``: a ``__reduce__`` recipe and a caller-supplied codec.

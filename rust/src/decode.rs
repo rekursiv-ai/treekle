@@ -66,6 +66,8 @@ enum Tag {
     Set,
     FrozenSet,
     MappingProxy,
+    Dict,
+    List,
     B64,
     Float,
     Complex,
@@ -78,13 +80,15 @@ enum Tag {
 }
 
 /// Every tag, in the precedence ``_TAGS`` gives a node carrying several.
-const TAGS: [(&str, Tag); 15] = [
+const TAGS: [(&str, Tag); 17] = [
     ("py/type", Tag::Type),
     ("py/function", Tag::Function),
     ("py/tuple", Tag::Tuple),
     ("py/set", Tag::Set),
     ("py/frozenset", Tag::FrozenSet),
     ("py/mappingproxy", Tag::MappingProxy),
+    ("py/dict", Tag::Dict),
+    ("py/list", Tag::List),
     ("py/b64", Tag::B64),
     ("py/float", Tag::Float),
     ("py/complex", Tag::Complex),
@@ -95,6 +99,11 @@ const TAGS: [(&str, Tag); 15] = [
     ("py/hook", Tag::Hook),
     ("py/object", Tag::Object),
 ];
+
+/// Whether a mapping target reads ``tag`` as a tag; it reads any other as a key.
+fn is_mapping_tag(tag: Tag) -> bool {
+    matches!(tag, Tag::MappingProxy | Tag::Dict)
+}
 
 fn tag_named(name: &[u8]) -> Option<Tag> {
     TAGS.iter()
@@ -213,6 +222,7 @@ pub struct DecGlobals {
     is_protocol: Py<PyAny>,
     is_any: Py<PyAny>,
     field_types: Py<PyAny>,
+    stored_types: Py<PyAny>,
     field_types_cache: Py<PyAny>,
     required_keys: Py<PyAny>,
     import_name: Py<PyAny>,
@@ -310,11 +320,11 @@ pub fn setup(module: &Bound<'_, PyDict>) -> PyResult<()> {
         ("_decode_enum", Kind::Leaf),
         ("_decode_literal", Kind::Literal),
         ("_decode_list", Kind::List),
-        ("_decode_tuple", Kind::Tuple),
+        ("_decode_untagged_tuple", Kind::Tuple),
         ("_decode_set", Kind::Set),
         ("_decode_frozenset", Kind::FrozenSet),
         ("_decode_dict", Kind::Dict),
-        ("_decode_mappingproxy", Kind::MappingProxy),
+        ("_decode_untagged_proxy", Kind::MappingProxy),
         ("_decode_type", Kind::Type),
         ("_decode_union", Kind::Union),
         ("_decode_object", Kind::Object),
@@ -430,6 +440,7 @@ pub fn setup(module: &Bound<'_, PyDict>) -> PyResult<()> {
         is_protocol: get("_is_protocol")?,
         is_any: get("_is_any")?,
         field_types: get("_field_types")?,
+        stored_types: get("_stored_types")?,
         field_types_cache: get("_FIELD_TYPES")?,
         required_keys: get("_required_keys")?,
         import_name: get("_import_name")?,
@@ -757,7 +768,9 @@ enum Types<'py> {
 enum Built<'py> {
     /// The placed list itself.
     List(Bound<'py, PyList>),
-    Tuple(Vec<B<'py>>),
+    /// The items, and whether the built tuple is placed by path for ``py/ref``,
+    /// as an untagged one is.
+    Tuple(Vec<B<'py>>, bool),
     FrozenSet(Vec<B<'py>>),
     /// The placed set itself, refusing an unhashable member.
     Set(Bound<'py, PySet>),
@@ -797,21 +810,20 @@ enum Body<'py> {
         members: Bound<'py, PyDict>,
         pending_name: Option<B<'py>>,
     },
-    /// ``_Object``: a dataclass record, built once its fields have read.
+    /// ``_Object``: a dataclass record's fields, set on it once they have read.
     Object {
         entries: std::vec::IntoIter<(B<'py>, B<'py>, usize)>,
         info: Rc<DcInfo>,
         target: B<'py>,
-        stored: bool,
         value: B<'py>,
-        index: usize,
-        before: usize,
         members: Vec<(B<'py>, B<'py>, usize)>,
         pending: Option<(B<'py>, usize)>,
     },
     /// ``_Stored``: a ``py/object`` record's attributes, set once read.
     Stored {
         items: MapItems<'py>,
+        /// A dataclass's ``_field_types``; ``None`` reads every attribute as ``object``.
+        hints: Option<B<'py>>,
         value: B<'py>,
         members: Vec<(B<'py>, B<'py>)>,
         pending_name: Option<B<'py>>,
@@ -1337,6 +1349,24 @@ impl<'py, 'g> Decoder<'py, 'g> {
                 .unwrap_or_else(|| self.py.None().into_bound(self.py)));
         }
         data.call_method1(pyo3::intern!(self.py, "get"), (key,))
+    }
+
+    /// Whether ``data`` holds a tag naming a value, any tag but ``py/object``
+    /// and the tags a mapping target reads, asked in ``_TAGS`` order.
+    fn has_value_tag(&self, data: &B<'py>) -> PyResult<bool> {
+        static NAMES: PyOnceLock<Vec<Py<PyString>>> = PyOnceLock::new();
+        let names = NAMES.get_or_init(self.py, || {
+            TAGS.iter()
+                .filter(|(_, tag)| *tag != Tag::Object && !is_mapping_tag(*tag))
+                .map(|(name, _)| PyString::intern(self.py, name).unbind())
+                .collect()
+        });
+        for name in names {
+            if self.contains(data, name.bind(self.py))? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// ``_shown``: a value's repr for a message, elided past a fixed size.
@@ -2682,7 +2712,7 @@ impl<'py, 'g> Decoder<'py, 'g> {
             let Some(tag) = tag else {
                 return self.run_kind(data, target, plan, at, keys.as_ref());
             };
-            if (plan.kind == Kind::Dict && tag != Tag::MappingProxy)
+            if (plan.kind == Kind::Dict && !is_mapping_tag(tag))
                 || (tag == Tag::Object && plan.kind == Kind::Any && !self.objects_named()?)
             {
                 return self.run_kind(data, target, plan, at, keys.as_ref());
@@ -2816,11 +2846,11 @@ impl<'py, 'g> Decoder<'py, 'g> {
                 None => self.decode_literal(data, target, plan)?,
             },
             Kind::List => return self.decode_list(data, target, plan, at),
-            Kind::Tuple => return self.decode_tuple(data, target, plan, at),
+            Kind::Tuple => return self.decode_tuple(data, target, plan, at, true),
             Kind::Set => return self.decode_set(data, target, plan, at),
             Kind::FrozenSet => return self.decode_frozenset(data, target, plan, at),
             Kind::Dict => return self.decode_dict(data, target, plan, at, true),
-            Kind::MappingProxy => return self.decode_mappingproxy(data, target, plan, at),
+            Kind::MappingProxy => return self.decode_untagged_proxy(data, target, plan, at),
             Kind::Type => self.decode_type(data, plan)?,
             Kind::Union => return self.decode_union(data, target, plan, at),
             Kind::Object => return self.decode_object(data, target, plan, at, keys),
@@ -2852,10 +2882,14 @@ impl<'py, 'g> Decoder<'py, 'g> {
                     .map(|(_, func)| func);
                 self.leaf(func, data, target)?
             }
-            Tag::Tuple => return self.decode_tuple(data, target, plan, at),
+            Tag::Tuple => return self.decode_tuple(data, target, plan, at, false),
             Tag::Set => return self.decode_set(data, target, plan, at),
             Tag::FrozenSet => return self.decode_frozenset(data, target, plan, at),
             Tag::MappingProxy => return self.decode_mappingproxy(data, target, plan, at),
+            // Only a mapping target reads a mapping as quickly as its decoder
+            // does; a record target's quick read would read it as fields.
+            Tag::Dict => return self.decode_dict(data, target, plan, at, plan.kind == Kind::Dict),
+            Tag::List => return self.decode_list(data, target, plan, at),
             Tag::Type => self.decode_type(data, plan)?,
             Tag::Function => self.decode_function(data)?,
             Tag::Object => return self.decode_object(data, target, plan, at, keys),
@@ -3001,12 +3035,13 @@ impl<'py, 'g> Decoder<'py, 'g> {
             }
             Body::Stored {
                 items,
+                hints,
                 members,
                 pending_name,
                 ..
             } => {
                 let key_object = pyo3::intern!(py, "py/object");
-                let object = self.b(&self.g.object);
+                let object = self.b(&self.g.object).clone();
                 while let Some((name, raw)) = items.next_item()? {
                     let skip = if tp(&name) == t_str() {
                         is_object_key(&name)
@@ -3016,13 +3051,21 @@ impl<'py, 'g> Decoder<'py, 'g> {
                     if skip {
                         continue;
                     }
-                    if is_leaf_kind(tp(&raw)) {
+                    let hint = match hints {
+                        Some(hints) => hints.get_item(&name).ok().unwrap_or(object.clone()),
+                        None => object.clone(),
+                    };
+                    if is_leaf_kind(tp(&raw)) && hint.is(&object) {
                         members.push((name, raw));
                         continue;
                     }
-                    let plan = self.object_plan.clone();
+                    let plan = if hint.is(&object) {
+                        self.object_plan.clone()
+                    } else {
+                        self.plan_for(&hint, false)?
+                    };
                     let here = Loc::Child(at, StepRef::Key(&name));
-                    match self.start_part(&raw, object, &plan, here)? {
+                    match self.start_part(&raw, &hint, &plan, here)? {
                         Start::Value(member) => members.push((name, member)),
                         Start::Frame(child) => {
                             *pending_name = Some(name);
@@ -3229,7 +3272,7 @@ impl<'py, 'g> Decoder<'py, 'g> {
                     list.append(value)?;
                 }
             }
-            Built::Tuple(values) | Built::FrozenSet(values) => values.push(value),
+            Built::Tuple(values, _) | Built::FrozenSet(values) => values.push(value),
             Built::Set(set) => {
                 if let Err(error) = set.add(&value) {
                     if error.is_instance_of::<PyTypeError>(self.py) {
@@ -3274,7 +3317,13 @@ impl<'py, 'g> Decoder<'py, 'g> {
             Body::Items { built, .. } => match built {
                 Built::List(list) => Ok(list.into_any()),
                 Built::Set(set) => Ok(set.into_any()),
-                Built::Tuple(values) => Ok(PyTuple::new(py, values)?.into_any()),
+                Built::Tuple(values, placed) => {
+                    let tuple = PyTuple::new(py, values)?.into_any();
+                    if placed {
+                        self.place_only(at, &tuple)?;
+                    }
+                    Ok(tuple)
+                }
                 Built::FrozenSet(values) => {
                     let members = PyList::new(py, values)?;
                     match PyFrozenSet::new(py, members.iter()) {
@@ -3295,13 +3344,10 @@ impl<'py, 'g> Decoder<'py, 'g> {
             Body::Object {
                 info,
                 target,
-                stored,
                 value,
-                index,
-                before,
                 members,
                 ..
-            } => self.build_object(at, &info, &target, stored, value, index, before, members),
+            } => self.build_object(&info, &target, value, members),
             Body::Stored { value, members, .. } => {
                 self.setattrs(&value, &members)?;
                 Ok(value)
@@ -3603,6 +3649,10 @@ impl<'py, 'g> Decoder<'py, 'g> {
                     Some(origin) => origin.bind(py).clone(),
                     None => target.clone(),
                 };
+                // An int is a float as typing reads one, and keeps its class when read.
+                if origin.is(self.b(&self.g.float_type)) && tp(value) == t_int() {
+                    return Ok(Shallow::Verdict(true));
+                }
                 if !self.is_instance(value, &origin)? {
                     return Ok(Shallow::Verdict(false));
                 }
@@ -3860,11 +3910,9 @@ impl<'py, 'g> Decoder<'py, 'g> {
     }
 
     fn decode_float(&mut self, data: &B<'py>) -> DR<B<'py>> {
-        if is_float(data) {
+        // Plain data tells an int from a float, so an int keeps its class.
+        if is_float(data) || (is_int(data) && tp(data) != t_bool()) {
             return Ok(data.clone());
-        }
-        if is_int(data) && tp(data) != t_bool() {
-            return Ok(self.b(&self.g.float_type).call1((data,))?);
         }
         if is_str(data) && !self.strict.get()? {
             let stripped = data.call_method0(pyo3::intern!(self.py, "strip"))?;
@@ -4031,16 +4079,7 @@ impl<'py, 'g> Decoder<'py, 'g> {
                 return std::ptr::null_mut();
             }
             if kind == t_int() && target == t_float().cast() && self.g.fast_float {
-                let value = ffi::PyLong_AsDouble(raw);
-                if value == -1.0 && !ffi::PyErr_Occurred().is_null() {
-                    ffi::PyErr_Clear();
-                    return std::ptr::null_mut();
-                }
-                let made = ffi::PyFloat_FromDouble(value);
-                if made.is_null() {
-                    ffi::PyErr_Clear();
-                }
-                return made;
+                return ffi::Py_NewRef(raw);
             }
             std::ptr::null_mut()
         }
@@ -4881,12 +4920,14 @@ impl<'py, 'g> Decoder<'py, 'g> {
         Ok(true)
     }
 
+    /// ``_decode_tuple``, or ``_decode_untagged_tuple`` where ``placed``.
     fn decode_tuple(
         &mut self,
         data: &B<'py>,
         target: &B<'py>,
         plan: &Rc<Plan>,
         at: Loc<'_, 'py>,
+        placed: bool,
     ) -> DR<Start<'py>> {
         let py = self.py;
         if !self.is_sequence(data)? || is_str(data) {
@@ -4918,7 +4959,7 @@ impl<'py, 'g> Decoder<'py, 'g> {
         };
         let frame = self.frame(at)?;
         let raws = SeqItems::new(data)?;
-        let built = Built::Tuple(Vec::with_capacity(raws.len_hint()));
+        let built = Built::Tuple(Vec::with_capacity(raws.len_hint()), placed);
         Ok(Start::Frame(Frame::new(
             frame,
             data,
@@ -5142,6 +5183,56 @@ impl<'py, 'g> Decoder<'py, 'g> {
         Ok(Start::Frame(frame))
     }
 
+    /// ``_decode_untagged_proxy``: an untagged mapping as a ``MappingProxyType``,
+    /// placed before its entries, which fill its own dict at its own place.
+    fn decode_untagged_proxy(
+        &mut self,
+        data: &B<'py>,
+        target: &B<'py>,
+        plan: &Rc<Plan>,
+        at: Loc<'_, 'py>,
+    ) -> DR<Start<'py>> {
+        let py = self.py;
+        if !self.is_mapping(data)? {
+            return fail(format!(
+                "cannot read {} as {}",
+                self.shown(data)?,
+                self.target_text(target)?
+            ));
+        }
+        let args = plan.args.bind(py).clone();
+        let (key, value) = if args.len() == 2 {
+            let (key, value) = (args.get_item(0)?, args.get_item(1)?);
+            let key_plan = self.plan_for(&key, plan.persistent)?;
+            let value_plan = self.plan_for(&value, plan.persistent)?;
+            ((key, key_plan), (value, value_plan))
+        } else {
+            let object = self.b(&self.g.object).clone();
+            let plan = self.object_plan.clone();
+            ((object.clone(), plan.clone()), (object, plan))
+        };
+        let inner = PyDict::new(py);
+        let proxy = self.b(&self.g.mappingproxy).call1((&inner,))?;
+        let place = self.frame(at)?;
+        self.place(place, &proxy)?;
+        let plain_keys = key.1.is_object || key.0.is(self.b(&self.g.str_type));
+        let mut frame = Frame::new(
+            place,
+            data,
+            Body::Entries {
+                items: MapItems::new(data)?,
+                key,
+                value,
+                plain_keys,
+                result: inner.clone(),
+                pending_key: None,
+            },
+        );
+        // The entries fill ``inner`` itself; updating it from itself changes nothing.
+        frame.then = Some((inner, proxy));
+        Ok(Start::Frame(frame))
+    }
+
     fn decode_type(&mut self, data: &B<'py>, plan: &Rc<Plan>) -> DR<B<'py>> {
         if !is_str(data) {
             return fail(format!("cannot read {} as a class path", self.shown(data)?));
@@ -5195,10 +5286,6 @@ impl<'py, 'g> Decoder<'py, 'g> {
         // run since: a truthiness override on ``allow_imports`` may mutate the
         // record between the scan and here.
         let keys = keys.filter(|_| matches!(self.allow_imports, Flag::Known(_)));
-        let stored = match keys {
-            Some(keys) => keys.object,
-            None => self.contains(data, key_object)?,
-        };
         let mut data = data.clone();
         // The record's entries but its ``py/object`` key, where they can be
         // taken without the dict copy Python makes of them.
@@ -5218,6 +5305,12 @@ impl<'py, 'g> Decoder<'py, 'g> {
             // With the tag, they keep every entry but the tag, which the read
             // below passes over instead.
             let str_keyed = keys.is_some() || is_str_keyed_dict(&data);
+            // Asked only of a dict whose lookup runs no Python code, as Python
+            // asks nothing before it copies.
+            let stored = match keys {
+                Some(keys) => keys.object,
+                None => str_keyed && self.contains(&data, key_object)?,
+            };
             if names && stored && str_keyed {
                 let mut pairs = dict_entries(unsafe { data.cast_unchecked::<PyDict>() });
                 pairs.retain(|(key, _)| !is_object_key(key));
@@ -5282,19 +5375,12 @@ impl<'py, 'g> Decoder<'py, 'g> {
                 repr(&valid)?
             ));
         }
-        let position = self.built.len();
         let frame = self.frame(at)?;
-        // A ``py/object`` record is state ``to_plain`` took from a built
-        // object, so it is restored as is, allocated before its fields read so
-        // a field can refer back to it. An untagged record is constructor
-        // input, built through ``__init__`` once its fields have read.
-        let reserved = if stored {
-            self.allocate(target)?
-        } else {
-            self.pending()
-        };
+        // A record, tagged or with its class implied, is state ``to_plain``
+        // took from a built object, so it is restored as is, allocated before
+        // its fields read so a field can refer back to it.
+        let reserved = self.allocate(target)?;
         self.place(frame, &reserved)?;
-        let before = self.bad_len();
         let members = Vec::with_capacity(entries.len());
         Ok(Start::Frame(Frame::new(
             frame,
@@ -5303,10 +5389,7 @@ impl<'py, 'g> Decoder<'py, 'g> {
                 entries: entries.into_iter(),
                 info,
                 target: target.clone(),
-                stored,
                 value: reserved,
-                index: position,
-                before,
                 members,
                 pending: None,
             },
@@ -5347,7 +5430,6 @@ impl<'py, 'g> Decoder<'py, 'g> {
         };
         let dict = unsafe { data.cast_unchecked::<PyDict>() };
         let mut entries = Vec::with_capacity(dict.len());
-        let mut stored = false;
         let mut cursor = 0;
         for (key, raw) in dict_entries(dict) {
             let Some(text) = (tp(&key) == t_str()).then(|| utf8(&key)).flatten() else {
@@ -5358,7 +5440,6 @@ impl<'py, 'g> Decoder<'py, 'g> {
                 if named != Some(own) {
                     return Ok(None);
                 }
-                stored = true;
                 continue;
             }
             match info.slot_of(text, &mut cursor) {
@@ -5368,15 +5449,9 @@ impl<'py, 'g> Decoder<'py, 'g> {
         }
         // A record naming its class whose imports are off reads its fields
         // just the same, since only the target's own name was accepted.
-        let position = self.built.len();
         let frame = self.frame(at)?;
-        let reserved = if stored {
-            self.allocate(target)?
-        } else {
-            self.pending()
-        };
+        let reserved = self.allocate(target)?;
         self.place(frame, &reserved)?;
-        let before = self.bad_len();
         let members = Vec::with_capacity(entries.len());
         Ok(Some(Start::Frame(Frame::new(
             frame,
@@ -5385,118 +5460,29 @@ impl<'py, 'g> Decoder<'py, 'g> {
                 entries: entries.into_iter(),
                 info,
                 target: target.clone(),
-                stored,
                 value: reserved,
-                index: position,
-                before,
                 members,
                 pending: None,
             },
         ))))
     }
 
-    /// ``_Object.finish``: the dataclass built from its read fields.
-    #[allow(clippy::too_many_arguments)]
+    /// ``_Object.finish``: each read field, or its default, set on the record.
     fn build_object(
         &mut self,
-        at: u32,
         info: &DcInfo,
         target: &B<'py>,
-        stored: bool,
-        reserved: B<'py>,
-        position: usize,
-        before: usize,
+        value: B<'py>,
         members: Vec<(B<'py>, B<'py>, usize)>,
     ) -> DR<B<'py>> {
-        let py = self.py;
-        let (value, rest) = if stored || self.bad_len() > before {
-            let value = if stored {
-                reserved
-            } else {
-                self.allocate(target)?
-            };
-            let rest = if self.covers(info, target, &members) {
-                for (key, member, slot) in &members {
-                    self.store(info, target, &value, *slot, key, member)?;
-                }
-                self.replace(position, at, &value)?;
-                return Ok(value);
-            } else {
-                self.with_defaults(members, target)?
-            };
-            (value, rest)
-        } else {
-            let kwargs = PyDict::new(py);
-            let mut rest = Vec::new();
-            let mut init = Vec::new();
-            match self.views(target)? {
-                Some(views) => {
-                    let slots = self.g.field_slots.as_ref().expect("views need slots");
-                    for view in &views {
-                        if slots.init(view)?.is_truthy()? {
-                            init.push(slots.name(view)?);
-                        }
-                    }
-                }
-                None => {
-                    for field in self.b(&self.g.fields).call1((target,))?.try_iter()? {
-                        let field = field?;
-                        if field.getattr(pyo3::intern!(py, "init"))?.is_truthy()? {
-                            init.push(field.getattr(pyo3::intern!(py, "name"))?);
-                        }
-                    }
-                }
+        if self.covers(info, target, &members) {
+            for (key, member, slot) in &members {
+                self.store(info, target, &value, *slot, key, member)?;
             }
-            // With exact str keys and names, membership is a byte comparison
-            // and runs no ``__eq__``; any other key asks the set Python builds.
-            let exact = init
-                .iter()
-                .all(|name| tp(name) == t_str() && utf8(name).is_some());
-            let set = if exact {
-                None
-            } else {
-                let set = PySet::empty(py)?;
-                for name in &init {
-                    set.add(name)?;
-                }
-                Some(set)
-            };
-            for (key, member, _) in members {
-                let inside = match &set {
-                    Some(set) => set.contains(&key)?,
-                    None if tp(&key) == t_str() && utf8(&key).is_some() => {
-                        let text = utf8(&key);
-                        init.iter().any(|name| name.is(&key) || utf8(name) == text)
-                    }
-                    None => {
-                        let set = PySet::new(py, &init)?;
-                        set.contains(&key)?
-                    }
-                };
-                if inside {
-                    kwargs.set_item(key, member)?;
-                } else {
-                    rest.push((key, member));
-                }
-            }
-            match target.call((), Some(&kwargs)) {
-                Ok(value) => (value, rest),
-                Err(error)
-                    if error.is_instance_of::<PyTypeError>(py)
-                        || error.is_instance_of::<PyValueError>(py) =>
-                {
-                    let message = format!(
-                        "cannot build {}: {}",
-                        self.class_name(target)?,
-                        err_text(py, &error)?
-                    );
-                    return fail_from(message, error);
-                }
-                Err(error) => return Err(error.into()),
-            }
-        };
+            return Ok(value);
+        }
+        let rest = self.with_defaults(members, target)?;
         self.setattrs(&value, &rest)?;
-        self.replace(position, at, &value)?;
         Ok(value)
     }
 
@@ -5663,7 +5649,7 @@ impl<'py, 'g> Decoder<'py, 'g> {
         Ok(filled)
     }
 
-    /// ``_decode_stored``: the class a ``py/object`` record names, attributes untyped.
+    /// ``_decode_stored``: the class a ``py/object`` record names, each field by its type.
     fn decode_stored(&mut self, data: &B<'py>, at: Loc<'_, 'py>) -> DR<Start<'py>> {
         let py = self.py;
         let path = self.get(data, pyo3::intern!(py, "py/object"))?;
@@ -5677,6 +5663,12 @@ impl<'py, 'g> Decoder<'py, 'g> {
         let value = self.allocate(&kind)?;
         let frame = self.frame(at)?;
         self.place(frame, &value)?;
+        let g = self.g;
+        let hints = if self.b(&g.is_dataclass).call1((&kind,))?.is_truthy()? {
+            Some(self.b(&g.stored_types).call1((&kind, data))?)
+        } else {
+            None
+        };
         let items = MapItems::new(data)?;
         let members = Vec::with_capacity(items.len_hint());
         Ok(Start::Frame(Frame::new(
@@ -5684,6 +5676,7 @@ impl<'py, 'g> Decoder<'py, 'g> {
             data,
             Body::Stored {
                 items,
+                hints,
                 value,
                 members,
                 pending_name: None,
@@ -5879,17 +5872,25 @@ impl<'py, 'g> Decoder<'py, 'g> {
         let tagged = self.is_mapping(data)? && self.has_tag_key(data)?;
         let order: Vec<usize> = if tagged {
             // The member a ``py/object`` tag names goes first, so member order
-            // cannot pick a sibling whose fields happen to fit too.
+            // cannot pick a sibling whose fields happen to fit too. A mapping
+            // member reads a value tag such as ``py/tuple`` as a key, and a
+            // ``py/object`` record it could build as a mapping, so it goes last.
             let path = self.get_or_none(data, pyo3::intern!(py, "py/object"))?;
+            let valued = self.has_value_tag(data)? || (!path.is_none() && self.objects_named()?);
             let mut keyed = Vec::with_capacity(members.len());
             for (index, name) in self.member_tags(plan, info)?.iter().enumerate() {
                 let differs = match name {
                     Some(name) => !py_eq(name, &path)?,
                     None => !path.is_none(),
                 };
-                keyed.push((differs, index));
+                let misread = valued
+                    && self
+                        .plan_for(&members.get_item(index)?, plan.persistent)?
+                        .kind
+                        == Kind::Dict;
+                keyed.push(((differs, misread), index));
             }
-            keyed.sort_by_key(|(differs, _)| *differs);
+            keyed.sort_by_key(|(rank, _)| *rank);
             keyed.into_iter().map(|(_, index)| index).collect()
         } else {
             let kind = tp(data);
@@ -6246,10 +6247,7 @@ impl<'py> Exec<'_, 'py> {
             Node::Float if kind == t_dict() && special_float(raw).is_some() => {
                 special_float(raw).ok_or(Stop::Abort)
             }
-            Node::Float if kind == t_int() => unsafe {
-                Bound::from_owned_ptr_or_err(self.py, ffi::PyNumber_Float(raw.as_ptr()))
-                    .map_err(|_| Stop::Abort)
-            },
+            Node::Float if kind == t_int() => Ok(raw.clone()),
             Node::Str if kind == t_str() => Ok(raw.clone()),
             Node::Bool if kind == t_bool() => Ok(raw.clone()),
             Node::NoneType if kind == t_none() => Ok(raw.clone()),
@@ -6484,7 +6482,7 @@ impl<'py> Exec<'_, 'py> {
             }
             count += 1;
         }
-        if !stored || count != rec.fields.len() {
+        if count != rec.fields.len() {
             return Err(Stop::Abort);
         }
         Ok(())
@@ -7431,6 +7429,16 @@ fn holds_tags_walk<'py>(g: &DecGlobals, data: &B<'py>) -> PyResult<bool> {
 
 // ------------------------------------------------------------ entry point --
 
+/// ``_python_from_plain``, the Python walk, which applies concrete-type overrides.
+pub fn python_walker(py: Python<'_>) -> PyResult<B<'_>> {
+    let Some(globals) = DEC.cloned(py) else {
+        return Err(PyTypeError::new_err(
+            "treekle._rust.setup_decode was not called",
+        ));
+    };
+    item(globals.module.bind(py), "_python_from_plain")
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn from_plain<'py>(
     py: Python<'py>,
@@ -7463,13 +7471,7 @@ pub fn from_plain<'py>(
             return Ok(data.clone());
         }
         if kind == t_int() && target.as_ptr() == t_float().cast::<ffi::PyObject>() && g.fast_float {
-            // ``float(data)`` on an exact int is ``PyLong_AsDouble``; one too
-            // large raises, which the walk below reproduces.
-            let value = unsafe { ffi::PyLong_AsDouble(data.as_ptr()) };
-            if value != -1.0 || unsafe { ffi::PyErr_Occurred() }.is_null() {
-                return Ok(pyo3::types::PyFloat::new(py, value).into_any());
-            }
-            unsafe { ffi::PyErr_Clear() };
+            return Ok(data.clone());
         }
     }
     let caches = CACHES.take(py).unwrap_or_else(|| new_caches(py));

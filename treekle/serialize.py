@@ -8,6 +8,13 @@ tuples; either way the result is freshly built and shared with no one.
 
 Each tagged type has an encoder here and a decoder in ``deserialize``, paired by
 name. Leaves pass through unencoded.
+
+A container is written untagged where its declared type implies its class, as
+``from_plain`` reads it. A record's ``py/object`` tag names its class, so its
+field types declare its parts; ``target``, the type ``from_plain`` will be
+given, declares the root. ``default_concrete_types`` says what an abstract
+declared type implies. Under the default ``object`` target, the tree reads back
+with no target at all.
 """
 
 from __future__ import annotations
@@ -34,8 +41,10 @@ from types import (
 from typing import (
     Final,
     Literal,
+    TypeGuard,
     cast,
     get_args,
+    get_origin,
     overload,
 )
 from uuid import UUID
@@ -45,12 +54,40 @@ import base64
 import json
 import weakref
 
+from treekle.deserialize import (
+    _decode_any,
+    _decode_complex,
+    _decode_datetime,
+    _decode_dict,
+    _decode_enum,
+    _decode_frozenset,
+    _decode_list,
+    _decode_object,
+    _decode_path,
+    _decode_set,
+    _decode_typeddict,
+    _decode_untagged_proxy,
+    _decode_untagged_tuple,
+    _decode_uuid,
+    _Decoder,
+    _element_type,
+    _entry_types,
+    _field_types,
+    _is_union,
+    _reads_tags_as_keys,
+    _resolve_alias,
+    _shallow_fit,
+    _tuple_types,
+    _union_candidates,
+    _untagged_decoder,
+)
 from treekle.native import native
 from treekle.plain import immutable
 from treekle.reflect import (
     PENDING,
     attribute_names,
     class_tags,
+    concrete_overrides,
     is_mutable,
     resolve_import,
     resolves_to,
@@ -65,6 +102,7 @@ from treekle.types import (
 
 
 __all__ = [
+    "record_implies",
     "to_plain",
 ]
 
@@ -78,6 +116,8 @@ def to_plain(
     hooks: Hooks = ...,
     classes: Classes = ...,
     sort: bool = ...,
+    target: object = ...,
+    default_concrete_types: Mapping[type, type] = ...,
 ) -> MutablePlainTree: ...
 
 
@@ -90,6 +130,8 @@ def to_plain(
     hooks: Hooks = ...,
     classes: Classes = ...,
     sort: bool = ...,
+    target: object = ...,
+    default_concrete_types: Mapping[type, type] = ...,
 ) -> PlainTree: ...
 
 
@@ -101,6 +143,8 @@ def to_plain(
     hooks: Hooks = MappingProxyType({}),
     classes: Classes = MappingProxyType({}),
     sort: bool = True,
+    target: object = object,
+    default_concrete_types: Mapping[type, type] = MappingProxyType({}),
 ) -> PlainTree:
     """Convert a Python value to plain data, tagging what ``dialect`` lacks.
 
@@ -117,26 +161,90 @@ def to_plain(
       sort: Order each object's attributes by name; when false, keep slots in
         MRO order then ``__dict__`` keys in insertion order. A stored form that
         must stay byte-stable sets this false.
+      target: The type ``from_plain`` will read the tree as. A container whose
+        declared type there builds its class from untagged data is written
+        untagged; ``object`` declares nothing, so the tree reads by tags alone.
+      default_concrete_types: What untagged data reads as under an abstract
+        declared type, over the baseline, as ``from_plain`` will be given it.
+        A dict or list where another class is concrete is written as
+        ``py/dict`` or ``py/list``.
 
     Returns:
-      tree: Fresh plain data that ``from_plain`` turns back into ``obj``.
+      tree: Fresh plain data that ``from_plain`` turns back into ``obj``, read
+        as ``target`` with the same ``default_concrete_types``.
 
     Raises:
-      ValueError: ``dialect`` names no known format, or ``classes`` names one
-        class twice.
+      ValueError: ``dialect`` names no known format, ``classes`` names one
+        class twice, or ``default_concrete_types`` names a type it cannot
+        apply.
       TypeError: A leaf has no conversion and no hook, a hook returns the type
         it encodes, a dict key holds a cycle, or ``classes`` is given and lacks
         a ``py/object`` class.
 
     """
-    if dialect not in get_args(Dialect.__value__):
+    if dialect not in get_args(cast("object", Dialect.__value__)):
         raise ValueError(f"unknown dialect {dialect!r}; expected 'json' or 'python'")
-    tags = class_tags(classes)
-    tree = cast(
-        "MutablePlainTree",
-        _encode(obj, _Encoding(dialect=dialect, hooks=hooks, tags=tags, sort=sort)),
+    state = _Encoding(
+        dialect=dialect,
+        hooks=hooks,
+        tags=class_tags(classes),
+        sort=sort,
+        default_concrete_types=concrete_overrides(default_concrete_types),
     )
+    tree = cast("MutablePlainTree", _encode(obj, state, target))
     return tree if mutable else immutable(tree)
+
+
+# The Rust core's fast paths write a record's fields as under ``object``, which
+# ``_form`` agrees with only where every field is declared ``object``.
+def record_implies(kind: type) -> bool:
+    """Return whether dataclass ``kind`` declares a field other than ``object``.
+
+    Args:
+      kind: The class of a record ``to_plain`` writes.
+
+    Returns:
+      implies: Whether a field's declared type decides how a container it holds
+        is written.
+
+    """
+    return is_dataclass(kind) and any(
+        hint is not object for hint in _field_types(kind).values()
+    )
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _DeclaredParts:
+    """A container's parts' declared types: one for each, or one per name or index.
+
+    Attributes:
+      each: Every part's type, where neither ``named`` nor ``indexed`` is given.
+      named: Each named part's type; a name absent here is ``object``.
+      indexed: Each indexed part's type; an index past the end is ``object``.
+
+    """
+
+    each: object = object
+    named: Mapping[str, object] | None = None
+    indexed: tuple[object, ...] | None = None
+
+    def of(self, key: str | int) -> object:
+        """Return the declared type of the part at ``key``.
+
+        Args:
+          key: The part's name in a mapping or record, or its index in a sequence.
+
+        Returns:
+          declared: The type ``from_plain`` reads that part as.
+
+        """
+        if self.indexed is not None:
+            if isinstance(key, int) and key < len(self.indexed):
+                return self.indexed[key]
+            return object
+        if self.named is not None:
+            return self.named.get(key, object) if isinstance(key, str) else object
+        return self.each
 
 
 # A place links to its parent's rather than holding the whole path, so placing a
@@ -149,8 +257,9 @@ type _Node = list[object] | dict[str, object]
 """A container node: raw parts at first, each replaced in place by its plain form."""
 
 
-type _Entry = tuple[object, _Node, str | int | _RawKey, _Here]
-"""A part still to encode: the value, its node and key, and the node's place."""
+type _Entry = tuple[object, _Node, str | int | _RawKey, _Here, object]
+"""A part still to encode: the value, its node and key, the node's place, and the
+value's declared type."""
 
 
 @dataclass(slots=True, kw_only=True)
@@ -162,6 +271,9 @@ class _Encoding:
       hooks: Codecs for leaf types with no built-in conversion.
       tags: Each class's short name for ``py/object``; empty writes import paths.
       sort: Order each object's attributes by name, or keep declaration order.
+      default_concrete_types: The class untagged data reads as under each
+        abstract declared origin, where not the baseline.
+      declared: The type ``from_plain`` reads the value being encoded as.
       here: Where the value being encoded sits.
       node: The node the value being encoded is written into.
       key: Where in ``node`` it is written.
@@ -175,6 +287,10 @@ class _Encoding:
     hooks: Hooks
     tags: Mapping[type, str] = field(default_factory=dict[type, str])
     sort: bool = True
+    default_concrete_types: Mapping[object, type] = field(
+        default_factory=dict[object, type],
+    )
+    declared: object = object
     here: _Here = None
     node: _Node = field(default_factory=list[object])
     key: str | int = 0
@@ -188,6 +304,7 @@ class _RawKey:
     """A dict key that is not written as itself, escaped when its entry is reached."""
 
     key: object
+    declared: object = object
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -200,6 +317,7 @@ class _Checkpoint:
       node: The node the reduce is written into.
       key: Where in ``node`` it is written.
       here: Where the reduced value sits.
+      declared: The reduced value's declared type.
 
     """
 
@@ -208,6 +326,7 @@ class _Checkpoint:
     node: _Node
     key: str | int
     here: _Here
+    declared: object
 
 
 type _Encoder = Callable[[object, _Encoding], object]
@@ -218,22 +337,24 @@ type _Encoder = Callable[[object, _Encoding], object]
 # depth encodes; recursion stopped near a thousand levels. Each container is
 # built at once with its leaves in place, and each other part is written into
 # it when popped, in the order a depth-first walk reaches it.
-def _encode(value: object, state: _Encoding) -> object:
-    """Encode ``value`` and everything it holds."""
-    outer = state.stack, state.here, state.node, state.key
+def _encode(value: object, state: _Encoding, declared: object = object) -> object:
+    """Encode ``value``, declared ``declared``, and everything it holds."""
+    outer = state.stack, state.here, state.node, state.key, state.declared
     root: list[object] = [None]
     stack: list[_Entry] = []
     state.stack, state.node, state.key = stack, root, 0
+    state.declared = declared
     try:
         root[0] = _encode_node(value, state)
         while stack:
-            item, node, key, parent = stack.pop()
+            item, node, key, parent, declared = stack.pop()
             if isinstance(item, _Checkpoint):
                 continue
             try:
                 if isinstance(key, _RawKey):
-                    key = _encode_key(key.key, state)
+                    key = _encode_key(key.key, state, key.declared)
                 state.here, state.node, state.key = (parent, key), node, key
+                state.declared = declared
                 done = _encode_node(item, state)
             except TypeError as error:
                 node, key, done = _recover(error, state)
@@ -245,7 +366,7 @@ def _encode(value: object, state: _Encoding) -> object:
                 node[key] = done
         return root[0]
     finally:
-        state.stack, state.here, state.node, state.key = outer
+        state.stack, state.here, state.node, state.key, state.declared = outer
 
 
 def _encode_node(value: object, state: _Encoding) -> object:
@@ -282,7 +403,7 @@ def _recover(
         if not isinstance(checkpoint, _Checkpoint):
             continue
         _rollback(state, checkpoint.mark)
-        state.here = checkpoint.here
+        state.here, state.declared = checkpoint.here, checkpoint.declared
         state.node, state.key = checkpoint.node, checkpoint.key
         try:
             done = _encode_unreduced(checkpoint.value, state)
@@ -293,7 +414,11 @@ def _recover(
     raise error
 
 
-def _push_items(node: list[object], state: _Encoding) -> None:
+def _push_items(
+    node: list[object],
+    state: _Encoding,
+    declared: _DeclaredParts,
+) -> None:
     """Queue each part of ``node`` that is not yet plain, the first last."""
     stack, here, python = state.stack, state.here, state.dialect == "python"
     for index in range(len(node) - 1, -1, -1):
@@ -302,19 +427,25 @@ def _push_items(node: list[object], state: _Encoding) -> None:
             continue
         if type(item) is float and (python or isfinite(item)):
             continue
-        stack.append((item, node, index, here))
+        stack.append((item, node, index, here, declared.of(index)))
 
 
-def _push_values(node: dict[str, object], state: _Encoding) -> None:
+def _push_values(
+    node: dict[str, object],
+    state: _Encoding,
+    declared: _DeclaredParts,
+    here: _Here | object = PENDING,
+) -> None:
     """Queue each value of ``node`` that is not yet plain, the first last."""
-    stack, here, python = state.stack, state.here, state.dialect == "python"
+    stack, python = state.stack, state.dialect == "python"
+    parent = state.here if here is PENDING else cast("_Here", here)
     for key in reversed(node):
         item = node[key]
         if item is None or type(item) in _NATIVE_LEAVES:
             continue
         if type(item) is float and (python or isfinite(item)):
             continue
-        stack.append((item, node, key, here))
+        stack.append((item, node, key, parent, declared.of(key)))
 
 
 def _reference(place: _Here) -> dict[str, object] | None:
@@ -402,98 +533,214 @@ def _encode_bytes(value: object, state: _Encoding) -> object:
 
 
 def _encode_path(value: object, state: _Encoding) -> object:
-    """Encode a path as ``py/path``."""
-    del state
-    return {"py/path": str(value)}
+    """Encode a path as ``py/path``, untagged where it reads so."""
+    text = _untagged_leaf(value, state.declared)
+    return {"py/path": str(value)} if text is None else text
 
 
 def _encode_uuid(value: object, state: _Encoding) -> object:
-    """Encode a UUID as ``py/uuid``."""
-    del state
-    return {"py/uuid": str(value)}
+    """Encode a UUID as ``py/uuid``, untagged where it reads so."""
+    text = _untagged_leaf(value, state.declared)
+    return {"py/uuid": str(value)} if text is None else text
 
 
 def _encode_datetime(value: object, state: _Encoding) -> object:
-    """Encode a datetime as ``py/datetime``, keeping a named zone."""
-    del state
-    moment = cast("datetime", value)
+    """Encode a datetime as ``py/datetime``, keeping a named zone; untagged where it reads so."""
+    text = _untagged_leaf(value, state.declared)
+    if text is None:
+        return {"py/datetime": _datetime_text(cast("datetime", value))}
+    return text
+
+
+def _datetime_text(moment: datetime) -> str:
+    """Return ``moment`` in ISO 8601, a named zone in brackets after it."""
     text = moment.isoformat()
     if isinstance(moment.tzinfo, ZoneInfo):
         text = f"{text}[{moment.tzinfo.key}]"
-    return {"py/datetime": text}
+    return text
+
+
+# The Rust core asks this of a leaf it holds under a declared type.
+def _untagged_leaf(value: object, declared: object) -> str | int | float | None:
+    """Return the text ``declared`` reads back as leaf ``value``, else ``None``."""
+    if declared is object:
+        return None
+    if isinstance(value, Enum):
+        text = cast("object", value.value)
+        if type(text) not in (str, int, float):
+            return None
+    elif isinstance(value, datetime):
+        text = _datetime_text(value)
+    elif isinstance(value, (PurePath, UUID)):
+        text = str(value)
+    else:
+        return None
+    plain = cast("str | int | float", text)
+    return plain if _implied_leaf(value, plain, declared) else None
+
+
+# As for a container: an untagged leaf reads as the first union member its kind
+# selects, ``None`` passed over, so the leaf goes untagged only where that member's
+# decoder builds the leaf's own class from its text.
+def _implied_leaf(value: object, text: str | float, declared: object) -> bool:
+    """Return whether ``declared`` reads ``text`` back as leaf ``value``."""
+    kind = type(value)
+    candidates = _union_candidates(text, _members(declared))
+    member = next(
+        (m for m in candidates if m is not None and m is not type(None)),
+        None,
+    )
+    decoder = _untagged_decoder(member, {})
+    if decoder is _decode_path:
+        built = member if _is_path_class(member) else Path
+        return type(built()) is kind
+    if decoder is _decode_enum:
+        return member is kind
+    if decoder is _decode_uuid:
+        return kind is UUID
+    return decoder is _decode_datetime and kind is datetime
+
+
+def _is_path_class(member: object) -> TypeGuard[type[PurePath]]:
+    """Return whether ``member`` is a ``PurePath`` class."""
+    return isinstance(member, type) and issubclass(member, PurePath)
 
 
 def _encode_list(value: object, state: _Encoding) -> object:
-    """Encode a list, registering it for ``py/ref``."""
+    """Encode a list, registering it for ``py/ref``; ``py/list`` where it reads otherwise."""
     _register(value, state)
+    untagged, _, items = _form(
+        value,
+        list,
+        state.declared,
+        state.default_concrete_types,
+    )
     node = list(cast("Iterable[object]", value))
-    _push_items(node, state)
-    return node
+    _push_items(node, state, items)
+    return node if untagged else {"py/list": node}
 
 
 def _encode_tuple(value: object, state: _Encoding) -> object:
-    """Encode a tuple as ``py/tuple``; a tuple is a value, never referenced."""
+    """Encode a tuple as ``py/tuple``, untagged where it reads so; it is never referenced."""
+    untagged, _, items = _form(
+        value,
+        tuple,
+        state.declared,
+        state.default_concrete_types,
+    )
     node = list(cast("tuple[object, ...]", value))
-    _push_items(node, state)
-    return {"py/tuple": node}
+    _push_items(node, state, items)
+    return node if untagged else {"py/tuple": node}
 
 
 def _encode_set(value: object, state: _Encoding) -> object:
     """Encode a set as ``py/set`` with members in a deterministic order."""
     _register(value, state)
-    return {"py/set": _ordered(cast("AbstractSet[object]", value), state)}
+    untagged, _, items = _form(value, set, state.declared, state.default_concrete_types)
+    node = _ordered(cast("AbstractSet[object]", value), state, items)
+    return node if untagged else {"py/set": node}
 
 
 def _encode_frozenset(value: object, state: _Encoding) -> object:
     """Encode a frozenset as ``py/frozenset``; a frozenset is never referenced."""
-    return {"py/frozenset": _ordered(cast("AbstractSet[object]", value), state)}
+    untagged, _, items = _form(
+        value,
+        frozenset,
+        state.declared,
+        state.default_concrete_types,
+    )
+    node = _ordered(cast("AbstractSet[object]", value), state, items)
+    return node if untagged else {"py/frozenset": node}
 
 
-def _ordered(members: AbstractSet[object], state: _Encoding) -> object:
-    """Return a set's members as a node in a deterministic order, queued."""
-    node = sorted(members, key=lambda member: _set_order_key(member, state))
-    _push_items(node, state)
+def _ordered(
+    members: AbstractSet[object],
+    state: _Encoding,
+    items: _DeclaredParts,
+) -> object:
+    """Return a set's members, declared ``items``, as a node in a deterministic order."""
+    node = sorted(members, key=lambda member: _set_order_key(member, state, items.each))
+    _push_items(node, state, items)
     return node
 
 
 # The encoding leads: a default ``repr`` holds the object's address, so ordering
 # by it first made a set's text differ from run to run.
-def _set_order_key(value: object, state: _Encoding) -> tuple[str, str]:
-    """Return a set member's sort key without registering anything it reaches."""
+def _set_order_key(
+    value: object,
+    state: _Encoding,
+    declared: object,
+) -> tuple[str, str]:
+    """Return a set member's sort key, as written, registering nothing it reaches."""
     mark = len(state.alive)
     try:
-        encoded = _encode(value, state)
+        encoded = _encode(value, state, declared)
     finally:
         _rollback(state, mark)
     return json.dumps(encoded, sort_keys=True), repr(value)
 
 
 def _encode_dict(value: object, state: _Encoding) -> object:
-    """Encode a dict, escaping keys through ``_encode_key``."""
-    mapping = cast("Mapping[object, object]", value)
+    """Encode a dict, escaping keys through ``_encode_key``; ``py/dict`` where it reads otherwise."""
     _register(value, state)
+    untagged, keys, values = _form(
+        value,
+        dict,
+        state.declared,
+        state.default_concrete_types,
+    )
+    node = _entries(
+        cast("Mapping[object, object]", value),
+        state,
+        keys,
+        values,
+        state.here,
+    )
+    return node if untagged else {"py/dict": node}
+
+
+def _encode_mappingproxy(value: object, state: _Encoding) -> object:
+    """Encode a ``MappingProxyType`` as ``py/mappingproxy`` around its dict, untagged where it reads so."""
+    _register(value, state)
+    untagged, keys, values = _form(
+        value,
+        MappingProxyType,
+        state.declared,
+        state.default_concrete_types,
+    )
+    mapping = cast("Mapping[object, object]", value)
+    if untagged:
+        return _entries(mapping, state, keys, values, state.here)
+    # Its entries sit below the dict the tag holds, as ``from_plain`` places them.
+    inner = _entries(mapping, state, keys, values, (state.here, "py/mappingproxy"))
+    return {"py/mappingproxy": inner}
+
+
+def _entries(
+    mapping: Mapping[object, object],
+    state: _Encoding,
+    keys: object,
+    values: _DeclaredParts,
+    here: _Here,
+) -> dict[str, object]:
+    """Return ``mapping``'s node, its entries at ``here`` queued, keys escaped."""
     if all(map(_is_plain_key, mapping)):
         node = {cast("str", key): item for key, item in mapping.items()}
-        _push_values(node, state)
+        _push_values(node, state, values, here)
         return node
     # An escaped key is encoded when its entry is reached, after every earlier
     # value, so a key naming an object written earlier becomes a ``py/ref``.
     # Every entry waits its turn, plain ones too, to keep the keys in order.
     escaped: dict[str, object] = {}
-    here = state.here
     for key, item in reversed(list(mapping.items())):
-        name = cast("str", key) if _is_plain_key(key) else _RawKey(key=key)
-        state.stack.append((item, escaped, name, here))
+        if _is_plain_key(key):
+            plain = cast("str", key)
+            state.stack.append((item, escaped, plain, here, values.of(plain)))
+        else:
+            name = _RawKey(key=key, declared=keys)
+            part = values.each if values.named is None else object
+            state.stack.append((item, escaped, name, here, part))
     return escaped
-
-
-def _encode_mappingproxy(value: object, state: _Encoding) -> object:
-    """Encode a ``MappingProxyType`` as ``py/mappingproxy`` around its dict."""
-    _register(value, state)
-    node: dict[str, object] = {"py/mappingproxy": None}
-    copied = dict(cast("Mapping[object, object]", value))
-    state.stack.append((copied, node, "py/mappingproxy", state.here))
-    return node
 
 
 def _is_plain_key(key: object) -> bool:
@@ -501,8 +748,8 @@ def _is_plain_key(key: object) -> bool:
     return type(key) is str and not key.startswith(("py/", "json://"))
 
 
-def _encode_key(key: object, state: _Encoding) -> str:
-    """Return a dict key, ``json://``-escaping non-strings and tag lookalikes."""
+def _encode_key(key: object, state: _Encoding, declared: object = object) -> str:
+    """Return a dict key, declared ``declared``, ``json://``-escaping non-strings and tag lookalikes."""
     if _is_plain_key(key):
         return cast("str", key)
     # A key is text, so nothing inside it has a path a later ``py/ref`` can name.
@@ -513,7 +760,7 @@ def _encode_key(key: object, state: _Encoding) -> str:
     mark, here = len(state.alive), state.here
     state.here = _IN_KEY
     try:
-        encoded = _encode(key, state)
+        encoded = _encode(key, state, declared)
     finally:
         _rollback(state, mark)
         state.here = here
@@ -546,13 +793,26 @@ def _encode_object(value: object, state: _Encoding) -> object:
     if state.tags and kind not in state.tags:
         raise TypeError(f"Cannot serialize {kind!r}: it is not in classes.")
     _register(value, state)
-    name = state.tags[kind] if state.tags else _import_path(kind)
-    node: dict[str, object] = {"py/object": name}
+    types = _field_types(kind) if is_dataclass(kind) else None
+    members: dict[str, object] = {}
     for name in attribute_names(value, sort=state.sort):
         member: object = getattr(value, name, PENDING)
         if member is not PENDING:
-            node[name] = member
-    _push_values(node, state)
+            members[name] = member
+    if (
+        types is not None
+        and members.keys() <= types.keys()
+        and _implied_record(
+            kind,
+            state.declared,
+            state.default_concrete_types,
+        )
+    ):
+        node = members
+    else:
+        tag = state.tags[kind] if state.tags else _import_path(kind)
+        node = {"py/object": tag, **members}
+    _push_values(node, state, _DeclaredParts(named=types))
     return node
 
 
@@ -572,12 +832,15 @@ def _encode_hooked(value: object, state: _Encoding) -> object:
             f"Cannot serialize {path}: its encode hook returned a {kind.__name__}.",
         )
     node: list[object] = [path, payload]
-    _push_items(node, state)
+    _push_items(node, state, _DeclaredParts())
     return {"py/hook": node}
 
 
 def _encode_reduce(value: object, state: _Encoding) -> object:
-    """Encode a value by its ``__reduce__`` recipe as ``py/reduce``."""
+    """Encode a value by its ``__reduce__`` recipe as ``py/reduce``, a leaf untagged where it reads so."""
+    text = _untagged_leaf(value, state.declared)
+    if text is not None:
+        return text
     recipe = _canonical_reduce(value)
     if recipe is None:
         return _encode_unreduced(value, state)
@@ -600,9 +863,10 @@ def _encode_reduce(value: object, state: _Encoding) -> object:
         node=state.node,
         key=state.key,
         here=state.here,
+        declared=state.declared,
     )
-    state.stack.append((checkpoint, state.node, state.key, None))
-    _push_items(parts, state)
+    state.stack.append((checkpoint, state.node, state.key, None, object))
+    _push_items(parts, state, _DeclaredParts())
     return {"py/reduce": parts}
 
 
@@ -700,6 +964,89 @@ def _verified_path(path: str, value: object) -> str:
     return path
 
 
+# A part written untagged reads back as its own class only where ``from_plain``'s
+# dispatch builds that class, so this asks that dispatch rather than restating it.
+# A union reads untagged data by the first member its kind selects, and tagged
+# data by the first member the value fits, mapping members last for a value tag.
+# Under ``object`` an untagged mapping or sequence reads as a dict or list.
+def _form(
+    value: object,
+    kind: type,
+    declared: object,
+    default_concrete_types: Mapping[object, type],
+) -> tuple[bool, object, _DeclaredParts]:
+    """Return whether ``value`` written as a ``kind`` goes untagged, and its parts' types."""
+    if declared is object:
+        return kind is dict or kind is list, object, _DeclaredParts()
+    mapping = kind is dict or kind is MappingProxyType
+    members = _members(declared)
+    builds = _MAPPING_BUILDS if mapping else _SEQUENCE_BUILDS
+    shape: PlainTree = MappingProxyType[str, PlainTree]({}) if mapping else ()
+    for member in _union_candidates(shape, members):
+        decoder = _untagged_decoder(member, default_concrete_types)
+        built = builds.get(decoder)
+        if built is None:
+            continue
+        if built is kind:
+            if decoder is _decode_typeddict:
+                named = _field_types(cast("type", member))
+                return True, object, _DeclaredParts(named=named)
+            return True, *_part_types(member, kind)
+        break
+    valued = not mapping
+    for member in sorted(
+        members,
+        key=lambda member: (
+            valued and _reads_tags_as_keys(member, default_concrete_types)
+        ),
+    ):
+        if _shallow_fit(value, member) is not False:
+            return False, *_part_types(member, kind)
+    return False, object, _DeclaredParts()
+
+
+# As for a container: the first member whose decoder builds from an untagged
+# mapping is the one ``from_plain`` reads it as.
+def _implied_record(
+    kind: type,
+    declared: object,
+    default_concrete_types: Mapping[object, type],
+) -> bool:
+    """Return whether ``declared`` reads an untagged mapping as dataclass ``kind``."""
+    if declared is object:
+        return False
+    shape = MappingProxyType[str, PlainTree]({})
+    for member in _union_candidates(shape, _members(declared)):
+        decoder = _untagged_decoder(member, default_concrete_types)
+        if decoder in _MAPPING_BUILDS:
+            return decoder is _decode_object and member is kind
+    return False
+
+
+def _part_types(member: object, kind: type) -> tuple[object, _DeclaredParts]:
+    """Return the key and part types a ``kind`` decoder reads under ``member``."""
+    if kind is dict or kind is MappingProxyType:
+        key_type, value_type = _entry_types(member)
+        return key_type, _DeclaredParts(each=value_type)
+    if kind is tuple:
+        fixed, each = _tuple_types(member)
+        return object, _DeclaredParts(each=each, indexed=fixed)
+    return object, _DeclaredParts(each=_element_type(member))
+
+
+def _members(declared: object) -> tuple[object, ...]:
+    """Return ``declared``'s union members, nested unions spelled out, aliases resolved."""
+    flat: list[object] = []
+    pending = [declared]
+    while pending:
+        member = _resolve_alias(pending.pop())
+        if _is_union(get_origin(member) or member):
+            pending.extend(reversed(cast("tuple[object, ...]", get_args(member))))
+        else:
+            flat.append(member)
+    return tuple(flat)
+
+
 _NATIVE_LEAVES: Final = frozenset((str, int, bool))
 
 
@@ -755,3 +1102,29 @@ def _walker[F](python: F) -> F:
 
 
 to_plain = _walker(_python_to_plain)
+
+
+# ``object`` marks a decoder that takes the data but builds no container of its kind.
+_MAPPING_BUILDS: Final = MappingProxyType[_Decoder, type](
+    {
+        _decode_dict: dict,
+        _decode_untagged_proxy: MappingProxyType,
+        _decode_typeddict: dict,
+        _decode_any: dict,
+        _decode_object: object,
+    },
+)
+"""The class each decoder builds from an untagged mapping."""
+
+
+_SEQUENCE_BUILDS: Final = MappingProxyType[_Decoder, type](
+    {
+        _decode_list: list,
+        _decode_untagged_tuple: tuple,
+        _decode_set: set,
+        _decode_frozenset: frozenset,
+        _decode_any: list,
+        _decode_complex: object,
+    },
+)
+"""The class each decoder builds from an untagged sequence."""
