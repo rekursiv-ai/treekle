@@ -21,6 +21,7 @@ from typing import (
     TYPE_CHECKING,
     Annotated,
     ClassVar,
+    Final,
     NamedTuple,
     Protocol,
     TypedDict,
@@ -30,14 +31,17 @@ from typing import (
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
+import contextlib
 import datetime as dt
 import gc
 import importlib
 import inspect
+import itertools
 import json
 import math
 import os
 import random
+import re
 import struct
 import subprocess
 import sys
@@ -49,6 +53,8 @@ import weakref
 import pytest
 
 from treekle import deserialize, reflect, serialize, wire
+from treekle.absent import ABSENT
+from treekle.plain import immutable
 from treekle.types import ReadError
 
 
@@ -115,6 +121,18 @@ class WithClassVar:
     shared: ClassVar[int] = 0
 
 
+class AreaShape(Protocol):
+    def area(self) -> float: ...
+
+
+@dataclass(frozen=True, kw_only=True, slots=True)
+class SquareShape:
+    side: float
+
+    def area(self) -> float:
+        return self.side * self.side
+
+
 @dataclass(kw_only=True, slots=True)
 class ChangingField:
     x: int = 1
@@ -130,6 +148,37 @@ class Node:
     name: str
     children: list[Node] = field(default_factory=list["Node"])
     parent: Node | None = None
+
+
+@dataclass(
+    slots=True,
+)  # house-ignore[dataclass] -- Built positionally, as ``Node`` is.
+class Carrier:
+    """A record like ``Node`` whose last field holds any value."""
+
+    name: str
+    children: list[Node] = field(default_factory=list["Node"])
+    held: object = None
+
+
+@dataclass(frozen=True, kw_only=True, slots=True)
+class Implied:
+    """A record whose field types imply containers JSON lacks."""
+
+    names: tuple[str, ...] = ()
+    pair: tuple[int, str] = (0, "")
+    tags: frozenset[str] = frozenset()
+    members: set[int] = field(default_factory=set[int])
+    index: dict[str, tuple[int, ...]] = field(
+        default_factory=dict[str, tuple[int, ...]],
+    )
+    keyed: dict[tuple[int, int], str] = field(
+        default_factory=dict[tuple[int, int], str],
+    )
+    frozen: Mapping[str, Sequence[int]] = field(
+        default_factory=dict[str, Sequence[int]],
+    )
+    held: object = None
 
 
 class Slotted:
@@ -573,6 +622,14 @@ ENCODE_CASES: list[tuple[str, object, object, Hooks | None]] = [
 DECODE_CASES: list[tuple[str, object, object, dict[str, object]]] = [
     ("untagged dataclass", {"x": 1, "y": 2.0}, Point, {}),
     ("bad field", {"x": "bad"}, Point, {}),
+    ("int in a float field", {"x": 1, "y": 3}, Point, {}),
+    ("int as a float", [3, 10**400, 2.5], list[float], {}),
+    (
+        "tagged int in a float field",
+        {"py/object": f"{__name__}.Point", "x": 1, "y": 3},
+        Point,
+        {},
+    ),
     ("list of int", [1, 2, 3], list[int], {}),
     ("bad list items", [True, "bad", 3], list[int], {}),
     ("default on none", None, str, {"default": ""}),
@@ -791,6 +848,133 @@ def test_to_plain_matches_python(
         ),
     )
     assert rust == python
+
+
+_FROZEN_TYPES: Final = MappingProxyType[type, type](
+    {Mapping: MappingProxyType, Sequence: tuple},
+)
+
+
+def _to_plain_grid(value: object, hooks: Hooks | None) -> dict[str, list[object]]:
+    """Return every value each ``to_plain`` option takes in the grid, but ``obj``."""
+    return {
+        "dialect": ["json", "python"],
+        "mutable": [True, False],
+        "hooks": [MappingProxyType({}), *([] if hooks is None else [hooks])],
+        "classes": [MappingProxyType({}), {"point": Point, "implied": Implied}],
+        "sort": [True, False],
+        "target": [object, type(value), list[Implied]],
+        "default_concrete_types": [MappingProxyType({}), _FROZEN_TYPES],
+    }
+
+
+def _from_plain_grid(hooks: Hooks | None) -> dict[str, list[object]]:
+    """Return every value each ``from_plain`` option takes in the grid, but ``data``."""
+    return {
+        "target": [object, list[Implied], Implied | None],
+        "default": [ABSENT, None],
+        "hooks": [MappingProxyType({}), *([] if hooks is None else [hooks])],
+        "classes": [MappingProxyType({}), {"point": Point, "implied": Implied}],
+        "allow_imports": [True, False],
+        "strict": [True, False],
+        "default_concrete_types": [MappingProxyType({}), _FROZEN_TYPES],
+    }
+
+
+def test_the_option_grids_name_every_parameter() -> None:
+    encoding = list(inspect.signature(serialize._python_to_plain).parameters)
+    decoding = list(inspect.signature(deserialize._python_from_plain).parameters)
+    assert sorted(_to_plain_grid(None, None)) == sorted(encoding[1:])
+    assert sorted(_from_plain_grid(None)) == sorted(decoding[1:])
+
+
+_GRID_VALUES: Final[list[tuple[str, object, Hooks | None]]] = [
+    *((name, value, hooks) for name, value, _, hooks in ENCODE_CASES),
+    (
+        "implied",
+        [Implied(names=("a",), pair=(1, "x"), tags=frozenset({"t"}), members={2, 1})],
+        None,
+    ),
+    ("frozen json", immutable({"a": [1, {"b": (2,)}]}), None),
+]
+
+
+@needs_rust
+@pytest.mark.parametrize(
+    ("value", "hooks"),
+    [case[1:] for case in _GRID_VALUES],
+    ids=[case[0] for case in _GRID_VALUES],
+)
+def test_to_plain_matches_python_under_every_option(
+    value: object,
+    hooks: Hooks | None,
+) -> None:
+    grid = _to_plain_grid(value, hooks)
+    for chosen in itertools.product(*grid.values()):
+        options = dict(zip(grid, chosen, strict=True))
+        python = _call_outcome(serialize._python_to_plain, value, options)
+        rust = _call_outcome(serialize.to_plain, value, options)
+        assert rust == python, options
+
+
+@needs_rust
+@pytest.mark.parametrize(
+    ("value", "hooks"),
+    [case[1:] for case in _GRID_VALUES],
+    ids=[case[0] for case in _GRID_VALUES],
+)
+def test_from_plain_matches_python_under_every_option(
+    value: object,
+    hooks: Hooks | None,
+) -> None:
+    trees: list[object] = []
+    for concrete in (MappingProxyType[type, type]({}), _FROZEN_TYPES):
+        with contextlib.suppress(TypeError, ValueError):
+            trees.append(
+                serialize._python_to_plain(
+                    value,
+                    hooks=hooks or {},
+                    target=type(value),
+                    default_concrete_types=concrete,
+                ),
+            )
+    grid = _from_plain_grid(hooks)
+    for tree, chosen in itertools.product(trees, itertools.product(*grid.values())):
+        options = dict(zip(grid, chosen, strict=True))
+        python = _call_outcome(
+            _read_back(deserialize._python_from_plain),
+            tree,
+            options,
+        )
+        rust = _call_outcome(_read_back(deserialize.from_plain), tree, options)
+        assert rust == python, (tree, options)
+
+
+def _python_json_dumps(value: object, **options: object) -> str:
+    """Return ``json_dumps(value, **options)`` as Python's walk writes it."""
+    encode = cast("Callable[..., object]", serialize._python_to_plain)
+    return json.dumps(encode(value, **options))
+
+
+def _read_back(read: Callable[..., object]) -> Callable[..., object]:
+    """Return ``read`` called with its ``target`` option, its result as Python writes it."""
+
+    def call(tree: object, *, target: object, **options: object) -> object:
+        return serialize._python_to_plain(read(tree, target, **options))
+
+    return call
+
+
+# An error names an object by ``repr``, which holds its address: two walks that
+# agree still build two objects, so the address is not compared.
+def _call_outcome(
+    function: Callable[..., object],
+    value: object,
+    options: dict[str, object],
+) -> str:
+    """Return ``_outcome`` of ``function(value, **options)``, addresses removed."""
+    shown = repr(_outcome(partial(function, value, **options)))
+    return re.sub(r" at 0x[0-9a-f]+", "", shown)
 
 
 @pytest.mark.parametrize(
@@ -1531,6 +1715,64 @@ def test_a_stored_record_runs_the_same_user_code_in_both() -> None:
     assert all(logs[1])
 
 
+@needs_rust
+@pytest.mark.parametrize(
+    "tag",
+    ["py/tuple", "py/list", "py/dict", "py/mappingproxy"],
+)
+def test_a_union_asks_a_record_for_value_tags_as_python_does(tag: str) -> None:
+    payload: object = {"a": 1} if tag in {"py/dict", "py/mappingproxy"} else [1]
+    target = Mapping[str, object] | Sequence[int]
+    logs: list[list[str]] = []
+    reads: list[object] = []
+    for function in (deserialize.from_plain, deserialize._python_from_plain):
+        _LoggedRecord.log.clear()
+        reads.append(function(_LoggedRecord({tag: payload}), target))
+        logs.append(_LoggedRecord.log[:])
+    assert logs[0] == logs[1]
+    assert type(reads[0]) is type(reads[1])
+    assert reads[0] == reads[1]
+
+
+@needs_rust
+def test_default_concrete_types_read_and_write_as_python_does() -> None:
+    concrete = MappingProxyType[type, type](
+        {Mapping: MappingProxyType, Sequence: tuple},
+    )
+    tree = {"a": [1, {"b": (2,)}], "c": {"py/dict": {"d": {"py/list": [3]}}}}
+    target = (
+        Mapping[str, object] | Mapping[str, Sequence[object] | Mapping[str, object]]
+    )
+    _assert_reads_alike(tree, target, default_concrete_types=concrete)
+    _assert_reads_alike(tree, Mapping[str, object], default_concrete_types=concrete)
+    value = immutable({"a": [1, {"b": 2}]})
+    for declared in (object, Mapping[str, object]):
+        assert serialize.to_plain(
+            value,
+            target=declared,
+            default_concrete_types=concrete,
+        ) == serialize._python_to_plain(
+            value,
+            target=declared,
+            default_concrete_types=concrete,
+        )
+    with pytest.raises(ValueError, match="default_concrete_types keys must be"):
+        serialize.to_plain(value, default_concrete_types={dict: MappingProxyType})
+    with pytest.raises(ValueError, match="default_concrete_types keys must be"):
+        deserialize.from_plain(
+            tree,
+            object,
+            default_concrete_types={dict: MappingProxyType},
+        )
+
+
+@needs_rust
+def test_a_union_builds_a_record_its_tag_names_as_python_does() -> None:
+    tree = serialize.to_plain(SquareShape(side=2.0))
+    _assert_reads_alike(tree, Mapping[str, object] | AreaShape, allow_imports=True)
+    _assert_reads_alike(tree, Mapping[str, object] | AreaShape)
+
+
 def test_a_class_variable_does_not_count_as_a_stored_field() -> None:
     # ``__dataclass_fields__`` holds the ``ClassVar`` too, so a record with
     # one key per entry there still lacks ``y``; one naming it is refused.
@@ -1629,7 +1871,7 @@ def _every_native_kind(depth: int) -> object:
         lambda tree, level: (tree, Color.RED, Level.LOW, Frozen(level)),
         lambda tree, level: [tree, {frozenset({level, "x"}), Frozen(level), "y"}],
         lambda tree, _: _Recipe(tree),
-        lambda tree, level: Node(f"n{level}", [Node("leaf")], cast("Node", tree)),
+        lambda tree, level: Carrier(f"n{level}", [Node("leaf")], tree),
         lambda tree, _: MappingProxyType({"m": tree, "f": math.inf, "s": shared}),
     ]
     tree: object = shared
@@ -1658,6 +1900,60 @@ def test_deep_trees_of_every_kind_encode_natively_as_python_does(
 
 
 @needs_rust
+@pytest.mark.parametrize("mutable", [True, False], ids=["mutable", "frozen"])
+@pytest.mark.parametrize("sort", [True, False], ids=["sorted", "unsorted"])
+@pytest.mark.parametrize("target", [object, list[Implied]], ids=repr)
+@pytest.mark.parametrize(
+    "concrete",
+    [MappingProxyType[type, type]({}), _FROZEN_TYPES],
+    ids=["baseline", "frozen"],
+)
+def test_records_whose_fields_imply_containers_encode_natively_as_python_does(
+    monkeypatch: pytest.MonkeyPatch,
+    mutable: bool,
+    sort: bool,
+    target: object,
+    concrete: Mapping[type, type],
+) -> None:
+    value = [
+        Implied(
+            names=("a", "b"),
+            pair=(1, "x"),
+            tags=frozenset({"t", "u"}),
+            members={2, 1},
+            index={"i": (1, 2)},
+            keyed={(1, 2): "k"},
+            frozen=MappingProxyType({"f": (3,)}),
+            held=Implied(names=("c",), held=(3,), frozen={"g": [4]}),
+        )
+        for _ in range(3)
+    ]
+    options: dict[str, object] = {
+        "sort": sort,
+        "target": target,
+        "default_concrete_types": concrete,
+    }
+    expected = _call_outcome(
+        serialize._python_to_plain,
+        value,
+        {**options, "mutable": mutable},
+    )
+    expected_text = _call_outcome(_python_json_dumps, value, options)
+
+    def refused(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("the native walk ran Python's")
+
+    monkeypatch.setattr(serialize, "_encode", refused)
+    monkeypatch.setattr(serialize, "_Encoding", refused)
+    assert _call_outcome(
+        serialize.to_plain,
+        value,
+        {**options, "mutable": mutable},
+    ) == (expected)
+    assert _call_outcome(wire.json_dumps, value, options) == expected_text
+
+
+@needs_rust
 def test_each_python_encoder_shares_one_reference_map(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1673,7 +1969,7 @@ def test_each_python_encoder_shares_one_reference_map(
         received.append(state.seen)
         serialize._register(value, state)
         node: dict[str, object] = {"held": cast("Holder", value).held}
-        serialize._push_values(node, state)
+        serialize._push_values(node, state, serialize._DeclaredParts())
         return node
 
     monkeypatch.setitem(serialize._ENCODER_CACHE, Holder, encode_holder)
@@ -1740,7 +2036,7 @@ def test_a_python_encoder_inside_a_key_sees_it_is_inside_one(
     def encode_box(value: object, state: serialize._Encoding) -> object:
         serialize._register(value, state)
         node: dict[str, object] = {"held": cast("KeyBox", value).held}
-        serialize._push_values(node, state)
+        serialize._push_values(node, state, serialize._DeclaredParts())
         return node
 
     monkeypatch.setitem(serialize._ENCODER_CACHE, KeyBox, encode_box)

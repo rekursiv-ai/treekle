@@ -1,9 +1,17 @@
-"""Import paths and object state, shared by ``serialize`` and ``deserialize``."""
+"""Import paths, object state, and concrete types, shared by both walks."""
 
 from __future__ import annotations
 
-from types import MemberDescriptorType
-from typing import TYPE_CHECKING, Final, cast
+from collections.abc import (
+    Mapping,
+    MutableMapping,
+    MutableSequence,
+    MutableSet,
+    Sequence,
+    Set as AbstractSet,
+)
+from types import MappingProxyType, MemberDescriptorType
+from typing import TYPE_CHECKING, Final, cast, get_origin
 
 import importlib
 import sys
@@ -11,14 +19,16 @@ import weakref
 
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Mapping
+    from collections.abc import Iterable
 
 
 __all__ = [
+    "BASELINE_CONCRETE",
     "PENDING",
     "SKIPPED_ATTRIBUTES",
     "attribute_names",
     "class_tags",
+    "concrete_overrides",
     "is_mutable",
     "resolve_import",
     "resolves_to",
@@ -32,6 +42,30 @@ SKIPPED_ATTRIBUTES: Final = frozenset(("__weakref__", "__dict__"))
 
 PENDING: Final = object()
 """Marks a value not built yet, or an attribute a walk did not find."""
+
+
+BASELINE_CONCRETE: Final = MappingProxyType[type, type](
+    {
+        Mapping: dict,
+        MutableMapping: dict,
+        Sequence: list,
+        MutableSequence: list,
+        AbstractSet: frozenset,
+        MutableSet: set,
+    },
+)
+"""What untagged data under each abstract declared type reads as by default."""
+
+
+_BUILDABLE: Final[tuple[type, ...]] = (
+    dict,
+    MappingProxyType,
+    list,
+    tuple,
+    set,
+    frozenset,
+)
+"""The classes a walk builds from an untagged mapping or sequence."""
 
 
 def resolve_import(path: str) -> object:
@@ -99,7 +133,7 @@ def resolves_to(path: str, value: object) -> bool:
     return False
 
 
-def class_tags(classes: Mapping[str, type]) -> dict[type, str]:
+def class_tags(classes: Mapping[str, object]) -> dict[type, str]:
     """Return each class in ``classes`` by its short name, checking the mapping.
 
     Args:
@@ -125,6 +159,49 @@ def class_tags(classes: Mapping[str, type]) -> dict[type, str]:
             )
         tags[kind] = name
     return tags
+
+
+def concrete_overrides(concrete: Mapping[type, type]) -> dict[object, type]:
+    """Return each entry of ``concrete`` that differs from the baseline, checked.
+
+    Args:
+      concrete: Abstract declared types to the class untagged data under them
+        reads as; a ``typing`` alias names its ``collections.abc`` class.
+
+    Returns:
+      overrides: The entries a walk must apply over ``BASELINE_CONCRETE``.
+
+    Raises:
+      ValueError: A key is not a ``BASELINE_CONCRETE`` key, or its value is
+        not a buildable subclass of it.
+
+    """
+    overrides: dict[object, type] = {}
+    for key, chosen in concrete.items():
+        declared = cast("type", get_origin(key) or key)
+        baseline = BASELINE_CONCRETE.get(declared)
+        if baseline is None:
+            raise ValueError(
+                "default_concrete_types keys must be one of "
+                f"{', '.join(kind.__name__ for kind in BASELINE_CONCRETE)}, "
+                f"not {key!r}",
+            )
+        choices = (
+            baseline,
+            *(
+                kind
+                for kind in _BUILDABLE
+                if kind is not baseline and issubclass(kind, declared)
+            ),
+        )
+        if chosen not in choices:
+            raise ValueError(
+                f"default_concrete_types[{declared.__name__}] must be one of "
+                f"{', '.join(choice.__name__ for choice in choices)}, not {chosen!r}",
+            )
+        if chosen is not baseline:
+            overrides[declared] = chosen
+    return overrides
 
 
 # A class that sets ``__hash__ = None`` (``bytearray``, ``array``) is mutable by

@@ -4,7 +4,14 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections import OrderedDict
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import (
+    Callable,
+    Mapping,
+    MutableMapping,
+    MutableSet,
+    Sequence,
+    Set as AbstractSet,
+)
 from dataclasses import dataclass, field, make_dataclass
 from decimal import Decimal
 from enum import Enum
@@ -41,6 +48,7 @@ import inspect
 import math
 import numbers
 import sys
+import typing
 import weakref
 
 import pytest
@@ -573,11 +581,37 @@ class TestTypedDecode:
 
         assert from_plain([[1], {"py/ref": [0]}], target) == ([1], [1])
 
-    def test_a_float_accepts_an_int_and_a_tag(self) -> None:
-        read = from_plain(1, float)
+    @pytest.mark.parametrize("strict", [True, False])
+    def test_a_float_keeps_an_int_as_written(self, strict: bool) -> None:
+        read = from_plain(1, float, strict=strict)
+        huge = from_plain(10**400, float, strict=strict)
 
-        assert read == 1.0
-        assert type(read) is float
+        assert (read, type(read)) == (1, int)
+        assert (huge, type(huge)) == (10**400, int)
+
+    @pytest.mark.parametrize(
+        "data",
+        [
+            {"py/dict": {"a": 1}},
+            [{"a": 1}, {"py/ref": [0]}],
+        ],
+        ids=repr,
+    )
+    def test_a_tagged_or_referenced_int_fits_a_float(self, data: PlainTree) -> None:
+        concrete = MappingProxyType[type, type]({Mapping: MappingProxyType})
+        target = (
+            Mapping[str, float] if isinstance(data, Mapping) else list[dict[str, float]]
+        )
+
+        read = from_plain(data, target, default_concrete_types=concrete)
+
+        assert "1" in repr(read)
+        assert "1.0" not in repr(read)
+
+    def test_a_float_accepts_a_float_and_a_tag(self) -> None:
+        read = from_plain(1.0, float)
+
+        assert (read, type(read)) == (1.0, float)
         assert from_plain({"py/float": "-inf"}, float) == -math.inf
 
     def test_a_pep695_alias_resolves(self) -> None:
@@ -833,14 +867,12 @@ class TestReferences:
         assert restored.name == "p"
         assert restored.children[0] is restored
 
-    def test_a_reference_into_an_unbuilt_dataclass_is_invalid(self) -> None:
+    def test_an_untagged_dataclass_cycle_reads_as_its_declared_type(self) -> None:
         tree: MutablePlainTree = {"name": "n", "children": [{"py/ref": []}]}
 
-        with pytest.raises(ReadError) as raised:
-            from_plain(tree, Node)
+        restored = from_plain(tree, Node)
 
-        assert list(raised.value.bad) == [("children", 0)]
-        assert "still being built" in raised.value.bad["children", 0].reason
+        assert restored.children[0] is restored
 
     def test_a_typed_dataclass_is_placed_for_a_later_reference(self) -> None:
         tree = {"a": {"x": 1}, "b": {"py/ref": ["a"]}}
@@ -1035,12 +1067,10 @@ class TestDecodeEdges:
         assert from_plain(ordered, object, allow_imports=True) == OrderedDict(a=1)
         assert from_plain(listed, object, allow_imports=True) == [1, 2]
 
-    def test_a_reference_to_an_unbuilt_dataclass_is_invalid(self) -> None:
-        with pytest.raises(ReadError) as raised:
-            from_plain({"name": "n", "children": [{"py/id": 0}]}, Node)
+    def test_a_numbered_reference_to_an_untagged_dataclass_resolves(self) -> None:
+        restored = from_plain({"name": "n", "children": [{"py/id": 0}]}, Node)
 
-        assert list(raised.value.bad) == [("children", 0)]
-        assert "still being built" in raised.value.bad["children", 0].reason
+        assert restored.children[0] is restored
 
     @pytest.mark.parametrize(
         ("data", "target"),
@@ -1055,7 +1085,6 @@ class TestDecodeEdges:
             ([[1]], set[object]),
             ([[1]], frozenset[object]),
             ({"json://[1]": 1}, dict[object, int]),
-            ({"n": 0}, Positive),
             ({"x": 1}, Bare),
             ("x", int | float),
             ({"py/type": 1}, object),
@@ -1102,7 +1131,6 @@ class TestDecodeEdges:
         [
             ([1], Point, False, r"^expected object for Point, got \[1\]$"),
             ({"x": 1}, Bare, False, r"^cannot read \{'x': 1\} as Bare$"),
-            ({"n": 0}, Positive, False, "^cannot build Positive: n must be positive$"),
             ({"py/object": 1}, object, True, "^invalid py/object path: 1$"),
             (
                 {"py/object": "builtins.max"},
@@ -1626,22 +1654,35 @@ class TestStoredState:
         assert from_plain(to_plain(stored), Doubled).value == 2
         assert from_plain(to_plain(stored), Doubled, allow_imports=True).value == 2
 
-    def test_an_untagged_record_is_built_through_init(self) -> None:
-        assert from_plain({"value": 1}, Doubled).value == 2
+    def test_an_untagged_record_restores_as_its_tag_would(self) -> None:
+        assert from_plain({"value": 2}, Doubled) == from_plain(
+            {"py/object": f"{__name__}.Doubled", "value": 2},
+            Doubled,
+        )
+        assert from_plain({"value": 2}, Doubled).value == 2
+        assert from_plain({"n": 0}, Positive).n == 0
 
-    def test_stored_state_fills_a_missing_defaulted_field(self) -> None:
-        tree = {"py/object": f"{__name__}.Point", "x": 1}
+    @pytest.mark.parametrize("tag", [{}, {"py/object": f"{__name__}.Point"}], ids=repr)
+    def test_stored_state_fills_a_missing_defaulted_field(
+        self,
+        tag: dict[str, str],
+    ) -> None:
+        assert from_plain({**tag, "x": 1}, Point) == Point(x=1)
 
-        assert from_plain(tree, Point) == Point(x=1)
+    @pytest.mark.parametrize("tag", [{}, {"py/object": f"{__name__}.Node"}], ids=repr)
+    def test_stored_state_fills_a_missing_factory_field(
+        self,
+        tag: dict[str, str],
+    ) -> None:
+        assert from_plain({**tag, "name": "n"}, Node).children == []
 
-    def test_stored_state_fills_a_missing_factory_field(self) -> None:
-        tree = {"py/object": f"{__name__}.Node", "name": "n"}
-
-        assert from_plain(tree, Node).children == []
-
-    def test_stored_state_missing_a_required_field_is_refused(self) -> None:
+    @pytest.mark.parametrize("tag", [{}, {"py/object": f"{__name__}.Point"}], ids=repr)
+    def test_stored_state_missing_a_required_field_is_refused(
+        self,
+        tag: dict[str, str],
+    ) -> None:
         with pytest.raises(ReadError, match=r"missing field\(s\) \['x'\]"):
-            from_plain({"py/object": f"{__name__}.Point"}, Point)
+            from_plain(tag, Point)
 
 
 class TestDefault:
@@ -1974,14 +2015,24 @@ class TestHooked:
         }
         assert raised.value.partial == [raised.value.bad[0,], 2]
 
-    def test_a_hooked_value_is_placed_before_its_payload_reads(self) -> None:
+    @pytest.mark.parametrize(
+        ("reference", "reason"),
+        [
+            ({"py/ref": ["r"]}, "py/ref ['r'] names a value still being built"),
+            ({"py/id": 1}, "py/id 1 names a value still being built"),
+        ],
+        ids=repr,
+    )
+    def test_a_hooked_value_is_placed_before_its_payload_reads(
+        self,
+        reference: MutablePlainTree,
+        reason: str,
+    ) -> None:
         tree: MutablePlainTree = {
-            "r": {"py/hook": [f"{__name__}.Tensor", [{"py/ref": ["r"]}]]},
+            "r": {"py/hook": [f"{__name__}.Tensor", [reference]]},
         }
 
-        assert _bad_of(tree, hooks=_HOOKS) == {
-            ("r", 1, 0): "py/ref ['r'] names a value still being built",
-        }
+        assert _bad_of(tree, hooks=_HOOKS) == {("r", 1, 0): reason}
 
     def test_a_hook_payload_decodes_by_its_tags_where_it_sits(self) -> None:
         tree: MutablePlainTree = [
@@ -3445,6 +3496,273 @@ class TestEdges:
 
         shown = "{'k': " * 8 + "{...}" + "}" * 8
         assert str(raised.value) == f"cannot read {shown} as int"
+
+
+_FROZEN: Final = MappingProxyType[type, type](
+    {Mapping: MappingProxyType, Sequence: tuple},
+)
+
+
+@dataclass(frozen=True, kw_only=True, slots=True)
+class Pinned:
+    names: tuple[str, ...] = ()
+    tags: frozenset[str] = frozenset()
+    extra: Mapping[str, PlainTree] = field(
+        default_factory=lambda: MappingProxyType[str, PlainTree]({}),
+    )
+    loose: object = None
+
+
+class TestATagImpliesItsFields:
+    _TREE: Final[Mapping[str, PlainTree]] = MappingProxyType(
+        {
+            "py/object": f"{__name__}.Pinned",
+            "names": ["a"],
+            "tags": ["t"],
+            "extra": {"k": [1]},
+            "loose": [2],
+        },
+    )
+
+    @pytest.mark.parametrize(
+        "target",
+        [object, Any, Pinned | None, Mapping[str, object] | Pinned],
+        ids=repr,
+    )
+    def test_a_tagged_record_reads_its_fields_by_their_types(
+        self,
+        target: object,
+    ) -> None:
+        read = from_plain(self._TREE, target, allow_imports=True)
+
+        assert isinstance(read, Pinned)
+        assert type(read.names) is tuple
+        assert type(read.tags) is frozenset
+        assert type(read.loose) is list
+
+    def test_concrete_types_apply_under_the_tag(self) -> None:
+        read = from_plain(
+            self._TREE,
+            object,
+            allow_imports=True,
+            default_concrete_types=_FROZEN,
+        )
+
+        assert isinstance(read, Pinned)
+        assert isinstance(read.extra, MappingProxyType)
+        assert type(read.extra["k"]) is tuple
+
+
+class TestDefaultConcreteTypes:
+    def test_untagged_data_reads_as_its_declared_types_concrete_type(self) -> None:
+        read = from_plain(
+            {"a": [1, {"b": 2}]},
+            Mapping[str, PlainTree],
+            default_concrete_types=_FROZEN,
+        )
+
+        assert read == {"a": (1, {"b": 2})}
+        assert isinstance(read, MappingProxyType)
+        items = read["a"]
+        assert isinstance(items, tuple)
+        assert isinstance(items[1], MappingProxyType)
+
+    @pytest.mark.parametrize(
+        "target",
+        [
+            dict[str, list[int]],
+            MutableMapping[str, list[int]],
+            object,
+            Any,
+            Shape,
+        ],
+        ids=repr,
+    )
+    def test_a_type_with_no_override_reads_as_without_them(
+        self,
+        target: object,
+    ) -> None:
+        read = from_plain({"a": [1]}, target, default_concrete_types=_FROZEN)
+
+        assert read == {"a": [1]}
+        assert type(read) is dict
+        assert type(cast("dict[str, object]", read)["a"]) is list
+
+    @pytest.mark.parametrize("concrete", [{}, _FROZEN], ids=["none", "frozen"])
+    @pytest.mark.parametrize(
+        "target",
+        [Mapping[str, Sequence[int]], dict[str, list[int]], object],
+        ids=repr,
+    )
+    def test_a_dict_or_list_tag_reads_as_a_dict_or_list(
+        self,
+        target: object,
+        concrete: Mapping[type, type],
+    ) -> None:
+        tree = {"py/dict": {"a": {"py/list": [1]}}}
+
+        read = from_plain(tree, target, default_concrete_types=concrete)
+
+        assert read == {"a": [1]}
+        assert type(read) is dict
+        assert type(cast("dict[str, object]", read)["a"]) is list
+
+    def test_a_proxy_or_tuple_tag_still_reads(self) -> None:
+        tree = {"py/mappingproxy": {"a": {"py/tuple": [1]}}}
+
+        read = from_plain(
+            tree,
+            Mapping[str, Sequence[int]],
+            default_concrete_types=_FROZEN,
+        )
+
+        assert read == {"a": (1,)}
+        assert isinstance(read, MappingProxyType)
+        assert isinstance(read["a"], tuple)
+
+    def test_a_reference_names_an_untagged_proxy_and_its_entries(self) -> None:
+        tree: MutablePlainTree = [{"k": [1]}, {"py/ref": [0]}, {"py/ref": [0, "k"]}]
+
+        proxy, again, inner = from_plain(
+            tree,
+            tuple[Mapping[str, list[int]], Mapping[str, list[int]], list[int]],
+            default_concrete_types=_FROZEN,
+        )
+
+        assert isinstance(proxy, MappingProxyType)
+        assert again is proxy
+        assert inner is proxy["k"]
+
+    def test_an_untagged_proxy_needs_a_mapping(self) -> None:
+        with pytest.raises(ReadError) as raised:
+            from_plain([[1]], tuple[Mapping[str, int]], default_concrete_types=_FROZEN)
+
+        assert dict(raised.value.bad) == {
+            (0,): Invalid(
+                raw=[1],
+                reason="cannot read [1] as collections.abc.Mapping[str, int]",
+            ),
+        }
+
+    @pytest.mark.parametrize(
+        ("tree", "reason"),
+        [
+            ({"py/dict": [1]}, "cannot read [1] as <class 'object'>"),
+            ({"py/list": {"a": 1}}, "cannot read {'a': 1} as <class 'object'>"),
+            (
+                {"py/dict": {}, "x": 1},
+                "invalid py/dict envelope: {'py/dict': {}, 'x': 1}",
+            ),
+        ],
+        ids=repr,
+    )
+    def test_a_malformed_dict_or_list_tag_names_why(
+        self,
+        tree: MutablePlainTree,
+        reason: str,
+    ) -> None:
+        with pytest.raises(ReadError) as raised:
+            from_plain(tree, object)
+
+        assert str(raised.value) == reason
+
+    @pytest.mark.parametrize("concrete", [{}, _FROZEN], ids=["none", "frozen"])
+    @pytest.mark.parametrize(
+        ("tree", "expected"),
+        [
+            ({"py/tuple": [1]}, (1,)),
+            ({"py/list": [1]}, [1]),
+            ({"py/dict": {"a": 1}}, {"a": 1}),
+            ({"py/mappingproxy": {"a": 1}}, MappingProxyType({"a": 1})),
+        ],
+        ids=repr,
+    )
+    def test_a_union_reads_a_value_tag_as_its_value_not_as_a_key(
+        self,
+        tree: MutablePlainTree,
+        expected: object,
+        concrete: Mapping[type, type],
+    ) -> None:
+        read = from_plain(
+            tree,
+            Mapping[str, object] | Sequence[int],
+            default_concrete_types=concrete,
+        )
+
+        assert read == expected
+        assert type(read) is type(expected)
+
+    def test_a_reference_names_an_untagged_tuple(self) -> None:
+        tree: MutablePlainTree = [[1], {"py/ref": [0]}]
+
+        first, again = from_plain(
+            tree,
+            tuple[Sequence[int], Sequence[int]],
+            default_concrete_types=_FROZEN,
+        )
+
+        assert first == (1,)
+        assert again is first
+
+    def test_a_typing_alias_names_its_abstract_class(self) -> None:
+        concrete = cast(
+            "Mapping[type, type]",
+            {typing.Mapping: MappingProxyType},  # pyright: ignore[reportDeprecated] -- The deprecated alias is the input under test.
+        )
+
+        read = from_plain({"a": 1}, Mapping[str, int], default_concrete_types=concrete)
+
+        assert isinstance(read, MappingProxyType)
+
+    @pytest.mark.parametrize(
+        ("concrete", "target", "kind"),
+        [
+            ({AbstractSet: set}, AbstractSet[int], set),
+            ({MutableSet: set}, MutableSet[int], set),
+            ({}, AbstractSet[int], frozenset),
+        ],
+        ids=repr,
+    )
+    def test_a_set_reads_as_its_concrete_type(
+        self,
+        concrete: Mapping[type, type],
+        target: object,
+        kind: type,
+    ) -> None:
+        read = from_plain([1, 2], target, default_concrete_types=concrete)
+
+        assert type(read) is kind
+        assert read == {1, 2}
+
+    def test_a_union_builds_a_record_its_tag_names_before_a_mapping(self) -> None:
+        tree = to_plain(Square(side=2.0))
+
+        read = from_plain(tree, Mapping[str, object] | Shape, allow_imports=True)
+
+        assert read == Square(side=2.0)
+
+    @pytest.mark.parametrize(
+        ("concrete", "match"),
+        [
+            (
+                {Mapping: list},
+                r"default_concrete_types\[Mapping\] must be one of dict, mappingproxy",
+            ),
+            (
+                {MutableMapping: MappingProxyType},
+                r"default_concrete_types\[MutableMapping\] must be one of dict,",
+            ),
+            ({dict: MappingProxyType}, "default_concrete_types keys must be one of"),
+        ],
+        ids=repr,
+    )
+    def test_a_concrete_type_it_cannot_apply_is_refused(
+        self,
+        concrete: Mapping[type, type],
+        match: str,
+    ) -> None:
+        with pytest.raises(ValueError, match=match):
+            from_plain(None, object, default_concrete_types=concrete)
 
 
 class TestFrameBase:

@@ -3,15 +3,24 @@
 from __future__ import annotations
 
 from collections import OrderedDict
-from dataclasses import dataclass, field
+from collections.abc import (
+    Mapping,
+    MutableMapping,
+    Sequence,
+    Set as AbstractSet,
+)
+from dataclasses import dataclass, field, fields, is_dataclass
+from decimal import Decimal
 from enum import Enum, IntEnum
 from functools import partial
 from pathlib import Path, PurePosixPath
-from types import MappingProxyType
+from types import GenericAlias, MappingProxyType
 from typing import (
     TYPE_CHECKING,
+    Final,
     Protocol,
     SupportsIndex,
+    TypedDict,
     cast,
     override,
 )
@@ -23,6 +32,7 @@ import json
 import math
 import re
 import threading
+import typing
 import weakref
 
 import pytest
@@ -30,8 +40,9 @@ import pytest
 from treekle import serialize
 from treekle.deserialize import from_plain
 from treekle.lib.testing.resources import recursion_headroom
+from treekle.plain import immutable
 from treekle.serialize import to_plain
-from treekle.types import ReadError
+from treekle.types import PlainTree, ReadError
 
 
 if TYPE_CHECKING:
@@ -1427,6 +1438,789 @@ class TestKeyHelpers:
 
         assert serialize._encloses(place, ((None, "b"), 0)) is False
         assert serialize._encloses(place, (place, 0)) is True
+
+
+_FROZEN: Final = MappingProxyType[type, type](
+    {Mapping: MappingProxyType, Sequence: tuple},
+)
+
+
+def _no_json() -> Mapping[str, PlainTree]:
+    return MappingProxyType[str, PlainTree]({})
+
+
+@dataclass(frozen=True, kw_only=True, slots=True)
+class Record:
+    """Provider JSON in ``extra``, beside fields declared otherwise."""
+
+    extra: Mapping[str, PlainTree] = field(default_factory=_no_json)
+    names: Sequence[str] = ()
+    pairs: tuple[int, ...] = ()
+    loose: object = None
+
+
+@dataclass(frozen=True, kw_only=True, slots=True)
+class Extended(Record):
+    """A record read through its base's declared type, untyped."""
+
+    more: Sequence[int] = ()
+
+
+class Tags(TypedDict):
+    tags: Sequence[str]
+
+
+def _no_records() -> Mapping[str, Record]:
+    return MappingProxyType[str, Record]({})
+
+
+@dataclass(frozen=True, kw_only=True, slots=True)
+class Shelf:
+    """Fields whose unions, TypedDicts, and records declared types reach through."""
+
+    either: Mapping[str, int] | Sequence[int] | None = None
+    either_way: Mapping[str, Sequence[int]] | dict[str, Sequence[int]] | None = None
+    split: dict[str, int] | Mapping[str, int] | None = None
+    pair: tuple[Mapping[str, int], Sequence[int]] | None = None
+    base: Record | None = None
+    tags: Tags | None = None
+    records: tuple[Record, ...] = ()
+    by_name: Mapping[str, Record] = field(default_factory=_no_records)
+    plain: dict[str, int] | dict[str, str] | None = None
+    record_or_map: Mapping[str, object] | Record | None = None
+    members: AbstractSet[Sequence[int] | bool] = frozenset()
+
+
+def _record_tree(*, tagged: bool, **fields: MutablePlainTree) -> MutablePlainTree:
+    """Return a ``Record``'s tree under ``_FROZEN``, ``fields`` replacing."""
+    tag: dict[str, MutablePlainTree] = (
+        {"py/object": f"{__name__}.Record"} if tagged else {}
+    )
+    defaults: dict[str, MutablePlainTree] = {
+        "extra": {},
+        "loose": None,
+        "names": [],
+        "pairs": [],
+    }
+    return {**tag, **defaults, **fields}
+
+
+def _kinds(value: object) -> object:
+    """Return ``value`` with each container shown as its type and its parts' kinds."""
+    kind: type = type(value)
+    if is_dataclass(value) and not isinstance(value, type):
+        return (
+            kind,
+            {
+                item.name: _kinds(cast("object", getattr(value, item.name)))
+                for item in fields(value)
+            },
+        )
+    if isinstance(value, Mapping):
+        entries = cast("Mapping[object, object]", value)
+        return kind, {key: _kinds(item) for key, item in entries.items()}
+    if isinstance(value, (list, tuple)):
+        items = cast("Sequence[object]", value)
+        return kind, [_kinds(item) for item in items]
+    return value
+
+
+def _concrete_round_trip(value: object, target: object) -> object:
+    """Return ``value`` written and read back as ``target`` under ``_FROZEN``."""
+    tree = to_plain(value, target=target, default_concrete_types=_FROZEN)
+    return from_plain(
+        tree,
+        target,
+        allow_imports=True,
+        default_concrete_types=_FROZEN,
+    )
+
+
+@dataclass(frozen=True, kw_only=True, slots=True)
+class Pins:
+    """Fields whose declared types imply a non-JSON container."""
+
+    names: tuple[str, ...] = ()
+    pair: tuple[int, str] = (0, "")
+    tags: frozenset[str] = frozenset()
+    loose: object = None
+
+
+@dataclass(frozen=True, kw_only=True, slots=True)
+class PinsHolder:
+    """A record reached through fields that declare nothing about it."""
+
+    inner: Pins | None = None
+    loose: object = None
+
+
+@dataclass(frozen=True, kw_only=True, slots=True)
+class Loose:
+    """A record that declares nothing about its fields."""
+
+    held: object = None
+
+
+# ``Hooks`` is imported for type checking only, so this alias's value raises
+# ``NameError`` when evaluated, as one naming ``torch.nn`` there would.
+type _LateHooks = list[Hooks]
+
+
+@dataclass(frozen=True, kw_only=True, slots=True)
+class LateHinted:
+    """A field whose alias does not evaluate beside one whose type implies."""
+
+    hooks: _LateHooks
+    names: tuple[str, ...] = ()
+
+
+class TestRecordImplies:
+    def test_a_field_whose_alias_does_not_evaluate_reads_by_its_tags(self) -> None:
+        value = LateHinted(hooks=[], names=("a",))
+
+        tree = to_plain(value)
+
+        assert tree == {
+            "py/object": f"{__name__}.LateHinted",
+            "hooks": [],
+            "names": ["a"],
+        }
+        assert from_plain(tree, object, allow_imports=True) == value
+
+    @pytest.mark.parametrize(
+        ("kind", "implies"),
+        [
+            (Pins, True),
+            (PinsHolder, True),
+            (Loose, False),
+            (int, False),
+        ],
+        ids=repr,
+    )
+    def test_a_record_implies_where_a_field_declares_more_than_object(
+        self,
+        kind: type,
+        implies: bool,
+    ) -> None:
+        assert serialize.record_implies(kind) is implies
+
+
+@dataclass(frozen=True, kw_only=True, slots=True)
+class Doubles:
+    """Stores twice what it is built with, so a rebuild shows as a second doubling."""
+
+    value: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "value", self.value * 2)
+
+
+@dataclass(frozen=True, kw_only=True, slots=True)
+class Nest2:
+    """Records reached through fields that declare them, or declare less."""
+
+    record: Record | None = None
+    either: Mapping[str, object] | Record | None = None
+    loose: object = None
+
+
+class TestADeclaredRecordIsUntagged:
+    @pytest.mark.parametrize(
+        ("value", "target", "tagged"),
+        [
+            (Point(x=1), Point, False),
+            (Point(x=1), Point | None, False),
+            (Point(x=1), object, True),
+            (Extended(more=(1,)), Record, True),
+            (Square(side=2.0), Shape, True),
+        ],
+        ids=repr,
+    )
+    def test_the_tag_is_written_only_where_the_declared_type_does_not_imply_it(
+        self,
+        value: object,
+        target: object,
+        tagged: bool,
+    ) -> None:
+        tree = to_plain(value, target=target)
+
+        assert isinstance(tree, dict)
+        assert ("py/object" in tree) is tagged
+        assert from_plain(tree, target, allow_imports=True) == value
+
+    @pytest.mark.parametrize("target", [int, int | str], ids=repr)
+    def test_a_record_its_declared_type_cannot_read_keeps_its_tag(
+        self,
+        target: object,
+    ) -> None:
+        tree = to_plain(Point(x=1), target=target)
+
+        assert tree == {"py/object": f"{__name__}.Point", "x": 1, "y": 0.0}
+
+    def test_a_record_field_declaring_its_class_is_untagged(self) -> None:
+        value = Nest2(
+            record=Record(names=("a",)),
+            either=Record(names=("b",)),
+            loose=Record(names=("c",)),
+        )
+
+        tree = to_plain(value)
+
+        assert isinstance(tree, dict)
+        tags = {
+            name: part.get("py/object")
+            for name, part in tree.items()
+            if isinstance(part, dict)
+        }
+        assert tags == {
+            "record": None,
+            "either": f"{__name__}.Record",
+            "loose": f"{__name__}.Record",
+        }
+        assert from_plain(tree, object, allow_imports=True) == value
+
+    def test_an_untagged_record_restores_its_state(self) -> None:
+        value = Doubles(value=1)
+
+        tree = to_plain(value, target=Doubles)
+
+        assert tree == {"value": 2}
+        assert from_plain(tree, Doubles) == value
+
+    def test_an_untagged_record_cycle_survives(self) -> None:
+        parent = Node(name="p")
+        parent.children.append(parent)
+
+        tree = to_plain(parent, target=Node)
+        restored = from_plain(tree, Node)
+
+        assert tree == {"children": [{"py/ref": []}], "name": "p"}
+        assert restored.children[0] is restored
+
+
+def _no_proxy() -> MappingProxyType[str, list[int]]:
+    return MappingProxyType[str, list[int]]({})
+
+
+@dataclass(frozen=True, kw_only=True, slots=True)
+class Proxied:
+    """A field declared exactly ``MappingProxyType``, beside one declaring nothing."""
+
+    fixed: MappingProxyType[str, list[int]] = field(default_factory=_no_proxy)
+    loose: object = None
+
+
+_EXACT: Final[list[tuple[object, object]]] = [
+    ({"k": [1]}, dict[str, list[int]]),
+    ([[1]], list[list[int]]),
+    (([1],), tuple[list[int], ...]),
+    (([1],), tuple[list[int]]),
+    ({(1,)}, set[tuple[int]]),
+    (frozenset({(1,)}), frozenset[tuple[int]]),
+    (MappingProxyType({"k": [1]}), MappingProxyType[str, list[int]]),
+]
+"""A value of each container class, and that class declared exactly."""
+
+
+class TestADeclaredContainerIsUntagged:
+    @pytest.mark.parametrize(("value", "target"), _EXACT, ids=repr)
+    def test_a_container_of_its_declared_class_is_written_untagged(
+        self,
+        value: object,
+        target: object,
+    ) -> None:
+        tree = to_plain(value, target=target)
+        restored = from_plain(tree, target)
+
+        assert isinstance(tree, (list, dict))
+        assert not any(str(key).startswith("py/") for key in tree)
+        assert restored == value
+        assert type(restored) is type(value)
+
+    # A set's members are hashable, so none is a value a reference names.
+    @pytest.mark.parametrize(
+        ("value", "target", "step"),
+        [
+            (value, target, "k" if isinstance(value, Mapping) else 0)
+            for value, target in _EXACT
+            if not isinstance(value, AbstractSet)
+        ],
+        ids=repr,
+    )
+    def test_a_reference_into_it_names_its_own_place(
+        self,
+        value: object,
+        target: object,
+        step: str | int,
+    ) -> None:
+        held = cast("Mapping[str, list[int]] | Sequence[list[int]]", value)
+        inner = held["k"] if isinstance(held, Mapping) else held[0]
+        declared = GenericAlias(tuple, (target, list[int]))
+
+        tree = to_plain((value, inner), target=declared)
+        restored = cast("tuple[object, ...]", from_plain(tree, declared))
+
+        assert tree == [to_plain(value, target=target), {"py/ref": [0, step]}]
+        first = cast("Mapping[str, list[int]] | Sequence[list[int]]", restored[0])
+        assert restored[1] is (first["k"] if isinstance(first, Mapping) else first[0])
+
+
+class Ratio(Enum):
+    HALF = 0.5
+    PAIR = (1, 2)
+
+
+_LEAVES: Final[list[tuple[object, object, PlainTree]]] = [
+    (Path("/a/b"), Path, "/a/b"),
+    (PurePosixPath("c/d"), PurePosixPath, "c/d"),
+    (UUID(int=7), UUID, "00000000-0000-0000-0000-000000000007"),
+    (dt.datetime(2026, 1, 2, tzinfo=dt.UTC), dt.datetime, "2026-01-02T00:00:00+00:00"),
+    (
+        dt.datetime(2026, 1, 2, tzinfo=ZoneInfo("America/New_York")),
+        dt.datetime,
+        "2026-01-02T00:00:00-05:00[America/New_York]",
+    ),
+    (Color.RED, Color, "red"),
+    (Level.LOW, Level, 1),
+    (Ratio.HALF, Ratio, 0.5),
+]
+"""A leaf of each class read from untagged text, that class, and its text."""
+
+
+_TAGGED_LEAVES: Final[list[tuple[object, object]]] = [
+    *((value, object) for value, _, _ in _LEAVES),
+    (Path("/a/b"), str | Path),
+    (PurePosixPath("c/d"), str | PurePosixPath),
+    (UUID(int=7), str | UUID),
+    (dt.datetime(2026, 1, 2, tzinfo=dt.UTC), str | dt.datetime),
+    (Color.RED, str | Color),
+    (Level.LOW, int | Level),
+    (Ratio.HALF, float | Ratio),
+    (Decimal("1.5"), Decimal),
+    (Ratio.PAIR, Ratio),
+]
+"""A leaf and a declared type whose untagged reading is not the leaf."""
+
+
+class TestADeclaredLeafIsUntagged:
+    @pytest.mark.parametrize(("value", "target", "text"), _LEAVES, ids=repr)
+    def test_a_leaf_of_its_declared_class_is_written_as_its_text(
+        self,
+        value: object,
+        target: object,
+        text: PlainTree,
+    ) -> None:
+        tree = to_plain(value, target=target)
+        restored = from_plain(tree, target)
+
+        assert tree == text
+        assert restored == value
+        assert type(restored) is type(value)
+
+    @pytest.mark.parametrize(
+        ("value", "declared", "text"),
+        [
+            (value, declared, text)
+            for (value, _, text), declared in zip(
+                _LEAVES,
+                [
+                    (Path | None, None | Path),
+                    (PurePosixPath | None, None | PurePosixPath),
+                    (UUID | None, None | UUID),
+                    (dt.datetime | None, None | dt.datetime),
+                    (dt.datetime | None, None | dt.datetime),
+                    (Color | None, None | Color),
+                    (Level | None, None | Level),
+                    (Ratio | None, None | Ratio),
+                ],
+                strict=True,
+            )
+            for declared in declared
+        ],
+        ids=repr,
+    )
+    def test_an_optional_leaf_is_written_as_its_text(
+        self,
+        value: object,
+        declared: object,
+        text: PlainTree,
+    ) -> None:
+        assert to_plain(value, target=declared) == text
+        assert from_plain(text, declared) == value
+
+    @pytest.mark.parametrize(("value", "target"), _TAGGED_LEAVES, ids=repr)
+    def test_a_leaf_another_member_would_read_keeps_its_tag(
+        self,
+        value: object,
+        target: object,
+    ) -> None:
+        tree = to_plain(value, target=target)
+        restored = from_plain(tree, target, allow_imports=True)
+
+        assert isinstance(tree, dict)
+        assert restored == value
+        assert type(restored) is type(value)
+
+    @pytest.mark.parametrize(("value", "target", "text"), _LEAVES, ids=repr)
+    def test_a_key_of_its_declared_class_is_escaped_as_its_text(
+        self,
+        value: object,
+        target: object,
+        text: PlainTree,
+    ) -> None:
+        declared = GenericAlias(dict, (target, int))
+
+        tree = to_plain({value: 1}, target=declared)
+        restored = cast("dict[object, int]", from_plain(tree, declared))
+
+        assert tree == {"json://" + json.dumps(text): 1}
+        assert restored == {value: 1}
+        assert type(next(iter(restored))) is type(value)
+
+
+class TestRecordsImplyTheirFields:
+    def test_a_field_declared_a_mappingproxy_holds_one_untagged(self) -> None:
+        inner = [1]
+        value = Proxied(fixed=MappingProxyType({"k": inner}), loose=inner)
+
+        tree = to_plain(value)
+        restored = from_plain(tree, object, allow_imports=True)
+
+        assert tree == {
+            "py/object": f"{__name__}.Proxied",
+            "fixed": {"k": [1]},
+            "loose": {"py/ref": ["fixed", "k"]},
+        }
+        assert isinstance(restored, Proxied)
+        assert type(restored.fixed) is MappingProxyType
+        assert restored.loose is restored.fixed["k"]
+
+    def test_an_int_in_a_float_field_reads_back_as_an_int(self) -> None:
+        value = Point(x=1, y=3)
+
+        tree = to_plain(value)
+        restored = from_plain(tree, object, allow_imports=True)
+
+        assert tree == {"py/object": f"{__name__}.Point", "x": 1, "y": 3}
+        assert isinstance(restored, Point)
+        assert (restored.y, type(restored.y)) == (3, int)
+
+    def test_a_fixed_tuple_longer_than_declared_tags_its_extra_items(self) -> None:
+        value = Pins(pair=cast("tuple[int, str]", cast("object", (1, "b", (2,)))))
+
+        tree = to_plain(value)
+
+        assert isinstance(tree, dict)
+        assert tree["pair"] == [1, "b", {"py/tuple": [2]}]
+
+    def test_a_record_writes_what_its_fields_imply_untagged(self) -> None:
+        value = Pins(names=("a",), pair=(1, "b"), tags=frozenset({"t"}), loose=(2,))
+
+        assert to_plain(value) == {
+            "py/object": f"{__name__}.Pins",
+            "loose": {"py/tuple": [2]},
+            "names": ["a"],
+            "pair": [1, "b"],
+            "tags": ["t"],
+        }
+
+    @pytest.mark.parametrize("field", ["inner", "loose"])
+    def test_a_record_anywhere_writes_what_its_fields_imply(self, field: str) -> None:
+        value = PinsHolder(**{field: Pins(names=("a",))})
+
+        tree = to_plain(value)
+
+        assert isinstance(tree, dict)
+        inner = tree[field]
+        assert isinstance(inner, dict)
+        assert inner["names"] == ["a"]
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            Pins(names=("a",), pair=(1, "b"), tags=frozenset({"t"}), loose=(2,)),
+            PinsHolder(inner=Pins(names=("a",)), loose=Pins(tags=frozenset({"t"}))),
+            [Pins(names=("a",))],
+        ],
+        ids=repr,
+    )
+    def test_the_tag_alone_reads_it_back(self, value: object) -> None:
+        restored = from_plain(to_plain(value), object, allow_imports=True)
+
+        assert restored == value
+        assert _kinds(restored) == _kinds(value)
+
+    def test_concrete_types_apply_inside_a_record_with_no_target(self) -> None:
+        value = Record(extra=immutable({"a": [1]}), names=("x",))
+
+        tree = to_plain(value, default_concrete_types=_FROZEN)
+        restored = from_plain(
+            tree,
+            object,
+            allow_imports=True,
+            default_concrete_types=_FROZEN,
+        )
+
+        assert tree == _record_tree(tagged=True, extra={"a": [1]}, names=["x"])
+        assert _kinds(restored) == _kinds(value)
+
+
+class TestDefaultConcreteTypes:
+    def test_a_value_of_its_concrete_type_is_written_untagged(self) -> None:
+        value = Record(extra=immutable({"a": [1, {"b": 2}]}), names=("x",))
+
+        tree = to_plain(value, target=Record, default_concrete_types=_FROZEN)
+
+        assert tree == _record_tree(
+            tagged=False,
+            extra={"a": [1, {"b": 2}]},
+            names=["x"],
+        )
+
+    def test_a_dict_or_list_where_another_type_is_concrete_is_tagged(self) -> None:
+        value = Record(extra={"a": [1, (2,)]}, names=["x"])
+
+        tree = to_plain(value, target=Record, default_concrete_types=_FROZEN)
+
+        assert tree == _record_tree(
+            tagged=False,
+            extra={"py/dict": {"a": {"py/list": [1, [2]]}}},
+            names={"py/list": ["x"]},
+        )
+
+    @pytest.mark.parametrize(
+        "value",
+        [MappingProxyType({"a": (1,)}), [(1,), {"b": frozenset({2})}]],
+        ids=repr,
+    )
+    def test_without_a_target_a_plain_root_declares_nothing(
+        self,
+        value: object,
+    ) -> None:
+        tree = to_plain(value, default_concrete_types=_FROZEN)
+
+        assert tree == to_plain(value)
+        assert _kinds(from_plain(tree, object, allow_imports=True)) == _kinds(value)
+
+    def test_a_root_list_reads_back_as_its_target_declares(self) -> None:
+        value = [Record(names=["x"])]
+
+        restored = _concrete_round_trip(value, list[Record])
+
+        assert _kinds(restored) == _kinds(value)
+
+    @pytest.mark.parametrize(
+        ("loose", "tree"),
+        [
+            (
+                immutable({"a": [1]}),
+                {"py/mappingproxy": {"a": {"py/tuple": [1]}}},
+            ),
+            ({"a": [1]}, {"a": [1]}),
+        ],
+        ids=["frozen", "mutable"],
+    )
+    def test_a_field_declared_otherwise_is_written_as_without_them(
+        self,
+        loose: object,
+        tree: MutablePlainTree,
+    ) -> None:
+        value = Record(loose=loose)
+
+        tree_written = to_plain(value, target=Record, default_concrete_types=_FROZEN)
+
+        assert tree_written == _record_tree(tagged=False, loose=tree)
+        assert to_plain(value) == {
+            **cast("dict[str, MutablePlainTree]", to_plain(Record())),
+            "loose": tree,
+        }
+
+    def test_without_them_a_frozen_field_keeps_its_tags(self) -> None:
+        tree = to_plain(Record(extra=immutable({"a": [1]})), target=Record)
+
+        assert isinstance(tree, dict)
+        assert tree["extra"] == {"py/mappingproxy": {"a": {"py/tuple": [1]}}}
+
+    @pytest.mark.parametrize(
+        "concrete",
+        [{Mapping: dict}, {Sequence: list}, {}],
+        ids=repr,
+    )
+    def test_baseline_entries_write_as_without_them(
+        self,
+        concrete: Mapping[type, type],
+    ) -> None:
+        value = Record(extra=immutable({"a": [1]}), names=["x"], loose={"b": (2,)})
+
+        tree = to_plain(value, target=Record, default_concrete_types=concrete)
+
+        assert tree == to_plain(value, target=Record)
+
+    def test_a_union_with_no_overridden_member_writes_as_without_them(self) -> None:
+        value = Shelf(plain={"a": 1})
+
+        tree = to_plain(value, target=Shelf, default_concrete_types=_FROZEN)
+
+        assert isinstance(tree, dict)
+        assert tree["plain"] == {"a": 1}
+
+    def test_union_members_that_disagree_tag_only_what_they_disagree_on(
+        self,
+    ) -> None:
+        value = Shelf(either_way={"a": [1], "b": (2,)})
+
+        tree = to_plain(value, target=Shelf, default_concrete_types=_FROZEN)
+
+        assert isinstance(tree, dict)
+        assert tree["either_way"] == {"py/dict": {"a": {"py/list": [1]}, "b": [2]}}
+
+    def test_a_record_under_another_declared_type_writes_its_own_fields(self) -> None:
+        value = Shelf(either=cast("Mapping[str, int]", Record(names=["n"])))
+
+        tree = to_plain(value, target=Shelf, default_concrete_types=_FROZEN)
+
+        assert isinstance(tree, dict)
+        assert tree["either"] == to_plain(
+            Record(names=["n"]),
+            default_concrete_types=_FROZEN,
+        )
+
+    def test_a_value_its_declared_type_cannot_hold_keeps_every_tag(self) -> None:
+        value = Shelf(split=cast("dict[str, int]", cast("object", [1, (2,)])))
+
+        tree = to_plain(value, target=Shelf, default_concrete_types=_FROZEN)
+
+        assert isinstance(tree, dict)
+        assert tree["split"] == {"py/list": [1, {"py/tuple": [2]}]}
+
+    def test_a_set_orders_its_members_as_they_are_written(self) -> None:
+        value = Shelf(members=frozenset({(1,), True}))
+
+        tree = to_plain(value, target=Shelf, default_concrete_types=_FROZEN)
+
+        assert isinstance(tree, dict)
+        assert tree["members"] == [[1], True]
+
+    def test_a_shared_untagged_value_is_one_value_read_back(self) -> None:
+        shared = immutable({"a": [1]})
+
+        restored = _concrete_round_trip(Record(extra=shared, loose=[shared]), Record)
+
+        assert isinstance(restored, Record)
+        assert isinstance(restored.extra, MappingProxyType)
+        assert cast("list[object]", restored.loose)[0] is restored.extra
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            Record(
+                extra=immutable({"a": [1, {"b": None}]}),
+                names=("x",),
+                pairs=(1, 2),
+            ),
+            Record(extra={"a": [1, {"b": 2}]}, names=["x"]),
+            Record(extra=MappingProxyType({"a": [1], "b": {"c": (2,)}})),
+            Record(extra=MappingProxyType({"py/x": (1,), "json://y": {}})),
+            Record(loose=immutable({"a": [1]})),
+            Record(loose={"a": [1], "b": (2,)}),
+            Record(loose=Record(extra=immutable({"a": [1]}), names=["y"])),
+            Shelf(either=MappingProxyType({"a": 1})),
+            Shelf(either={"a": 1}),
+            Shelf(either=(1, 2)),
+            Shelf(either=[1, 2]),
+            Shelf(either_way={"a": [1], "b": (2,)}),
+            Shelf(either_way=MappingProxyType({"a": [1]})),
+            Shelf(split=MappingProxyType({"a": 1})),
+            Shelf(split={"a": 1}),
+            Shelf(base=Extended(extra=immutable({"a": [1]}), more=(1,))),
+            Shelf(base=Extended(extra={"a": (1,)}, more=[1])),
+            Shelf(base=Record(extra=immutable({"a": [1]}), names=["n"])),
+            Shelf(pair=(MappingProxyType({"a": 1}), (1,))),
+            Shelf(pair=({"a": 1}, [1])),
+            Shelf(tags={"tags": ("a",)}),
+            Shelf(tags={"tags": ["a"]}),
+            Shelf(
+                records=(Record(extra=immutable({"a": [1]})),),
+                by_name=MappingProxyType({"r": Record(names=["n"])}),
+            ),
+            Shelf(by_name={"r": Record(extra={"a": (1,)})}),
+            Shelf(plain={"a": 1}),
+            Shelf(
+                tags=cast("Tags", cast("object", MappingProxyType({"tags": ("a",)}))),
+            ),
+            Shelf(record_or_map=Extended(more=(1,))),
+            Shelf(record_or_map={"a": (1,)}),
+            Shelf(members=frozenset({(1,), True})),
+        ],
+        ids=repr,
+    )
+    def test_each_container_reads_back_as_its_own_type(self, value: object) -> None:
+        restored = _concrete_round_trip(value, type(value))
+
+        assert restored == value
+        assert _kinds(restored) == _kinds(value)
+
+    def test_an_abstract_set_may_read_as_a_set(self) -> None:
+        value = Shelf(members={(1,)})
+        concrete = MappingProxyType[type, type]({AbstractSet: set, Sequence: tuple})
+
+        tree = to_plain(value, target=Shelf, default_concrete_types=concrete)
+        back = from_plain(tree, Shelf, default_concrete_types=concrete)
+
+        assert isinstance(tree, dict)
+        assert tree["members"] == [[1]]
+        assert type(back.members) is set
+
+    def test_a_typing_alias_names_its_abstract_class(self) -> None:
+        value = Record(extra=immutable({"a": 1}))
+        concrete = cast(
+            "Mapping[type, type]",
+            {typing.Mapping: MappingProxyType},  # pyright: ignore[reportDeprecated] -- The deprecated alias is the input under test.
+        )
+
+        tree = to_plain(value, default_concrete_types=concrete)
+
+        assert isinstance(tree, dict)
+        assert tree["extra"] == {"a": 1}
+
+    @pytest.mark.parametrize(
+        ("concrete", "match"),
+        [
+            (
+                {Mapping: list},
+                (
+                    "default_concrete_types\\[Mapping\\] must be one of "
+                    "dict, mappingproxy, not <class 'list'>"
+                ),
+            ),
+            (
+                {Sequence: dict},
+                (
+                    "default_concrete_types\\[Sequence\\] must be one of "
+                    "list, tuple, not <class 'dict'>"
+                ),
+            ),
+            (
+                {MutableMapping: MappingProxyType},
+                "default_concrete_types\\[MutableMapping\\] must be one of dict",
+            ),
+            (
+                {dict: MappingProxyType},
+                (
+                    "default_concrete_types keys must be one of Mapping, "
+                    "MutableMapping, Sequence, MutableSequence, Set, MutableSet"
+                ),
+            ),
+        ],
+        ids=repr,
+    )
+    def test_a_concrete_type_it_cannot_apply_is_refused(
+        self,
+        concrete: Mapping[type, type],
+        match: str,
+    ) -> None:
+        with pytest.raises(ValueError, match=match):
+            to_plain(1, default_concrete_types=concrete)
 
 
 class Callee:

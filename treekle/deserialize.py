@@ -12,6 +12,12 @@ a tag naming the very class ``T`` asks for: the caller already holds it.
 A tag only selects which decoder runs; the decoder is the same one untagged
 data reaches through ``T``. Some targets (``Literal``, unions, ``object``) only
 decode.
+
+``default_concrete_types`` changes what untagged data reads as under an
+abstract declared type. For example, with ``{Mapping: MappingProxyType}``, an
+untagged mapping under a type declared ``Mapping`` reads as a
+``MappingProxyType``. A ``py/dict`` or ``py/list`` tag still reads as a dict or
+a list.
 """
 
 from __future__ import annotations
@@ -71,6 +77,7 @@ from treekle.native import native
 from treekle.reflect import (
     PENDING,
     class_tags,
+    concrete_overrides,
     is_mutable,
     resolve_import,
     resolves_to,
@@ -105,6 +112,7 @@ def from_plain[T](
     classes: Classes = ...,
     allow_imports: bool = ...,
     strict: bool = ...,
+    default_concrete_types: Mapping[type, type] = ...,
 ) -> T: ...
 
 
@@ -118,6 +126,7 @@ def from_plain[T](
     classes: Classes = ...,
     allow_imports: bool = ...,
     strict: bool = ...,
+    default_concrete_types: Mapping[type, type] = ...,
 ) -> T | None: ...
 
 
@@ -131,6 +140,7 @@ def from_plain[T](
     classes: Classes = ...,
     allow_imports: bool = ...,
     strict: bool = ...,
+    default_concrete_types: Mapping[type, type] = ...,
 ) -> T: ...
 
 
@@ -144,6 +154,7 @@ def from_plain(
     classes: Classes = ...,
     allow_imports: bool = ...,
     strict: bool = ...,
+    default_concrete_types: Mapping[type, type] = ...,
 ) -> object: ...
 
 
@@ -156,6 +167,7 @@ def from_plain(
     classes: Classes = MappingProxyType({}),
     allow_imports: bool = False,
     strict: bool = True,
+    default_concrete_types: Mapping[type, type] = MappingProxyType({}),
 ) -> object:
     """Convert plain data to ``target``; a ``py/*`` tag decides where present.
 
@@ -175,6 +187,8 @@ def from_plain(
         A ``py/object`` tag naming the target dataclass itself needs none.
       strict: When false, also read numeric and boolean text (``"3"`` as
         ``3``) and integral numbers across ``int``, ``float``, and ``bool``.
+      default_concrete_types: What untagged data reads as under an abstract
+        declared type, over the baseline, as ``to_plain`` was given it.
 
     Returns:
       value: ``data`` as a ``target``, or ``default``.
@@ -185,9 +199,11 @@ def from_plain(
         ``classes``.
       TypeError: ``classes`` has a key that is not a ``str``, or a value that
         is not a class.
-      ValueError: ``classes`` names one class twice.
+      ValueError: ``classes`` names one class twice, or
+        ``default_concrete_types`` names a type it cannot apply.
 
     """
+    overrides = concrete_overrides(default_concrete_types)
     if data is None and default is not ABSENT:
         return default
     state = _Decoding(
@@ -197,6 +213,7 @@ def from_plain(
         allow_imports=allow_imports,
         strict=strict,
         untagged=not _holds_tags(data),
+        default_concrete_types=overrides,
     )
     # A non-plain leaf is checked where it is read, by ``_passes_through``.
     tree = cast("PlainTree", data)
@@ -240,6 +257,8 @@ class _Decoding:
       unread: The data of each ``(id(data), id(union))`` that failed with no
         reference read, held so its ``id`` is not reused.
       reading: The ``id`` of each input container a frame is reading now.
+      default_concrete_types: The class untagged data reads as under each
+        abstract declared origin, where not the baseline.
 
     """
 
@@ -257,6 +276,9 @@ class _Decoding:
         default_factory=dict[tuple[int, int], PlainTree],
     )
     reading: set[int] = field(default_factory=set[int])
+    default_concrete_types: Mapping[object, type] = field(
+        default_factory=dict[object, type],
+    )
 
 
 type _Decoder = Callable[[PlainTree, object, FieldPath, _Decoding], object]
@@ -368,7 +390,7 @@ def _start_node(
         if target is float and isinstance(data, (Real, Decimal)):
             return float(data)
         raise ReadError(f"cannot read {_shown(data)} as {target}")
-    decoder = _decoder_for(target)
+    decoder = _untagged_decoder(target, state.default_concrete_types)
     if decoder is _decode_union or not isinstance(data, Mapping):
         return decoder(data, target, at, state)
     if decoder is _decode_object and kind is dict:
@@ -391,7 +413,7 @@ def _start_node(
         # can be built, so an untyped ``py/object`` record stays a record too.
         if (
             tag is None
-            or (decoder is _decode_dict and tag != "py/mappingproxy")
+            or (decoder in _MAPPING_DECODERS and tag not in _MAPPING_TAGS)
             or (
                 tag == "py/object"
                 and decoder is _decode_any
@@ -464,6 +486,18 @@ def _decoder_for(target: object) -> _Decoder:
     if _is_protocol(origin) or inspect.isabstract(origin) or _is_any(origin):
         return _decode_any
     return _decode_object
+
+
+def _untagged_decoder(
+    target: object,
+    default_concrete_types: Mapping[object, type],
+) -> _Decoder:
+    """Return the decoder untagged data under ``target`` takes, overrides applied."""
+    if default_concrete_types:
+        chosen = default_concrete_types.get(get_origin(target) or target)
+        if chosen is not None:
+            return _DECODERS[chosen]
+    return _decoder_for(target)
 
 
 def _tag_of(node: Mapping[str, PlainTree]) -> str | None:
@@ -573,6 +607,9 @@ def _shallow_fit(value: object, target: object) -> bool | _Parts:
         )
     if _is_protocol(origin):
         return _has_members(value, origin)
+    # An int is a float as typing reads one, and keeps its class when read.
+    if origin is float and type(value) is int:
+        return True
     if not isinstance(value, origin):
         return False
     if isinstance(value, Mapping) and len(args) == 2:
@@ -798,12 +835,11 @@ def _decode_float(
     at: FieldPath,
     state: _Decoding,
 ) -> float:
-    """Decode a float from an int or a float; lax also reads float text."""
+    """Decode a float, or an int as itself; lax also reads float text."""
     del target, at
-    if isinstance(data, float):
+    # Plain data tells an int from a float, so an int keeps its class.
+    if isinstance(data, (float, int)) and not isinstance(data, bool):
         return data
-    if isinstance(data, int) and not isinstance(data, bool):
-        return float(data)
     if isinstance(data, str) and not state.strict:
         try:
             return float(data.strip())
@@ -1007,16 +1043,46 @@ def _decode_tuple(
     del state
     if not isinstance(data, Sequence) or isinstance(data, str):
         raise ReadError(f"cannot read {_shown(data)} as {target}")
+    fixed, each = _tuple_types(target)
+    if fixed is None:
+        types: Iterator[object] = repeat(each)
+    elif len(fixed) != len(data):
+        raise ReadError(f"expected {len(fixed)} items for {target}, got {len(data)}")
+    else:
+        types = iter(fixed)
+    return _Items(at, raws=data, types=types, values=[], done=tuple)
+
+
+def _tuple_types(target: object) -> tuple[tuple[object, ...] | None, object]:
+    """Return a fixed tuple's item types, else ``None`` and every item's one type."""
     args = cast("tuple[object, ...]", get_args(target))
     if get_origin(target) is not tuple:
-        types = repeat(_element_type(target))
-    elif len(args) == 2 and args[1] is Ellipsis:
-        types = repeat(args[0])
-    elif len(args) != len(data):
-        raise ReadError(f"expected {len(args)} items for {target}, got {len(data)}")
-    else:
-        types = iter(args)
-    return _Items(at, raws=data, types=types, values=[], done=tuple)
+        return None, _element_type(target)
+    if len(args) == 2 and args[1] is Ellipsis:
+        return None, args[0]
+    return args, object
+
+
+# ``to_plain`` never refers to a tuple, but data naming an untagged one finds it
+# where a list read there would sit.
+def _decode_untagged_tuple(
+    data: PlainTree,
+    target: object,
+    at: FieldPath,
+    state: _Decoding,
+) -> object:
+    """Decode an untagged sequence as a tuple, placed by path once built."""
+    frame = _decode_tuple(data, target, at, state)
+    assert isinstance(frame, _Items)
+    frame.done = partial(_placed_tuple, at=at, state=state)
+    return frame
+
+
+def _placed_tuple(items: list[object], *, at: FieldPath, state: _Decoding) -> object:
+    """Return ``items`` as a tuple, placed at ``at`` for ``py/ref``."""
+    value = tuple(items)
+    state.placed[at] = value
+    return value
 
 
 def _decode_set(
@@ -1071,9 +1137,14 @@ def _decode_dict(
     """Decode a dict, typing keys and values, numbering it for ``py/id``."""
     if not isinstance(data, Mapping):
         raise ReadError(f"cannot read {_shown(data)} as {target}")
-    args = cast("tuple[object, ...]", get_args(target))
-    key_type, value_type = args if len(args) == 2 else (object, object)
+    key_type, value_type = _entry_types(target)
     return _decode_entries(data, key_type, value_type, at, state)
+
+
+def _entry_types(target: object) -> tuple[object, object]:
+    """Return a mapping target's key and value types, else ``object`` for both."""
+    args = cast("tuple[object, ...]", get_args(target))
+    return (args[0], args[1]) if len(args) == 2 else (object, object)
 
 
 def _decode_entries(
@@ -1095,6 +1166,42 @@ def _decode_entries(
     )
 
 
+# An untagged proxy has no copied dict, so its entries sit right below it, as a
+# dict's do.
+def _decode_untagged_proxy(
+    data: PlainTree,
+    target: object,
+    at: FieldPath,
+    state: _Decoding,
+) -> object:
+    """Decode an untagged mapping as a ``MappingProxyType``, placed before its entries."""
+    if not isinstance(data, Mapping):
+        raise ReadError(f"cannot read {_shown(data)} as {target}")
+    key_type, value_type = _entry_types(target)
+    inner: dict[Hashable, object] = {}
+    proxy = MappingProxyType(inner)
+    _place(proxy, at, state)
+    frame = _Entries(
+        at,
+        data=data,
+        key_type=key_type,
+        value_type=value_type,
+        result=inner,
+    )
+    frame.then = partial(_as_proxy, proxy=proxy)
+    return frame
+
+
+def _as_proxy(
+    decoded: object,
+    *,
+    proxy: MappingProxyType[Hashable, object],
+) -> object:
+    """Return ``proxy``, whose dict the frame filled with ``decoded``."""
+    del decoded
+    return proxy
+
+
 # ``to_plain`` registers the proxy at its own path and the copied dict one step below
 # it, under ``py/mappingproxy``; a ``py/ref`` may name either.
 def _decode_mappingproxy(
@@ -1109,8 +1216,7 @@ def _decode_mappingproxy(
     state.placed[at] = value
     if not isinstance(data, Mapping):
         raise ReadError(f"cannot read {_shown(data)} as {target}")
-    args = cast("tuple[object, ...]", get_args(target))
-    key_type, value_type = args if len(args) == 2 else (object, object)
+    key_type, value_type = _entry_types(target)
     frame = _decode_entries(data, key_type, value_type, (*at, "py/mappingproxy"), state)
     frame.then = partial(_fill_proxy, inner=inner, proxy=value)
     return frame
@@ -1237,7 +1343,6 @@ def _decode_object(
     name = target.__name__ if isinstance(target, type) else str(target)
     if not isinstance(data, Mapping):
         raise ReadError(f"expected object for {name}, got {_shown(data)}")
-    stored = "py/object" in data
     if _names_dataclass(data, target, state):
         fields_only: dict[str, PlainTree] = {
             key: raw for key, raw in data.items() if key != "py/object"
@@ -1253,25 +1358,13 @@ def _decode_object(
         raise ReadError(
             f"{name}: unknown field(s) {unknown}; valid: {sorted(types)}",
         )
-    index = len(state.built)
-    # A ``py/object`` record is state ``to_plain`` took from a built object, so it
-    # is restored as is: running ``__init__`` again would rerun a ``__post_init__``
-    # that already transformed it. Allocated before its fields read, it is there
-    # for a field that refers back to it. An untagged record is constructor input,
-    # so it goes through ``__init__``, which validates it. A part that did not
-    # read leaves ``__init__`` unrunnable either way.
-    value = _allocate(target) if stored else PENDING
+    # A record, tagged or with its class implied, is state ``to_plain`` took from
+    # a built object, so it is restored as is: running ``__init__`` again would
+    # rerun a ``__post_init__`` that already transformed it. Allocated before its
+    # fields read, it is there for a field that refers back to it.
+    value = _allocate(target)
     _place(value, at, state)
-    return _Object(
-        at,
-        data=data,
-        types=types,
-        target=target,
-        stored=stored,
-        value=value,
-        index=index,
-        before=len(state.bad),
-    )
+    return _Object(at, data=data, types=types, target=target, value=value)
 
 
 # Taken for a dict whose keys are all ``str``, each a field of ``target`` but a
@@ -1295,34 +1388,24 @@ def _decode_exact_object(
     ):
         return None
     types = _field_types(target)
-    stored = False
+    tagged = False
     for key, raw in data.items():
         if type(key) is not str:
             return None
         if key == "py/object":
             if type(raw) is not str or raw != _class_tag(target, state):
                 return None
-            stored = True
+            tagged = True
         elif key not in types:
             return None
-    if stored and "py/object" in types:
+    if tagged and "py/object" in types:
         return None
-    index = len(state.built)
-    value = _allocate(target) if stored else PENDING
+    value = _allocate(target)
     _place(value, at, state)
     # The full path also has a stored record's built object checked against
     # ``target``; that object is exactly ``target``, which ``isinstance``
     # answers without any ``__instancecheck__``, so the check is left out.
-    return _Object(
-        at,
-        data=data,
-        types=types,
-        target=target,
-        stored=stored,
-        value=value,
-        index=index,
-        before=len(state.bad),
-    )
+    return _Object(at, data=data, types=types, target=target, value=value)
 
 
 def _decode_stored(
@@ -1330,7 +1413,7 @@ def _decode_stored(
     at: FieldPath,
     state: _Decoding,
 ) -> object:
-    """Rebuild the class a ``py/object`` record names, its attributes untyped."""
+    """Rebuild the class a ``py/object`` record names, each field by its type."""
     path = data["py/object"]
     if not isinstance(path, str):
         raise ReadError(f"invalid py/object path: {_shown(path)}")
@@ -1339,7 +1422,16 @@ def _decode_stored(
         raise ReadError(f"{_shown(path)} does not name a class")
     value = _allocate(kind)
     _place(value, at, state)
-    return _Stored(at, data=data, value=value)
+    return _Stored(at, data=data, types=_stored_types(kind, data), value=value)
+
+
+# A tag names the class, so its fields' types are implied, as a target's are.
+def _stored_types(kind: type, data: Mapping[str, PlainTree]) -> dict[str, object]:
+    """Return the type each attribute of ``kind``'s tagged record ``data`` reads as."""
+    if not is_dataclass(kind):
+        return dict.fromkeys((name for name in data if name != "py/object"), object)
+    hints = _field_types(kind)
+    return {name: hints.get(name, object) for name in data if name != "py/object"}
 
 
 def _with_defaults(
@@ -1508,10 +1600,23 @@ def _decode_union(
     members = cast("tuple[object, ...]", get_args(target))
     if isinstance(data, Mapping) and _has_tag_key(data):
         # The member a ``py/object`` tag names goes first, so member order
-        # cannot pick a sibling whose fields happen to fit too.
-        path = cast("Mapping[str, PlainTree]", data).get("py/object")
+        # cannot pick a sibling whose fields happen to fit too. A mapping member
+        # reads a value tag such as ``py/tuple`` as a key, and a ``py/object``
+        # record it could build as a mapping, so it goes last.
+        tagged = cast("Mapping[str, PlainTree]", data)
+        path = tagged.get("py/object")
+        valued = any(tag in tagged for tag in _VALUE_TAGS) or (
+            path is not None and _objects_named(state)
+        )
         members = tuple(
-            sorted(members, key=lambda member: _class_tag(member, state) != path),
+            sorted(
+                members,
+                key=lambda member: (
+                    _class_tag(member, state) != path,
+                    valued
+                    and _reads_tags_as_keys(member, state.default_concrete_types),
+                ),
+            ),
         )
     else:
         members = _union_candidates(data, members)
@@ -1736,7 +1841,7 @@ class _Fields(_PartFrame):
         at: FieldPath,
         *,
         data: Mapping[str, PlainTree],
-        types: Mapping[str, object] | None,
+        types: Mapping[str, object],
         members: dict[str, object],
     ) -> None:
         super().__init__(at)
@@ -1749,14 +1854,9 @@ class _Fields(_PartFrame):
     def step(self, state: _Decoding) -> _Frame | None:
         at, types, members = self.at, self.types, self.members
         for name, raw in self.parts:
-            if types is None:
-                if name == "py/object":
-                    continue
-                target: object = object
-            elif name in types:
-                target = types[name]
-            else:
+            if name not in types:
                 continue
+            target = types[name]
             if (target is object or target is type(raw)) and type(raw) in _PLAIN_LEAVES:
                 members[name] = raw
                 continue
@@ -1781,9 +1881,9 @@ class _Fields(_PartFrame):
 
 
 class _Object(_Fields):
-    """A dataclass record, built from its fields once they have all read."""
+    """A dataclass record's fields, set on its allocated object once read."""
 
-    __slots__ = ("before", "index", "stored", "target", "value")
+    __slots__ = ("target", "value")
 
     def __init__(
         self,
@@ -1792,36 +1892,22 @@ class _Object(_Fields):
         data: Mapping[str, PlainTree],
         types: Mapping[str, object],
         target: type[DataclassInstance],
-        stored: bool,
         value: object,
-        index: int,
-        before: int,
     ) -> None:
         super().__init__(at, data=data, types=types, members={})
         self.target = target
-        self.stored = stored
         self.value = value
-        self.index = index
-        self.before = before
 
     @override
     def finish(self, state: _Decoding) -> object:
-        target, members, value = self.target, self.members, self.value
-        name = target.__name__
-        if self.stored or len(state.bad) > self.before:
-            if value is PENDING:
-                value = _allocate(target)
-            rest = _with_defaults(fields(target), members, name)
-        else:
-            init = {item.name for item in fields(target) if item.init}
-            try:
-                value = target(**{k: v for k, v in members.items() if k in init})
-            except (TypeError, ValueError) as error:
-                raise ReadError(f"cannot build {name}: {error}") from error
-            rest = {k: v for k, v in members.items() if k not in init}
-        for key, member in rest.items():
+        del state
+        target, value = self.target, self.value
+        for key, member in _with_defaults(
+            fields(target),
+            self.members,
+            target.__name__,
+        ).items():
             object.__setattr__(value, key, member)
-        _replace(self.index, value, self.at, state)
         return value
 
 
@@ -1835,9 +1921,10 @@ class _Stored(_Fields):
         at: FieldPath,
         *,
         data: Mapping[str, PlainTree],
+        types: Mapping[str, object],
         value: object,
     ) -> None:
-        super().__init__(at, data=data, types=None, members={})
+        super().__init__(at, data=data, types=types, members={})
         self.value = value
 
     @override
@@ -2068,6 +2155,15 @@ class _Union(_Frame):
             state.placed.popitem()
 
 
+def _reads_tags_as_keys(
+    member: object,
+    default_concrete_types: Mapping[object, type],
+) -> bool:
+    """Return whether union ``member`` reads a value tag as a mapping key."""
+    decoder = _untagged_decoder(_resolve_alias(member), default_concrete_types)
+    return decoder in _MAPPING_DECODERS
+
+
 def _import_name(member: object) -> str | None:
     """Return a class member's ``module.qualname``, else ``None``."""
     if isinstance(member, type):
@@ -2194,9 +2290,16 @@ def _field_types(kind: type) -> Mapping[str, object]:
         if is_dataclass(kind)
         else hints
     )
-    result = MappingProxyType(
-        {name: _resolved_hint(hints.get(name, object)) for name in names},
-    )
+    found: dict[str, object] = {}
+    for name in names:
+        # An alias whose value names what is imported for type checking only
+        # does not evaluate; it reads as ``object``, as an unresolved hint does.
+        try:
+            found[name] = _resolved_hint(hints.get(name, object))
+        except NameError:
+            found[name] = object
+            resolved = False
+    result = MappingProxyType(found)
     if (
         resolved
         and reached
@@ -2377,12 +2480,15 @@ def _single_hint(
     """Resolve one annotation by itself, or return ``PENDING`` if it fails."""
     single = SimpleNamespace(__annotations__={name: hint})
     try:
-        return get_type_hints(
-            single,
-            globalns,
-            localns,
-            include_extras=include_extras,
-        )[name]
+        return cast(
+            "object",
+            get_type_hints(
+                single,
+                globalns,
+                localns,
+                include_extras=include_extras,
+            )[name],
+        )
     except (AttributeError, NameError, TypeError):
         return PENDING
 
@@ -2456,6 +2562,8 @@ _TAGS: Final = (
     "py/set",
     "py/frozenset",
     "py/mappingproxy",
+    "py/dict",
+    "py/list",
     "py/b64",
     "py/float",
     "py/complex",
@@ -2467,6 +2575,16 @@ _TAGS: Final = (
     "py/object",
 )
 """Every tag, in the precedence a node carrying several resolves by."""
+
+
+_MAPPING_TAGS: Final = frozenset(("py/mappingproxy", "py/dict"))
+"""The tags a mapping target reads as tags; it reads any other as a key."""
+
+
+_VALUE_TAGS: Final = tuple(
+    tag for tag in _TAGS if tag not in {*_MAPPING_TAGS, "py/object"}
+)
+"""The tags naming a value a mapping member of a union would misread as a key."""
 
 
 _PLAIN_LEAVES: Final = frozenset[object](
@@ -2546,7 +2664,7 @@ _DECODERS: Final[Mapping[object, _Decoder]] = MappingProxyType(
         list: _decode_list,
         Sequence: _decode_list,
         MutableSequence: _decode_list,
-        tuple: _decode_tuple,
+        tuple: _decode_untagged_tuple,
         set: _decode_set,
         MutableSet: _decode_set,
         frozenset: _decode_frozenset,
@@ -2554,7 +2672,7 @@ _DECODERS: Final[Mapping[object, _Decoder]] = MappingProxyType(
         dict: _decode_dict,
         Mapping: _decode_dict,
         MutableMapping: _decode_dict,
-        MappingProxyType: _decode_mappingproxy,
+        MappingProxyType: _decode_untagged_proxy,
         type: _decode_type,
         UnionType: _decode_union,
         # Before 3.14, ``Optional``/``Union`` have this origin, not ``UnionType``.
@@ -2576,6 +2694,8 @@ _TAG_DECODERS: Final[Mapping[str, _Decoder]] = MappingProxyType(
         "py/set": _decode_set,
         "py/frozenset": _decode_frozenset,
         "py/mappingproxy": _decode_mappingproxy,
+        "py/dict": _decode_dict,
+        "py/list": _decode_list,
         "py/type": _decode_type,
         "py/function": _decode_function,
         "py/object": _decode_object,
@@ -2584,6 +2704,10 @@ _TAG_DECODERS: Final[Mapping[str, _Decoder]] = MappingProxyType(
     },
 )
 """The decoder each tag selects; the same decoder untagged data reaches by type."""
+
+
+_MAPPING_DECODERS: Final = (_decode_dict, _decode_untagged_proxy)
+"""The decoders an untagged mapping target reads through."""
 
 
 _RESOLVED: Final[dict[str, object]] = {}

@@ -20,9 +20,14 @@ from treekle.serialize import _python_to_plain, to_plain
 
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Mapping
 
-    from treekle.types import Classes, Dialect, Hooks, MutablePlainTree
+    from treekle.types import (
+        Classes,
+        Dialect,
+        Hooks,
+        MutablePlainTree,
+    )
 
 
 __all__ = [
@@ -44,6 +49,7 @@ def json_loads[T](
     classes: Classes = ...,
     allow_imports: bool = ...,
     strict: bool = ...,
+    default_concrete_types: Mapping[type, type] = ...,
 ) -> T: ...
 
 
@@ -56,6 +62,7 @@ def json_loads(
     classes: Classes = ...,
     allow_imports: bool = ...,
     strict: bool = ...,
+    default_concrete_types: Mapping[type, type] = ...,
 ) -> object: ...
 
 
@@ -67,6 +74,7 @@ def json_loads(
     classes: Classes = MappingProxyType({}),
     allow_imports: bool = False,
     strict: bool = True,
+    default_concrete_types: Mapping[type, type] = MappingProxyType({}),
 ) -> object:
     """Parse JSON text, as ``target`` when given; ``NaN``/``Infinity`` read too.
 
@@ -82,6 +90,8 @@ def json_loads(
       classes: The short names ``to_plain`` wrote in ``py/object``.
       allow_imports: Whether tags may import modules and call code they name.
       strict: When false, also read numeric and boolean text.
+      default_concrete_types: What untagged data reads as under an abstract
+        declared type, as ``to_plain`` was given it.
 
     Returns:
       value: The document as a ``target``, or its plain tree.
@@ -102,6 +112,7 @@ def json_loads(
             classes=classes,
             allow_imports=allow_imports,
             strict=strict,
+            default_concrete_types=default_concrete_types,
         )
     loads = _CORE_JSON.get("loads", json.loads)
     tree = cast("MutablePlainTree", loads(text))
@@ -114,6 +125,7 @@ def json_loads(
         classes=classes,
         allow_imports=allow_imports,
         strict=strict,
+        default_concrete_types=default_concrete_types,
     )
 
 
@@ -124,6 +136,8 @@ def json_dumps(
     hooks: Hooks = MappingProxyType({}),
     classes: Classes = MappingProxyType({}),
     sort: bool = True,
+    target: object = object,
+    default_concrete_types: Mapping[type, type] = MappingProxyType({}),
     ensure_ascii: bool = True,
     separators: tuple[str, str] | None = None,
     indent: int | str | None = None,
@@ -142,6 +156,9 @@ def json_dumps(
       hooks: The codecs ``to_plain`` uses.
       classes: Short names to write in ``py/object``, as ``to_plain`` takes them.
       sort: Order each object's attributes by name, as ``to_plain`` does.
+      target: The type the text will be read as, as ``to_plain`` takes it.
+      default_concrete_types: What untagged data reads as under an abstract
+        declared type, as ``to_plain`` takes it.
       ensure_ascii: Escape non-ASCII text, as ``json.dumps`` does.
       separators: ``(item, key)`` separators, as ``json.dumps`` takes them.
       indent: Pretty-print by this many spaces or this text.
@@ -163,6 +180,8 @@ def json_dumps(
                 hooks=hooks,
                 classes=classes,
                 sort=sort,
+                target=target,
+                default_concrete_types=default_concrete_types,
                 ensure_ascii=ensure_ascii,
                 separators=separators,
                 indent=indent,
@@ -170,7 +189,15 @@ def json_dumps(
             ),
         )
     return json.dumps(
-        to_plain(obj, dialect=dialect, hooks=hooks, classes=classes, sort=sort),
+        to_plain(
+            obj,
+            dialect=dialect,
+            hooks=hooks,
+            classes=classes,
+            sort=sort,
+            target=target,
+            default_concrete_types=default_concrete_types,
+        ),
         ensure_ascii=ensure_ascii,
         separators=separators,
         indent=indent,

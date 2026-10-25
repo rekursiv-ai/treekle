@@ -40,7 +40,7 @@ mod sync;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
-use crate::py::{B, Flag, Maybe, t_tuple, tp};
+use crate::py::{B, Flag, Maybe, t_dict, t_proxy, t_tuple, tp};
 
 /// Read the decoder's helpers and sentinels from ``treekle.deserialize``'s globals.
 #[pyfunction]
@@ -71,6 +71,8 @@ fn setup_decode(module: &Bound<'_, PyDict>) -> PyResult<()> {
 ///     A ``py/object`` tag naming the target dataclass itself needs none.
 ///   strict: When false, also read numeric and boolean text (``"3"`` as
 ///     ``3``) and integral numbers across ``int``, ``float``, and ``bool``.
+///   default_concrete_types: What untagged data reads as under an abstract
+///     declared type, over the baseline, as ``to_plain`` was given it.
 ///
 /// Returns:
 ///   value: ``data`` as a ``target``, or ``default``.
@@ -81,11 +83,12 @@ fn setup_decode(module: &Bound<'_, PyDict>) -> PyResult<()> {
 ///     ``classes``.
 ///   TypeError: ``classes`` has a key that is not a ``str``, or a value that
 ///     is not a class.
-///   ValueError: ``classes`` names one class twice.
+///   ValueError: ``classes`` names one class twice, or
+///     ``default_concrete_types`` names a type it cannot apply.
 #[pyfunction]
 #[pyo3(
-    signature = (data, target, *, default = Maybe(None), hooks = Maybe(None), classes = Maybe(None), allow_imports = Maybe(None), strict = Maybe(None)),
-    text_signature = "(data, target, *, default=..., hooks=..., classes=..., allow_imports=False, strict=True)"
+    signature = (data, target, *, default = Maybe(None), hooks = Maybe(None), classes = Maybe(None), allow_imports = Maybe(None), strict = Maybe(None), default_concrete_types = Maybe(None)),
+    text_signature = "(data, target, *, default=..., hooks=..., classes=..., allow_imports=False, strict=True, default_concrete_types=...)"
 )]
 #[allow(clippy::too_many_arguments)]
 fn from_plain<'py>(
@@ -97,7 +100,24 @@ fn from_plain<'py>(
     classes: Maybe<'py>,
     allow_imports: Maybe<'py>,
     strict: Maybe<'py>,
+    default_concrete_types: Maybe<'py>,
 ) -> PyResult<B<'py>> {
+    // The native walk reads the baseline only; the Python walk applies and
+    // checks overrides.
+    if let Some(concrete) = default_concrete_types
+        .0
+        .filter(|concrete| !is_empty(concrete))
+    {
+        let options = [
+            ("default", default.0),
+            ("hooks", hooks.0),
+            ("classes", classes.0),
+            ("allow_imports", allow_imports.0),
+            ("strict", strict.0),
+            ("default_concrete_types", Some(concrete)),
+        ];
+        return call_python(&decode::python_walker(py)?, (data, target), options);
+    }
     let allow_imports = Flag::new(allow_imports.0, false);
     let strict = Flag::new(strict.0, true);
     decode::from_plain(
@@ -133,21 +153,31 @@ fn setup_encode(module: &Bound<'_, PyDict>) -> PyResult<()> {
 ///   sort: Order each object's attributes by name; when false, keep slots in
 ///     MRO order then ``__dict__`` keys in insertion order. A stored form that
 ///     must stay byte-stable sets this false.
+///   target: The type ``from_plain`` will read the tree as. A container whose
+///     declared type there builds its class from untagged data is written
+///     untagged; ``object`` declares nothing, so the tree reads by tags alone.
+///   default_concrete_types: What untagged data reads as under an abstract
+///     declared type, over the baseline, as ``from_plain`` will be given it.
+///     A dict or list where another class is concrete is written as
+///     ``py/dict`` or ``py/list``.
 ///
 /// Returns:
-///   tree: Fresh plain data that ``from_plain`` turns back into ``obj``.
+///   tree: Fresh plain data that ``from_plain`` turns back into ``obj``, read
+///     as ``target`` with the same ``default_concrete_types``.
 ///
 /// Raises:
-///   ValueError: ``dialect`` names no known format, or ``classes`` names one
-///     class twice.
+///   ValueError: ``dialect`` names no known format, ``classes`` names one
+///     class twice, or ``default_concrete_types`` names a type it cannot
+///     apply.
 ///   TypeError: A leaf has no conversion and no hook, a hook returns the type
 ///     it encodes, a dict key holds a cycle, or ``classes`` is given and lacks
 ///     a ``py/object`` class.
 #[pyfunction]
 #[pyo3(
-    signature = (obj, *, dialect = Maybe(None), mutable = Maybe(None), hooks = Maybe(None), classes = Maybe(None), sort = Maybe(None)),
-    text_signature = "(obj, *, dialect='json', mutable=True, hooks=..., classes=..., sort=True)"
+    signature = (obj, *, dialect = Maybe(None), mutable = Maybe(None), hooks = Maybe(None), classes = Maybe(None), sort = Maybe(None), target = Maybe(None), default_concrete_types = Maybe(None)),
+    text_signature = "(obj, *, dialect='json', mutable=True, hooks=..., classes=..., sort=True, target=..., default_concrete_types=...)"
 )]
+#[allow(clippy::too_many_arguments)]
 fn to_plain<'py>(
     py: Python<'py>,
     obj: &B<'py>,
@@ -156,8 +186,42 @@ fn to_plain<'py>(
     hooks: Maybe<'py>,
     classes: Maybe<'py>,
     sort: Maybe<'py>,
+    target: Maybe<'py>,
+    default_concrete_types: Maybe<'py>,
 ) -> PyResult<B<'py>> {
-    encode::to_plain(py, obj, dialect.0, mutable.0, hooks.0, classes.0, sort.0)
+    encode::to_plain(
+        py,
+        obj,
+        dialect.0,
+        mutable.0,
+        hooks.0,
+        classes.0,
+        sort.0,
+        target.0,
+        default_concrete_types.0,
+    )
+}
+
+/// Whether ``concrete`` is an exact empty dict or ``MappingProxyType``, which
+/// changes nothing; any other value is the Python walk's to apply or refuse.
+fn is_empty(concrete: &B<'_>) -> bool {
+    let kind = tp(concrete);
+    (kind == t_dict() || kind == t_proxy()) && concrete.len().is_ok_and(|len| len == 0)
+}
+
+/// ``walker(*args, **options)``, each option given only where the caller gave it.
+fn call_python<'py, const N: usize>(
+    walker: &B<'py>,
+    args: impl pyo3::call::PyCallArgs<'py>,
+    options: [(&str, Option<B<'py>>); N],
+) -> PyResult<B<'py>> {
+    let kwargs = PyDict::new(walker.py());
+    for (name, value) in options {
+        if let Some(value) = value {
+            kwargs.set_item(name, value)?;
+        }
+    }
+    walker.call(args, Some(&kwargs))
 }
 
 /// ``json.dumps(tree, ...)`` for a plain tree, with the same text.
@@ -193,9 +257,10 @@ fn json_loads_plain<'py>(py: Python<'py>, text: &B<'py>) -> PyResult<B<'py>> {
 /// ``from_plain(json.loads(text), target, ...)``, with the same value or error.
 #[pyfunction]
 #[pyo3(
-    signature = (text, target, *, hooks = Maybe(None), classes = Maybe(None), allow_imports = Maybe(None), strict = Maybe(None)),
-    text_signature = "(text, target, *, hooks=..., classes=..., allow_imports=False, strict=True)"
+    signature = (text, target, *, hooks = Maybe(None), classes = Maybe(None), allow_imports = Maybe(None), strict = Maybe(None), default_concrete_types = Maybe(None)),
+    text_signature = "(text, target, *, hooks=..., classes=..., allow_imports=False, strict=True, default_concrete_types=...)"
 )]
+#[allow(clippy::too_many_arguments)]
 fn json_loads_typed<'py>(
     py: Python<'py>,
     text: &B<'py>,
@@ -204,7 +269,22 @@ fn json_loads_typed<'py>(
     classes: Maybe<'py>,
     allow_imports: Maybe<'py>,
     strict: Maybe<'py>,
+    default_concrete_types: Maybe<'py>,
 ) -> PyResult<B<'py>> {
+    if let Some(concrete) = default_concrete_types
+        .0
+        .filter(|concrete| !is_empty(concrete))
+    {
+        let tree = json::loads(py, text)?;
+        let options = [
+            ("hooks", hooks.0),
+            ("classes", classes.0),
+            ("allow_imports", allow_imports.0),
+            ("strict", strict.0),
+            ("default_concrete_types", Some(concrete)),
+        ];
+        return call_python(&decode::python_walker(py)?, (tree, target), options);
+    }
     decode::from_json(
         py,
         text,
@@ -220,8 +300,8 @@ fn json_loads_typed<'py>(
 /// other half: one call from object to text or back.
 #[pyfunction]
 #[pyo3(
-    signature = (obj, *, dialect = Maybe(None), hooks = Maybe(None), classes = Maybe(None), sort = Maybe(None), ensure_ascii = Maybe(None), separators = Maybe(None), indent = Maybe(None), sort_keys = Maybe(None)),
-    text_signature = "(obj, *, dialect='json', hooks=..., classes=..., sort=True, ensure_ascii=True, separators=None, indent=None, sort_keys=False)"
+    signature = (obj, *, dialect = Maybe(None), hooks = Maybe(None), classes = Maybe(None), sort = Maybe(None), target = Maybe(None), default_concrete_types = Maybe(None), ensure_ascii = Maybe(None), separators = Maybe(None), indent = Maybe(None), sort_keys = Maybe(None)),
+    text_signature = "(obj, *, dialect='json', hooks=..., classes=..., sort=True, target=..., default_concrete_types=..., ensure_ascii=True, separators=None, indent=None, sort_keys=False)"
 )]
 #[allow(clippy::too_many_arguments)]
 fn json_dumps<'py>(
@@ -231,6 +311,8 @@ fn json_dumps<'py>(
     hooks: Maybe<'py>,
     classes: Maybe<'py>,
     sort: Maybe<'py>,
+    target: Maybe<'py>,
+    default_concrete_types: Maybe<'py>,
     ensure_ascii: Maybe<'py>,
     separators: Maybe<'py>,
     indent: Maybe<'py>,
@@ -250,9 +332,15 @@ fn json_dumps<'py>(
     let fixed = options[1].is_none_or(|seps| seps.is_none() || tp(seps) == t_tuple());
     // The text walk writes one line in tree order only; layout options go
     // through the tree and the plain writer. A ``json.dumps`` replaced since
-    // import gets the whole tree, once, as in Python.
+    // import gets the whole tree, once, as in Python. A target declares the
+    // root, which only the tree walk follows.
+    let untargeted = target
+        .0
+        .as_ref()
+        .is_none_or(|target| target.is(py.get_type::<pyo3::types::PyAny>()));
     if let Some(style) = style.filter(|style| style.indent.is_none() && !style.sort_keys)
         && fixed
+        && untargeted
         && json::current_dumps(py)?.1
         && let Some(text) = encode::to_json(
             py,
@@ -261,6 +349,7 @@ fn json_dumps<'py>(
             hooks.0.clone(),
             classes.0.clone(),
             sort.0.clone(),
+            default_concrete_types.0.clone(),
             style,
             options,
         )?
@@ -269,7 +358,17 @@ fn json_dumps<'py>(
     }
     // The text walk declined before running any user code; the tree walk's
     // answer goes through ``json.dumps`` as it is once that code has run.
-    let tree = encode::to_plain(py, obj, dialect.0, None, hooks.0, classes.0, sort.0)?;
+    let tree = encode::to_plain(
+        py,
+        obj,
+        dialect.0,
+        None,
+        hooks.0,
+        classes.0,
+        sort.0,
+        target.0,
+        default_concrete_types.0,
+    )?;
     json::dumps(
         py,
         &tree,

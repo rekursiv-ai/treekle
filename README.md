@@ -205,6 +205,7 @@ jsonpickle spells it where one exists:
 |---|---|
 | class instance, class, function | `py/object`, `py/type`, `py/function` |
 | tuple, set, frozenset, mappingproxy | `py/tuple`, `py/set`, `py/frozenset`, `py/mappingproxy` |
+| dict, list where `default_concrete_types` reads another | `py/dict`, `py/list` |
 | non-finite float, complex, bytes | `py/float`, `py/complex`, `py/b64` |
 | `Path`, `UUID`, `datetime` | `py/path`, `py/uuid`, `py/datetime` |
 | anything else picklable | `py/reduce` |
@@ -225,6 +226,47 @@ same way. Older `py/id` back-references still read.
 tag decides, so a field typed `object` or a Protocol reads back as whatever
 class the payload names, if that class fits the annotation. Importing a class
 by name is gated behind `allow_imports=True`.
+
+### A parent's type implies its children's
+
+A value is written untagged wherever its declared type implies its class. A
+record's `py/object` tag names its class, so its fields' annotations declare
+their values: a tuple in a `tuple[int, ...]` field is a plain array, and reads
+back a tuple, with or without a target.
+
+Only a root that is not a record declares nothing by itself. `to_plain(obj,
+target=T)` declares it, for `from_plain(tree, T)`: `to_plain([(1,)],
+target=list[tuple[int]])` writes `[[1]]`. The default target, `object`,
+declares nothing, so the tree reads with no target.
+
+Under an abstract declared type, untagged data reads as the baseline
+`{Mapping: dict, MutableMapping: dict, Sequence: list, MutableSequence: list,
+Set: frozenset, MutableSet: set}`. `default_concrete_types` overrides entries,
+so a record holding read-only JSON stores it untagged:
+
+```python
+from collections.abc import Mapping, Sequence
+from types import MappingProxyType
+
+from treekle import PlainTree, immutable
+
+frozen = {Mapping: MappingProxyType, Sequence: tuple}
+
+
+@dataclass(frozen=True)
+class Event:
+    payload: Mapping[str, PlainTree]
+
+
+event = Event(payload=immutable({"tags": ["a"]}))
+tree = to_plain(event, default_concrete_types=frozen)
+assert tree["payload"] == {"tags": ["a"]}
+back = from_plain(tree, Event, default_concrete_types=frozen)
+assert isinstance(back.payload["tags"], tuple)
+```
+
+A dict or list in such a field is written as `py/dict` or `py/list`, so it
+reads back as itself.
 
 ### Best-effort decoding
 

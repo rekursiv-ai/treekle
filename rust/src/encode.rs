@@ -59,6 +59,8 @@ pub enum Nat {
     Uuid,
     Datetime,
     Object,
+    /// ``_encode_object`` for a record whose field types declare its parts.
+    Implied,
     Hooked,
     Unreduced,
 }
@@ -107,6 +109,27 @@ pub struct EncGlobals {
     verified_path: Py<PyAny>,
     resolve_import: Py<PyAny>,
     is_dataclass: Py<PyAny>,
+    /// ``record_implies``: whether a record's field types write a container
+    /// untagged, so the walk carries its fields' declared types.
+    record_implies: Py<PyAny>,
+    /// ``_form``: whether a container goes untagged under its declared type,
+    /// and its parts' declared types, decided by ``from_plain``'s dispatch.
+    form: Py<PyAny>,
+    /// ``_DeclaredParts``, built for a record from ``_field_types``.
+    declared_parts: Py<PyAny>,
+    /// ``_implied_record``: whether a declared type implies a record's class,
+    /// so its ``py/object`` is not written.
+    implied_record: Py<PyAny>,
+    /// ``_untagged_leaf``: a path, UUID, datetime or enum member's text where
+    /// its declared type reads that text back as it, else ``None``.
+    untagged_leaf: Py<PyAny>,
+    field_types: Py<PyAny>,
+    /// The classes ``_form`` is asked about, by the native encoder that writes each.
+    form_kinds: [Py<PyAny>; 6],
+    object_type: Py<PyAny>,
+    /// ``concrete_overrides``: ``default_concrete_types`` checked, its baseline
+    /// entries dropped.
+    concrete_overrides: Py<PyAny>,
     canonical_reduce: Py<PyAny>,
     attribute_names: Py<PyAny>,
     slot_names: Py<PyAny>,
@@ -358,6 +381,22 @@ pub fn setup(module: &Bound<'_, PyDict>) -> PyResult<()> {
         verified_path: get("_verified_path")?,
         resolve_import: get("resolve_import")?,
         is_dataclass: get("is_dataclass")?,
+        record_implies: get("record_implies")?,
+        form: get("_form")?,
+        declared_parts: get("_DeclaredParts")?,
+        implied_record: get("_implied_record")?,
+        untagged_leaf: get("_untagged_leaf")?,
+        field_types: get("_field_types")?,
+        form_kinds: [
+            builtins.getattr("list")?.unbind(),
+            builtins.getattr("tuple")?.unbind(),
+            builtins.getattr("set")?.unbind(),
+            builtins.getattr("frozenset")?.unbind(),
+            builtins.getattr("dict")?.unbind(),
+            get("MappingProxyType")?,
+        ],
+        object_type: builtins.getattr("object")?.unbind(),
+        concrete_overrides: get("concrete_overrides")?,
         canonical_reduce: get("_canonical_reduce")?,
         attribute_names: reflect.getattr("attribute_names")?.unbind(),
         slot_names: reflect.getattr("slot_names")?.unbind(),
@@ -841,6 +880,10 @@ enum Entry<'py> {
         slot: Slot<'py>,
         raw: bool,
         parent: u32,
+        /// The part's declared type; ``None`` is ``object``.
+        declared: Option<B<'py>>,
+        /// A raw key's declared type; ``None`` is ``object``.
+        key_declared: Option<B<'py>>,
     },
     /// Where a reduce restarts by protocol when one of its parts fails.
     Check {
@@ -850,6 +893,50 @@ enum Entry<'py> {
         slot: Slot<'py>,
         frame: u32,
     },
+}
+
+/// A mapping's entries, read as ``_entries`` reads them, and whether every key
+/// is plain: an exact dict's at once, any other mapping's keys by iteration,
+/// until one is not plain, then its items.
+fn mapping_entries<'py>(value: &B<'py>) -> PyResult<(bool, Vec<(B<'py>, B<'py>)>)> {
+    if tp(value) == t_dict() {
+        let entries = dict_entries(unsafe { value.cast_unchecked::<PyDict>() });
+        let mut plain = true;
+        for (key, _) in &entries {
+            if !is_plain_key(key)? {
+                plain = false;
+                break;
+            }
+        }
+        return Ok((plain, entries));
+    }
+    let mut plain = true;
+    for key in value.try_iter()? {
+        if !is_plain_key(&key?)? {
+            plain = false;
+            break;
+        }
+    }
+    let mut entries = Vec::new();
+    let mut items = MapItems::new(value)?;
+    while let Some(entry) = items.next_item()? {
+        entries.push(entry);
+    }
+    Ok((plain, entries))
+}
+
+/// The index in ``form_kinds`` of the class whose native encoder ``nat`` is,
+/// for an encoder ``_form`` decides the tag of.
+fn form_index(nat: Nat) -> Option<usize> {
+    match nat {
+        Nat::List => Some(0),
+        Nat::Tuple => Some(1),
+        Nat::Set => Some(2),
+        Nat::FrozenSet => Some(3),
+        Nat::Dict => Some(4),
+        Nat::MappingProxy => Some(5),
+        _ => None,
+    }
 }
 
 fn write<'py>(node: &B<'py>, slot: &Slot<'py>, done: B<'py>) -> PyResult<()> {
@@ -1032,6 +1119,10 @@ struct Encoder<'py, 'g> {
     spare_entries: Vec<Vec<(B<'py>, B<'py>, bool)>>,
     /// The parts a JSON walk left for ``json`` to write, in text order.
     holes: Vec<Hole<'py>>,
+    /// ``concrete_overrides(default_concrete_types)``, which ``_form`` applies.
+    overrides: B<'py>,
+    /// Each record class's ``_DeclaredParts`` this walk built, by address.
+    record_parts: HashMap<usize, B<'py>>,
 }
 
 /// Spare ``Items`` vectors a JSON walk keeps; enough for its nesting depth.
@@ -1091,6 +1182,8 @@ impl<'py, 'g> Encoder<'py, 'g> {
             spare_values: Vec::new(),
             spare_entries: Vec::new(),
             holes: Vec::new(),
+            overrides: PyDict::new(py).into_any(),
+            record_parts: HashMap::new(),
         };
         Ok(encoder)
     }
@@ -1149,8 +1242,18 @@ impl<'py, 'g> Encoder<'py, 'g> {
 
     /// ``walk`` for a value that is no leaf.
     fn walk_node(&mut self, value: &B<'py>, frame: u32) -> PyResult<B<'py>> {
+        self.walk_as(value, frame, None)
+    }
+
+    /// ``_encode(value, state, declared)``: ``walk`` for a value declared ``declared``.
+    fn walk_as(
+        &mut self,
+        value: &B<'py>,
+        frame: u32,
+        declared: Option<&B<'py>>,
+    ) -> PyResult<B<'py>> {
         let base = self.stack.len();
-        let result = self.drain(value, frame, base);
+        let result = self.drain(value, frame, base, declared);
         // A failed walk leaves its parts behind; they belong to no one now.
         self.stack.truncate(base);
         result
@@ -1160,9 +1263,15 @@ impl<'py, 'g> Encoder<'py, 'g> {
     /// no node, so a reduce at the root keeps its checkpoint's node as
     /// ``ROOT_NODE``, which ``write`` never sees: a failure at the root has
     /// no checkpoint below it, as in Python.
-    fn drain(&mut self, value: &B<'py>, frame: u32, base: usize) -> PyResult<B<'py>> {
+    fn drain(
+        &mut self,
+        value: &B<'py>,
+        frame: u32,
+        base: usize,
+        declared: Option<&B<'py>>,
+    ) -> PyResult<B<'py>> {
         let root = unsafe { Bound::from_borrowed_ptr(self.py, ffi::Py_None()) };
-        let done = match self.encode_node(value, frame, &root, &Slot::Index(0)) {
+        let done = match self.encode_node(value, frame, &root, &Slot::Index(0), declared) {
             Ok(done) => done,
             // Only the root's own reduce can have checked in below its parts.
             Err(error) => self.recover(error, base)?.2,
@@ -1182,11 +1291,21 @@ impl<'py, 'g> Encoder<'py, 'g> {
                 slot,
                 raw,
                 parent,
+                declared,
+                key_declared,
             }) = self.stack.pop()
             else {
                 continue;
             };
-            match self.encode_part(&value, &node, slot, raw, parent) {
+            let slot = match slot {
+                Slot::Key(key) if raw => {
+                    self.escape_key(&key, key_declared.as_ref()).map(Slot::Key)
+                }
+                slot => Ok(slot),
+            };
+            match slot
+                .and_then(|slot| self.encode_part(&value, &node, slot, parent, declared.as_ref()))
+            {
                 Ok((slot, part)) => write(&node, &slot, part)?,
                 Err(error) => {
                     let (node, slot, part) = self.recover(error, base)?;
@@ -1207,18 +1326,14 @@ impl<'py, 'g> Encoder<'py, 'g> {
         value: &B<'py>,
         node: &B<'py>,
         slot: Slot<'py>,
-        raw: bool,
         parent: u32,
+        declared: Option<&B<'py>>,
     ) -> PyResult<(Slot<'py>, B<'py>)> {
-        let slot = match slot {
-            Slot::Key(key) if raw => Slot::Key(self.escape_key(&key)?),
-            slot => slot,
-        };
         if let Some(done) = self.leaf(value) {
             return Ok((slot, done?));
         }
         let frame = self.push_frame(parent, slot.clone());
-        let done = self.encode_node(value, frame, node, &slot)?;
+        let done = self.encode_node(value, frame, node, &slot, declared)?;
         Ok((slot, done))
     }
 
@@ -1282,6 +1397,18 @@ impl<'py, 'g> Encoder<'py, 'g> {
     /// would; a caller queuing several reverses them after (``queued``).
     #[inline]
     fn part(&mut self, node: &B<'py>, slot: Slot<'py>, item: B<'py>, parent: u32) -> PyResult<()> {
+        self.part_as(node, slot, item, parent, None)
+    }
+
+    /// ``part`` for an item declared ``declared``; ``None`` is ``object``.
+    fn part_as(
+        &mut self,
+        node: &B<'py>,
+        slot: Slot<'py>,
+        item: B<'py>,
+        parent: u32,
+        declared: Option<B<'py>>,
+    ) -> PyResult<()> {
         if self.is_plain(&item) {
             return Ok(());
         }
@@ -1294,11 +1421,12 @@ impl<'py, 'g> Encoder<'py, 'g> {
             // part that queues nothing (the walk is shallow, so most queue
             // nothing) needs no drain; a reduce queues its checkpoint.
             let root = unsafe { Bound::from_borrowed_ptr(self.py, ffi::Py_None()) };
-            let done = match self.encode_node(&item, frame, &root, &Slot::Index(0)) {
-                Ok(done) if self.stack.len() == base => Ok(done),
-                Ok(done) => self.drain_from(done, base),
-                Err(error) => self.recover(error, base).map(|(_, _, done)| done),
-            };
+            let done =
+                match self.encode_node(&item, frame, &root, &Slot::Index(0), declared.as_ref()) {
+                    Ok(done) if self.stack.len() == base => Ok(done),
+                    Ok(done) => self.drain_from(done, base),
+                    Err(error) => self.recover(error, base).map(|(_, _, done)| done),
+                };
             self.stack.truncate(base);
             self.depth -= 1;
             return write(node, &slot, done?);
@@ -1309,6 +1437,8 @@ impl<'py, 'g> Encoder<'py, 'g> {
             slot,
             raw: false,
             parent,
+            declared,
+            key_declared: None,
         });
         Ok(())
     }
@@ -1318,6 +1448,34 @@ impl<'py, 'g> Encoder<'py, 'g> {
     #[inline]
     fn queued(&mut self, base: usize) {
         self.stack[base..].reverse();
+    }
+
+    /// ``_push_items`` with ``parts``, a ``_DeclaredParts``: each part of
+    /// ``node`` that is not plain, declared ``parts.of(index)``.
+    fn push_items_as(
+        &mut self,
+        node: &Bound<'py, PyList>,
+        parent: u32,
+        parts: &B<'py>,
+    ) -> PyResult<()> {
+        let base = self.stack.len();
+        let shared = node.as_any();
+        for index in 0..node.len() {
+            let item = node.get_item(index)?;
+            if self.is_plain(&item) {
+                continue;
+            }
+            let declared = self.declared_of(parts, index.into_pyobject(self.py)?.as_any())?;
+            self.part_as(shared, Slot::Index(index), item, parent, declared)?;
+        }
+        self.queued(base);
+        Ok(())
+    }
+
+    /// ``parts.of(key)``, ``None`` where it is ``object``.
+    fn declared_of(&self, parts: &B<'py>, key: &B<'py>) -> PyResult<Option<B<'py>>> {
+        let declared = parts.call_method1(intern!(self.py, "of"), (key,))?;
+        Ok((!declared.is(self.b(&self.g.object_type))).then_some(declared))
     }
 
     /// ``_push_items``: each part of ``node``, as ``part`` takes it.
@@ -1354,6 +1512,18 @@ impl<'py, 'g> Encoder<'py, 'g> {
         entries: Vec<(B<'py>, B<'py>)>,
         parent: u32,
     ) -> PyResult<Bound<'py, PyDict>> {
+        self.node_from_as(lead, entries, parent, None)
+    }
+
+    /// ``node_from`` with each value declared ``parts.of(key)``, given a
+    /// ``_DeclaredParts``.
+    fn node_from_as(
+        &mut self,
+        lead: Option<(&Bound<'py, PyString>, B<'py>)>,
+        entries: Vec<(B<'py>, B<'py>)>,
+        parent: u32,
+        parts: Option<&B<'py>>,
+    ) -> PyResult<Bound<'py, PyDict>> {
         let py = self.py;
         let size = entries.len() + usize::from(lead.is_some());
         let node = unsafe {
@@ -1369,13 +1539,17 @@ impl<'py, 'g> Encoder<'py, 'g> {
         if node.len() != size {
             // A repeated key leaves the dict holding fewer entries than were
             // set, in an order only the dict knows.
-            self.push_values(&node, parent)?;
+            self.push_values_as(&node, parent, parts)?;
             return Ok(node);
         }
         let base = self.stack.len();
         let shared = node.as_any();
         for (key, item) in entries {
-            self.part(shared, Slot::Key(key), item, parent)?;
+            let declared = match parts {
+                Some(parts) if !self.is_plain(&item) => self.declared_of(parts, &key)?,
+                _ => None,
+            };
+            self.part_as(shared, Slot::Key(key), item, parent, declared)?;
         }
         self.queued(base);
         Ok(node)
@@ -1383,10 +1557,25 @@ impl<'py, 'g> Encoder<'py, 'g> {
 
     /// ``_push_values``: each value of ``node``, as ``part`` takes it.
     fn push_values(&mut self, node: &Bound<'py, PyDict>, parent: u32) -> PyResult<()> {
+        self.push_values_as(node, parent, None)
+    }
+
+    /// ``push_values`` with each value declared ``parts.of(key)``, given a
+    /// ``_DeclaredParts``.
+    fn push_values_as(
+        &mut self,
+        node: &Bound<'py, PyDict>,
+        parent: u32,
+        parts: Option<&B<'py>>,
+    ) -> PyResult<()> {
         let base = self.stack.len();
         let shared = node.as_any();
         for (key, item) in dict_entries(node) {
-            self.part(shared, Slot::Key(key), item, parent)?;
+            let declared = match parts {
+                Some(parts) if !self.is_plain(&item) => self.declared_of(parts, &key)?,
+                _ => None,
+            };
+            self.part_as(shared, Slot::Key(key), item, parent, declared)?;
         }
         self.queued(base);
         Ok(())
@@ -1706,7 +1895,9 @@ impl<'py, 'g> Encoder<'py, 'g> {
         // The slots were read from the class's own dict; a dataclass is one
         // whose MRO finds ``__dataclass_fields__``, which for a class
         // straight under ``object`` means its own dict.
-        if unsafe { type_lookup(class, intern!(py, "__dataclass_fields__").as_ptr()) }.is_null() {
+        if unsafe { type_lookup(class, intern!(py, "__dataclass_fields__").as_ptr()) }.is_null()
+            || self.implies(kind)?
+        {
             return Ok(None);
         }
         // Most classes a cold walk meets are met once: one is kept only when
@@ -1773,11 +1964,19 @@ impl<'py, 'g> Encoder<'py, 'g> {
             return Ok(encoder.bind(self.py));
         }
         let before = Stamp::always(kind);
-        let (encoder, keepable) = self.resolve_encoder(kind)?;
+        let (mut encoder, keepable) = self.resolve_encoder(kind)?;
+        if matches!(encoder, Enc::Native(Nat::Object)) && self.implies(kind)? {
+            encoder = Enc::Native(Nat::Implied);
+        }
         if keepable && let Some(info) = self.keep(kind, now, &before) {
             info.encoder = Some(encoder.kept());
         }
         Ok(encoder)
+    }
+
+    /// ``record_implies(kind)``.
+    fn implies(&self, kind: &B<'py>) -> PyResult<bool> {
+        self.b(&self.g.record_implies).call1((kind,))?.is_truthy()
     }
 
     /// ``_ENCODERS.get(kind) or _ENCODER_CACHE.get(kind)``, else what the
@@ -2132,6 +2331,7 @@ impl<'py, 'g> Encoder<'py, 'g> {
         frame: u32,
         node: &B<'py>,
         slot: &Slot<'py>,
+        declared: Option<&B<'py>>,
     ) -> PyResult<B<'py>> {
         if let Some(done) = self.leaf(value) {
             return done;
@@ -2150,6 +2350,31 @@ impl<'py, 'g> Encoder<'py, 'g> {
                     value.repr()?
                 )));
             }
+        }
+        if let Some(declared) = declared {
+            let kind = value.get_type().into_any();
+            if !self.hooks_are_immutable_empty && self.hooks.contains(&kind)? {
+                return self.encode_hooked(value, &kind, frame);
+            }
+            let encoder = self.encoder_of(&kind)?;
+            return match encoder {
+                Enc::Native(Nat::Object | Nat::Implied) => {
+                    self.encode_record_as(value, &kind, frame, declared)
+                }
+                Enc::Native(nat @ (Nat::Path | Nat::Uuid | Nat::Datetime | Nat::Reduce)) => {
+                    let text = self.b(&self.g.untagged_leaf).call1((value, declared))?;
+                    if text.is_none() {
+                        self.run(Enc::Native(nat), value, &kind, frame, node, slot)
+                    } else {
+                        Ok(text)
+                    }
+                }
+                Enc::Native(nat) => match form_index(nat) {
+                    Some(index) => self.encode_declared(value, nat, index, frame, declared),
+                    None => self.run(Enc::Native(nat), value, &kind, frame, node, slot),
+                },
+                Enc::Foreign(_) => self.foreign_as(value, frame, Some(declared)),
+            };
         }
         // The builtin containers, while no hook and no rebound ``_ENCODERS``
         // could claim them: ``_encoder_for`` gives their native encoders.
@@ -2271,12 +2496,211 @@ impl<'py, 'g> Encoder<'py, 'g> {
                 self.tagged(intern!(py, "py/datetime"), text)
             }
             Nat::Object => self.encode_object(value, kind, frame),
+            Nat::Implied => self.encode_implied(value, kind, frame),
             Nat::Hooked => self.encode_hooked(value, kind, frame),
             Nat::Unreduced => self.encode_unreduced(value, frame),
         }
     }
 
     // ---------------------------------------------------------- encoders --
+
+    /// ``_encode_list`` and its siblings for a container declared
+    /// ``declared``: ``_form`` decides its tag and its parts' declared types.
+    fn encode_declared(
+        &mut self,
+        value: &B<'py>,
+        nat: Nat,
+        index: usize,
+        frame: u32,
+        declared: &B<'py>,
+    ) -> PyResult<B<'py>> {
+        let py = self.py;
+        if !matches!(nat, Nat::Tuple | Nat::FrozenSet) {
+            self.register(value, frame);
+        }
+        let kind = self.b(&self.g.form_kinds[index]);
+        let form = self
+            .b(&self.g.form)
+            .call1((value, kind, declared, &self.overrides))?;
+        let untagged = form.get_item(0)?.is_truthy()?;
+        let keys = form.get_item(1)?;
+        let parts = form.get_item(2)?;
+        if matches!(nat, Nat::Dict | Nat::MappingProxy) {
+            // A tagged proxy's entries sit below the dict its tag holds; a
+            // dict's sit at its own place either way, as ``from_plain`` reads them.
+            let tag = match nat {
+                Nat::Dict => intern!(py, "py/dict"),
+                _ => intern!(py, "py/mappingproxy"),
+            };
+            let at = match nat {
+                Nat::MappingProxy if !untagged => {
+                    self.push_frame(frame, Slot::Key(tag.clone().into_any()))
+                }
+                _ => frame,
+            };
+            let node = self.entries_as(value, at, &keys, &parts)?;
+            return if untagged {
+                Ok(node)
+            } else {
+                self.tagged(tag, node)
+            };
+        }
+        let items = if matches!(nat, Nat::Set | Nat::FrozenSet) {
+            let each = parts.getattr(intern!(py, "each"))?;
+            let each = (!each.is(self.b(&self.g.object_type))).then_some(each);
+            self.ordered_as(value, frame, each.as_ref())?
+        } else {
+            self.snapshot(value)?
+        };
+        self.push_items_as(&items, frame, &parts)?;
+        if untagged {
+            return Ok(items.into_any());
+        }
+        let tag = match nat {
+            Nat::List => intern!(py, "py/list"),
+            Nat::Tuple => intern!(py, "py/tuple"),
+            Nat::Set => intern!(py, "py/set"),
+            _ => intern!(py, "py/frozenset"),
+        };
+        self.tagged(tag, items.into_any())
+    }
+
+    /// ``_entries``: a mapping's node at ``at``, each value declared
+    /// ``parts.of(key)``; a key that is not plain is escaped, declared
+    /// ``keys``, when its entry is reached.
+    fn entries_as(
+        &mut self,
+        mapping: &B<'py>,
+        at: u32,
+        keys: &B<'py>,
+        parts: &B<'py>,
+    ) -> PyResult<B<'py>> {
+        let py = self.py;
+        let (plain, entries) = mapping_entries(mapping)?;
+        if plain {
+            return Ok(self
+                .node_from_as(None, entries, at, Some(parts))?
+                .into_any());
+        }
+        let node = PyDict::new(py).into_any();
+        let object = self.b(&self.g.object_type);
+        let named = !parts.getattr(intern!(py, "named"))?.is_none();
+        let each = parts.getattr(intern!(py, "each"))?;
+        let key_declared = (!keys.is(object)).then(|| keys.clone());
+        for (key, item) in entries.into_iter().rev() {
+            let raw = !is_plain_key(&key)?;
+            let declared = if !raw {
+                self.declared_of(parts, &key)?
+            } else if named || each.is(object) {
+                None
+            } else {
+                Some(each.clone())
+            };
+            self.stack.push(Entry::Part {
+                value: item,
+                node: node.clone(),
+                slot: Slot::Key(key),
+                raw,
+                parent: at,
+                declared,
+                key_declared: if raw { key_declared.clone() } else { None },
+            });
+        }
+        Ok(node)
+    }
+
+    /// ``_encode_object`` for a record whose field types declare its parts.
+    fn encode_implied(&mut self, value: &B<'py>, kind: &B<'py>, frame: u32) -> PyResult<B<'py>> {
+        self.register(value, frame);
+        let path = self.object_path(kind)?;
+        let members = self.object_members(value, kind)?;
+        let types = self.b(&self.g.field_types).call1((kind,))?;
+        let parts = self.record_parts_of(kind, &types)?;
+        self.record_node(Some(path), members, frame, Some(&parts))
+    }
+
+    /// ``_encode_object`` for a record declared ``declared``: untagged where
+    /// ``_implied_record`` says that type reads an untagged mapping as its class.
+    fn encode_record_as(
+        &mut self,
+        value: &B<'py>,
+        kind: &B<'py>,
+        frame: u32,
+        declared: &B<'py>,
+    ) -> PyResult<B<'py>> {
+        // ``classes`` refuses a class it lacks before anything is registered.
+        let short = self.short_name(kind)?;
+        self.register(value, frame);
+        let types = if self.b(&self.g.is_dataclass).call1((kind,))?.is_truthy()? {
+            Some(self.b(&self.g.field_types).call1((kind,))?)
+        } else {
+            None
+        };
+        let members = self.object_members(value, kind)?;
+        let mut implied = false;
+        if let Some(types) = &types {
+            let mut fits = true;
+            for (name, _) in &members {
+                if !types.contains(name)? {
+                    fits = false;
+                    break;
+                }
+            }
+            implied = fits
+                && self
+                    .b(&self.g.implied_record)
+                    .call1((kind, declared, &self.overrides))?
+                    .is_truthy()?;
+        }
+        let parts = match &types {
+            Some(types) => Some(self.record_parts_of(kind, types)?),
+            None => None,
+        };
+        let path = match (implied, short) {
+            (true, _) => None,
+            (false, Some(short)) => Some(short),
+            (false, None) => Some(self.class_path(kind)?),
+        };
+        self.record_node(path, members, frame, parts.as_ref())
+    }
+
+    /// ``_DeclaredParts(named=types)`` for record class ``kind``, kept per walk.
+    fn record_parts_of(&mut self, kind: &B<'py>, types: &B<'py>) -> PyResult<B<'py>> {
+        if let Some(parts) = self.record_parts.get(&(kind.as_ptr() as usize)) {
+            return Ok(parts.clone());
+        }
+        let kwargs = PyDict::new(self.py);
+        kwargs.set_item("named", types)?;
+        let parts = self.b(&self.g.declared_parts).call((), Some(&kwargs))?;
+        self.record_parts
+            .insert(kind.as_ptr() as usize, parts.clone());
+        Ok(parts)
+    }
+
+    /// A record's node: its ``py/object`` tag when ``path`` is given, then
+    /// its members, each declared ``parts.of(name)``.
+    fn record_node(
+        &mut self,
+        path: Option<B<'py>>,
+        members: Vec<(B<'py>, B<'py>)>,
+        frame: u32,
+        parts: Option<&B<'py>>,
+    ) -> PyResult<B<'py>> {
+        let py = self.py;
+        if members.iter().all(|(name, _)| tp(name) == t_str()) {
+            let lead = path.map(|path| (intern!(py, "py/object"), path));
+            return Ok(self.node_from_as(lead, members, frame, parts)?.into_any());
+        }
+        let node = PyDict::new(py);
+        if let Some(path) = path {
+            node.set_item(intern!(py, "py/object"), path)?;
+        }
+        for (name, member) in members {
+            node.set_item(name, member)?;
+        }
+        self.push_values_as(&node, frame, parts)?;
+        Ok(node.into_any())
+    }
 
     fn encode_float(&self, value: &B<'py>) -> PyResult<B<'py>> {
         let number = unsafe {
@@ -2351,6 +2775,16 @@ impl<'py, 'g> Encoder<'py, 'g> {
 
     /// ``_ordered``: a set's members sorted by ``(encoded JSON, repr)``.
     fn ordered(&mut self, members: &B<'py>, frame: u32) -> PyResult<Bound<'py, PyList>> {
+        self.ordered_as(members, frame, None)
+    }
+
+    /// ``ordered`` for members declared ``each``; ``None`` is ``object``.
+    fn ordered_as(
+        &mut self,
+        members: &B<'py>,
+        frame: u32,
+        each: Option<&B<'py>>,
+    ) -> PyResult<Bound<'py, PyList>> {
         let py = self.py;
         let all: Vec<B<'py>> = members.try_iter()?.collect::<PyResult<_>>()?;
         if all.iter().all(is_leaf_value) && json::current_dumps(py)?.1 {
@@ -2372,19 +2806,24 @@ impl<'py, 'g> Encoder<'py, 'g> {
         }
         let mut keyed = Vec::with_capacity(all.len());
         for member in all {
-            let (text, shown) = self.set_order_key(&member, frame)?;
+            let (text, shown) = self.set_order_key(&member, frame, each)?;
             keyed.push(([text, shown], member));
         }
         PyList::new(py, sorted_by_keys(py, keyed)?)
     }
 
-    /// ``_set_order_key``: encode the member, forgetting what it registers,
-    /// then take the encoding's sorted JSON and the member's ``repr``.
-    fn set_order_key(&mut self, value: &B<'py>, frame: u32) -> PyResult<(B<'py>, B<'py>)> {
+    /// ``_set_order_key``: encode the member as declared, forgetting what it
+    /// registers, then take the encoding's sorted JSON and the member's ``repr``.
+    fn set_order_key(
+        &mut self,
+        value: &B<'py>,
+        frame: u32,
+        declared: Option<&B<'py>>,
+    ) -> PyResult<(B<'py>, B<'py>)> {
         let py = self.py;
         let _guard = Recursion::enter(py, c" while encoding")?;
         let mark = self.alive.len();
-        let encoded = self.walk(value, frame);
+        let encoded = self.walk_as(value, frame, declared);
         self.rollback(mark)?;
         let encoded = encoded?;
         let kwargs = PyDict::new(py);
@@ -2454,33 +2893,7 @@ impl<'py, 'g> Encoder<'py, 'g> {
             return Ok(node);
         }
         self.register(value, frame);
-        let (plain, entries) = if tp(value) == t_dict() {
-            let entries = dict_entries(unsafe { value.cast_unchecked::<PyDict>() });
-            let mut plain = true;
-            for (key, _) in &entries {
-                if !is_plain_key(key)? {
-                    plain = false;
-                    break;
-                }
-            }
-            (plain, entries)
-        } else {
-            // Any other mapping is read as Python reads it: its keys by
-            // iteration, until one is not plain, then its items.
-            let mut plain = true;
-            for key in value.try_iter()? {
-                if !is_plain_key(&key?)? {
-                    plain = false;
-                    break;
-                }
-            }
-            let mut entries = Vec::new();
-            let mut items = MapItems::new(value)?;
-            while let Some(entry) = items.next_item()? {
-                entries.push(entry);
-            }
-            (plain, entries)
-        };
+        let (plain, entries) = mapping_entries(value)?;
         if plain {
             // A plain key is an exact str, as ``node_from`` needs.
             return Ok(self.node_from(None, entries, frame)?.into_any());
@@ -2498,6 +2911,8 @@ impl<'py, 'g> Encoder<'py, 'g> {
                 slot: Slot::Key(key),
                 raw,
                 parent: frame,
+                declared: None,
+                key_declared: None,
             });
         }
         Ok(node.into_any())
@@ -2507,7 +2922,7 @@ impl<'py, 'g> Encoder<'py, 'g> {
     /// lookalikes. A key is text, so nothing in it has a path a later
     /// ``py/ref`` can name; what encoding it registers is forgotten. Its parts
     /// hang from ``IN_KEY``, which ``reference`` refuses to name.
-    fn escape_key(&mut self, key: &B<'py>) -> PyResult<B<'py>> {
+    fn escape_key(&mut self, key: &B<'py>, declared: Option<&B<'py>>) -> PyResult<B<'py>> {
         let py = self.py;
         // ``json``'s own ``dumps`` writes a leaf key as known without asking;
         // a replaced one is asked, as Python asks it.
@@ -2519,7 +2934,7 @@ impl<'py, 'g> Encoder<'py, 'g> {
         let encoded = {
             let _guard = Recursion::enter(py, c" while encoding")?;
             let mark = self.alive.len();
-            let encoded = self.walk(key, IN_KEY);
+            let encoded = self.walk_as(key, IN_KEY, declared);
             self.rollback(mark)?;
             encoded?
         };
@@ -3188,6 +3603,16 @@ impl<'py, 'g> Encoder<'py, 'g> {
     /// A caller-installed encoder owns its subtree: Python's walk encodes it
     /// with this walk's state and shares its registrations back.
     fn foreign(&mut self, value: &B<'py>, frame: u32) -> PyResult<B<'py>> {
+        self.foreign_as(value, frame, None)
+    }
+
+    /// ``foreign`` for a value declared ``declared``; ``None`` is ``object``.
+    fn foreign_as(
+        &mut self,
+        value: &B<'py>,
+        frame: u32,
+        declared: Option<&B<'py>>,
+    ) -> PyResult<B<'py>> {
         let py = self.py;
         let (seen, alive) = self.share()?;
         let kwargs = PyDict::new(py);
@@ -3200,10 +3625,16 @@ impl<'py, 'g> Encoder<'py, 'g> {
         kwargs.set_item("here", self.linked_place(frame)?)?;
         kwargs.set_item("seen", &seen)?;
         kwargs.set_item("alive", &alive)?;
+        kwargs.set_item("default_concrete_types", &self.overrides)?;
         let state = self.env.encoding.bind(py).call((), Some(&kwargs))?;
         let mark = self.alive.len();
         // Python's walk registers into ``seen`` and ``alive`` in place.
-        let result = match self.env.walk.bind(py).call1((value, &state)) {
+        let walk = self.env.walk.bind(py);
+        let called = match declared {
+            Some(declared) => walk.call1((value, &state, declared)),
+            None => walk.call1((value, &state)),
+        };
+        let result = match called {
             Ok(result) => result,
             Err(error) => {
                 self.unshare(mark)?;
@@ -3352,6 +3783,7 @@ fn leaf_key_text(key: &B<'_>) -> PyResult<Option<String>> {
 
 // ------------------------------------------------------------ entry point --
 
+#[allow(clippy::too_many_arguments)]
 pub fn to_plain<'py>(
     py: Python<'py>,
     obj: &B<'py>,
@@ -3360,6 +3792,8 @@ pub fn to_plain<'py>(
     hooks: Option<B<'py>>,
     classes: Option<B<'py>>,
     sort: Option<B<'py>>,
+    target: Option<B<'py>>,
+    concrete: Option<B<'py>>,
 ) -> PyResult<B<'py>> {
     let Some(globals) = ENC.cloned(py) else {
         return Err(PyTypeError::new_err(
@@ -3382,6 +3816,8 @@ pub fn to_plain<'py>(
         }
     };
     let class_names = ClassNames::read(py, classes.as_ref())?;
+    let overrides = overrides(py, g, concrete.as_ref())?;
+    let declared = target.filter(|target| !target.is(g.object_type.bind(py)));
     let kind = tp(obj);
     let tree = if kind == t_str() || kind == t_int() || kind == t_bool() || kind == t_none() {
         obj.clone()
@@ -3400,7 +3836,8 @@ pub fn to_plain<'py>(
             class_names,
             Writer::idle(),
         )?;
-        let tree = encoder.walk(obj, ROOT);
+        encoder.overrides = overrides;
+        let tree = encoder.walk_as(obj, ROOT, declared.as_ref());
         // Moved out whole: a default ``Classes`` left in their place would
         // allocate and zero its tables only to drop them.
         let Encoder {
@@ -3419,6 +3856,14 @@ pub fn to_plain<'py>(
         tree?
     };
     finish(py, g, tree, mutable.as_ref())
+}
+
+/// ``concrete_overrides(concrete)``, an empty mapping where none was given.
+fn overrides<'py>(py: Python<'py>, g: &EncGlobals, concrete: Option<&B<'py>>) -> PyResult<B<'py>> {
+    match concrete {
+        Some(concrete) => g.concrete_overrides.bind(py).call1((concrete,)),
+        None => Ok(PyDict::new(py).into_any()),
+    }
 }
 
 /// ``to_plain``'s last step: the tree, frozen unless ``mutable``.
@@ -3497,7 +3942,7 @@ impl<'py> Encoder<'py, '_> {
                 Items::Entries(entries) => {
                     let entry = &mut entries[index];
                     if entry.2 {
-                        entry.0 = self.escape_key(&entry.0)?;
+                        entry.0 = self.escape_key(&entry.0, None)?;
                         entry.2 = false;
                     }
                     let key = entry.0.clone();
@@ -3955,6 +4400,11 @@ impl<'py> Encoder<'py, '_> {
                 self.text_tagged("py/datetime", &text)
             }
             Nat::Object => self.text_object(value, kind, frame),
+            Nat::Implied => {
+                let tree = self.walk_node(value, frame)?;
+                self.text_tree(tree);
+                Ok(())
+            }
             Nat::Hooked => self.text_hooked(value, kind, frame),
             Nat::Unreduced => self.text_unreduced(value, frame),
         }
@@ -4081,6 +4531,8 @@ impl<'py> Encoder<'py, '_> {
                 slot: Slot::Key(key),
                 raw,
                 parent: frame,
+                declared: None,
+                key_declared: None,
             });
         }
         let root = unsafe { Bound::from_borrowed_ptr(self.py, ffi::Py_None()) };
@@ -4466,6 +4918,7 @@ pub fn to_json<'py>(
     hooks: Option<B<'py>>,
     classes: Option<B<'py>>,
     sort: Option<B<'py>>,
+    concrete: Option<B<'py>>,
     style: json::Style,
     options: [Option<&B<'py>>; 4],
 ) -> PyResult<Option<B<'py>>> {
@@ -4483,6 +4936,7 @@ pub fn to_json<'py>(
         _ => return Ok(None),
     };
     let class_names = ClassNames::read(py, classes.as_ref())?;
+    let overrides = overrides(py, g, concrete.as_ref())?;
     let hooks = hooks.unwrap_or_else(|| g.default_hooks.bind(py).clone());
     let classes = CLASSES.take(py).unwrap_or_default();
     let mut encoder = Encoder::new(
@@ -4496,6 +4950,7 @@ pub fn to_json<'py>(
         class_names,
         Writer::new(style),
     )?;
+    encoder.overrides = overrides;
     let done = encoder.text_walk(obj);
     let Encoder {
         classes,
