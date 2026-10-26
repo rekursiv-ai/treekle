@@ -3,6 +3,14 @@
 All notable treekle changes are documented here. This project follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## 0.4.0 - 2026-10-26
+
+### Changed
+
+- The Rust core sets up kept-path validation on first use, not on every call.
+- Builtin classes are treated as non-records without reading their type hints.
+- README benchmark totals refreshed across 53 baselines.
+
 ## 0.3.3 - 2026-10-26
 
 ### Added
