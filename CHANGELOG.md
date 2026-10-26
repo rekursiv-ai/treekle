@@ -3,6 +3,29 @@
 All notable treekle changes are documented here. This project follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## 0.3.3 - 2026-10-26
+
+### Added
+
+- `to_plain` and `json_dumps` take `target`, the type `from_plain` will read
+  the tree as, so a root that is not a record declares its parts.
+- `default_concrete_types` on all four entry points says what an abstract
+  declared type (`Mapping`, `Sequence`, `Set`) writes and reads as.
+- `classes` on all four entry points maps short `py/object` names to classes;
+  reading with it accepts only the listed classes.
+
+### Changed
+
+- A container or record is written untagged wherever its declared type implies
+  its class and the value fits that type; anything else keeps its tag. Trees
+  written by 0.3.2 still read.
+- Below the root a tag decides: a tagged value reads as the class it names, and
+  a union picks its member by tag.
+- A `py/dict` or `py/list` tag is kept where `default_concrete_types` would
+  otherwise read the value as another type.
+- The package docstring states the tagging contract, with an example for each
+  rule.
+
 ## 0.3.2 - 2026-10-23
 
 ### Removed

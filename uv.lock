@@ -1000,8 +1000,8 @@ wheels = [
 
 [[package]]
 name = "rekursiv-ai-typings"
-version = "0.1.9"
-source = { git = "https://github.com/rekursiv-ai/typings?branch=main#76275700cd5f9d6237c8c1b6005edcf1a77ce08f" }
+version = "0.1.10"
+source = { git = "https://github.com/rekursiv-ai/typings?branch=main#9afcba07ab466b745f6f08c0c6593ffb35fa4e86" }
 
 [[package]]
 name = "requests"
@@ -1139,7 +1139,7 @@ wheels = [
 
 [[package]]
 name = "treekle"
-version = "0.3.2"
+version = "0.3.3"
 source = { editable = "." }
 
 [package.dev-dependencies]
