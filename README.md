@@ -224,15 +224,19 @@ same way. Older `py/id` back-references still read.
 `from_plain(data, T)` reads `data` as `T`: a JSON array as a `tuple[int, int]`,
 `"red"` as `Color.RED`, a dict as a dataclass. Where the data carries a tag, the
 tag decides, so a field typed `object` or a Protocol reads back as whatever
-class the payload names, if that class fits the annotation. Importing a class
+class the payload names. Only the root's tag must fit `T`. Importing a class
 by name is gated behind `allow_imports=True`.
 
 ### A parent's type implies its children's
 
-A value is written untagged wherever its declared type implies its class. A
-record's `py/object` tag names its class, so its fields' annotations declare
-their values: a tuple in a `tuple[int, ...]` field is a plain array, and reads
-back a tuple, with or without a target.
+A value is written untagged wherever its declared type implies its class and
+the value fits that type; anything else keeps its tag. A record's `py/object`
+tag names its class, so its fields' annotations declare their values: a tuple
+in a `tuple[int, ...]` field is a plain array, and reads back a tuple, with or
+without a target, while a 3-tuple in a `tuple[int, str]` field stays
+`py/tuple`. An untagged record reads back as a tagged one does: its state is
+restored, and `__init__` does not run. The full rules, with one example that
+exercises each, are in the package docstring.
 
 Only a root that is not a record declares nothing by itself. `to_plain(obj,
 target=T)` declares it, for `from_plain(tree, T)`: `to_plain([(1,)],

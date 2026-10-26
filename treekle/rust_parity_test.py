@@ -1767,6 +1767,36 @@ def test_default_concrete_types_read_and_write_as_python_does() -> None:
 
 
 @needs_rust
+def test_a_proxy_target_reads_a_value_tag_as_a_key_as_python_does() -> None:
+    tree = {"py/tuple": [1]}
+    _assert_reads_alike(tree, MappingProxyType[str, object])
+    _assert_reads_alike(
+        tree,
+        Mapping[str, object],
+        default_concrete_types={Mapping: MappingProxyType},
+    )
+
+
+@needs_rust
+def test_a_hint_resolved_after_a_write_writes_as_python_does(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = ModuleType("treekle_parity_late")
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    late = dataclass(slots=True)(_class(module.__name__, "Late", proxy="Proxy"))
+    vars(module).update(Late=late)
+    value = cast("Callable[[object], object]", late)(MappingProxyType({"a": 1}))
+    for _ in range(_TIMES):
+        assert serialize.to_plain(value) == serialize._python_to_plain(value)
+    vars(module).update(Proxy=MappingProxyType[str, int])
+
+    tree = serialize.to_plain(value)
+    assert tree == serialize._python_to_plain(value)
+    assert isinstance(tree, dict)
+    assert tree["proxy"] == {"a": 1}
+
+
+@needs_rust
 def test_a_union_builds_a_record_its_tag_names_as_python_does() -> None:
     tree = serialize.to_plain(SquareShape(side=2.0))
     _assert_reads_alike(tree, Mapping[str, object] | AreaShape, allow_imports=True)

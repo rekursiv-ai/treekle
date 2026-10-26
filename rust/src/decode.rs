@@ -1,4 +1,5 @@
 //! ``from_plain``: plain trees to Python values, matching ``treekle.deserialize``.
+//! The tag rules and their example are in ``treekle``'s package docstring.
 //!
 //! Each function mirrors the Python function of the same name. Type facts are
 //! compiled once into a ``Plan`` per target and cached across calls: classes by
@@ -104,6 +105,10 @@ const TAGS: [(&str, Tag); 17] = [
 fn is_mapping_tag(tag: Tag) -> bool {
     matches!(tag, Tag::MappingProxy | Tag::Dict)
 }
+
+/// The union member order's last entry for tagged data below the root:
+/// read as ``object``, by tags alone.
+const BY_TAGS: usize = usize::MAX;
 
 fn tag_named(name: &[u8]) -> Option<Tag> {
     TAGS.iter()
@@ -1039,6 +1044,9 @@ pub struct Decoder<'py, 'g> {
     allow_imports: Flag<'py>,
     strict: Flag<'py>,
     untagged: bool,
+    /// ``_Decoding.choosing``: the node being started is a union's member
+    /// trial, so a tagged value that does not fit the member refuses it.
+    choosing: bool,
     /// ``classes``' short names, when the call gave any.
     class_names: Option<ClassNames>,
     built: Vec<B<'py>>,
@@ -1218,6 +1226,7 @@ impl<'py, 'g> Decoder<'py, 'g> {
             allow_imports,
             strict,
             untagged,
+            choosing: false,
             class_names,
             built,
             paths,
@@ -2697,22 +2706,29 @@ impl<'py, 'g> Decoder<'py, 'g> {
             return Ok(started);
         }
         let keys = classify(data);
+        // Rule 3 of the contract in ``treekle``'s package docstring: below the
+        // root a tag decides, so ``target`` refuses a tagged value only where
+        // a union is choosing the member to read by. A reference names a value
+        // its first occurrence decided, so it must always fit.
+        let mut checked = matches!(at, Loc::At(ROOT)) || self.choosing;
         let value = if match &keys {
             Some(keys) => keys.reference,
             None => self.contains(data, pyo3::intern!(py, "py/ref"))?,
         } {
+            checked = true;
             self.decode_path_reference(data)?
         } else if match &keys {
             Some(keys) => keys.id,
             None => self.contains(data, pyo3::intern!(py, "py/id"))?,
         } {
+            checked = true;
             self.decode_reference(data)?
         } else {
             let tag = self.tag_from(&keys, data)?;
             let Some(tag) = tag else {
                 return self.run_kind(data, target, plan, at, keys.as_ref());
             };
-            if (plan.kind == Kind::Dict && !is_mapping_tag(tag))
+            if (matches!(plan.kind, Kind::Dict | Kind::MappingProxy) && !is_mapping_tag(tag))
                 || (tag == Tag::Object && plan.kind == Kind::Any && !self.objects_named()?)
             {
                 return self.run_kind(data, target, plan, at, keys.as_ref());
@@ -2745,13 +2761,15 @@ impl<'py, 'g> Decoder<'py, 'g> {
             };
             match self.run_tag(tag, &payload, target, plan, at, keys.as_ref())? {
                 Start::Frame(mut frame) => {
-                    frame.check = Some((target.clone(), plan.clone()));
+                    if checked {
+                        frame.check = Some((target.clone(), plan.clone()));
+                    }
                     return Ok(Start::Frame(frame));
                 }
                 Start::Value(value) => value,
             }
         };
-        if !self.fits(&value, target, plan)? {
+        if checked && !self.fits(&value, target, plan)? {
             return fail(format!(
                 "cannot read {} as {}",
                 self.shown(&value)?,
@@ -3156,10 +3174,21 @@ impl<'py, 'g> Decoder<'py, 'g> {
             let (data, plan) = (data.clone(), plan.clone());
             let mark = self.mark();
             *marks = mark;
-            let member = plan.args.bind(self.py).get_item(index)?;
-            let started = match self.plan_for(&member, plan.persistent) {
-                Ok(member_plan) => self.start(&data, &member, &member_plan, Loc::At(at)),
-                Err(error) => Err(error),
+            let started = if index == BY_TAGS {
+                let object = self.object_plan.clone();
+                let target = self.b(&self.g.object).clone();
+                self.start(&data, &target, &object, Loc::At(at))
+            } else {
+                let member = plan.args.bind(self.py).get_item(index)?;
+                match self.plan_for(&member, plan.persistent) {
+                    Ok(member_plan) => {
+                        self.choosing = true;
+                        let started = self.start(&data, &member, &member_plan, Loc::At(at));
+                        self.choosing = false;
+                        started
+                    }
+                    Err(error) => Err(error),
+                }
             };
             match started {
                 Ok(Start::Frame(child)) => return Ok(Some(child)),
@@ -3655,6 +3684,13 @@ impl<'py, 'g> Decoder<'py, 'g> {
                 }
                 if !self.is_instance(value, &origin)? {
                     return Ok(Shallow::Verdict(false));
+                }
+                // Of a tuple only a fixed arity is judged; its items were read already.
+                if origin.as_ptr() == t_tuple().cast::<ffi::PyObject>() {
+                    let args = plan.args.bind(py);
+                    let variadic = args.len() == 2 && args.get_item(1)?.is(py.Ellipsis());
+                    let fixed = !args.is_empty() && !variadic;
+                    return Ok(Shallow::Verdict(!fixed || args.len() == value.len()?));
                 }
                 return self.item_parts(value, plan);
             }
@@ -4507,7 +4543,6 @@ impl<'py, 'g> Decoder<'py, 'g> {
         };
         let object = self.b(&self.g.object).as_ptr();
         let mut seen: u64 = 0;
-        let mut tagged = false;
         let mut position: ffi::Py_ssize_t = 0;
         let mut name = std::ptr::null_mut();
         let mut raw = std::ptr::null_mut();
@@ -4536,7 +4571,6 @@ impl<'py, 'g> Decoder<'py, 'g> {
                         return Ok(None);
                     }
                 }
-                tagged = true;
                 continue;
             }
             seen |= 1 << slot;
@@ -4572,8 +4606,9 @@ impl<'py, 'g> Decoder<'py, 'g> {
                 return Ok(None);
             }
         }
-        // An untagged record is constructor input, read through ``__init__``.
-        if !tagged || count != size {
+        // An untagged record restores as a tagged one does (rule 4 of the
+        // contract in ``treekle``'s package docstring).
+        if count != size {
             self.rollback(mark)?;
             return Ok(None);
         }
@@ -4947,15 +4982,21 @@ impl<'py, 'g> Decoder<'py, 'g> {
             Types::Repeat(first, first_plan)
         } else {
             let size = data.len()?;
-            if args.len() != size {
+            if args.len() == size {
+                Types::Fixed(args, plan.persistent)
+            } else if placed {
                 return fail(format!(
                     "expected {} items for {}, got {}",
                     args.len(),
                     self.target_text(target)?,
                     size
                 ));
+            } else {
+                // ``to_plain`` writes a tuple not of a fixed tuple's arity
+                // tagged, its items untyped.
+                let object = self.object_plan.clone();
+                Types::Repeat(self.b(&self.g.object).clone(), object)
             }
-            Types::Fixed(args, plan.persistent)
         };
         let frame = self.frame(at)?;
         let raws = SeqItems::new(data)?;
@@ -5879,15 +5920,19 @@ impl<'py, 'g> Decoder<'py, 'g> {
             let valued = self.has_value_tag(data)? || (!path.is_none() && self.objects_named()?);
             let mut keyed = Vec::with_capacity(members.len());
             for (index, name) in self.member_tags(plan, info)?.iter().enumerate() {
+                // Only a ``py/object`` tag ranks members; without one the
+                // writer's member order stands.
                 let differs = match name {
+                    _ if path.is_none() => false,
                     Some(name) => !py_eq(name, &path)?,
-                    None => !path.is_none(),
+                    None => true,
                 };
                 let misread = valued
-                    && self
-                        .plan_for(&members.get_item(index)?, plan.persistent)?
-                        .kind
-                        == Kind::Dict;
+                    && matches!(
+                        self.plan_for(&members.get_item(index)?, plan.persistent)?
+                            .kind,
+                        Kind::Dict | Kind::MappingProxy
+                    );
                 keyed.push(((differs, misread), index));
             }
             keyed.sort_by_key(|(rank, _)| *rank);
@@ -5917,7 +5962,23 @@ impl<'py, 'g> Decoder<'py, 'g> {
                 Some(slot) => match info.orders[slot].get() {
                     Some(order) => order.clone(),
                     None => {
-                        let order = self.union_order(data, &members)?;
+                        let mut order = self.union_order(data, &members)?;
+                        // A scalar member cannot read an untagged mapping or
+                        // sequence, so trying one would only fail.
+                        if slot >= 5 {
+                            let mut kept = Vec::with_capacity(order.len());
+                            for index in order {
+                                let member = members.get_item(index)?;
+                                let kind = self.plan_for(&member, plan.persistent)?.kind;
+                                if !matches!(
+                                    kind,
+                                    Kind::None | Kind::Bool | Kind::Int | Kind::Float | Kind::Str
+                                ) {
+                                    kept.push(index);
+                                }
+                            }
+                            order = kept;
+                        }
                         let _ = info.orders[slot].set(order.clone());
                         order
                     }
@@ -5948,7 +6009,23 @@ impl<'py, 'g> Decoder<'py, 'g> {
                 self.target_text(target)?
             ));
         }
-        let order = self.union_members(data, plan)?;
+        let mut order = self.union_members(data, plan)?;
+        // Below the root a tag decides (rule 3 of the contract in ``treekle``'s
+        // package docstring): a value fitting no member reads by tags alone. A
+        // union tried as another's member leaves that to the outer one, and a
+        // reference must fit a member. A ``py/object`` naming no class to build
+        // would read as data, not by its tag.
+        if !matches!(at, Loc::At(ROOT))
+            && !self.choosing
+            && self.is_mapping(data)?
+            && self.has_tag_key(data)?
+            && !self.contains(data, pyo3::intern!(self.py, "py/ref"))?
+            && !self.contains(data, pyo3::intern!(self.py, "py/id"))?
+            && (!self.contains(data, pyo3::intern!(self.py, "py/object"))?
+                || self.objects_named()?)
+        {
+            order.push(BY_TAGS);
+        }
         let members = plan.args.bind(self.py);
         // The first member tried reads a leaf of exactly its class as itself,
         // which ends the union with nothing placed or recorded.

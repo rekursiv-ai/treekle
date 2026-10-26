@@ -15,6 +15,9 @@ field types declare its parts; ``target``, the type ``from_plain`` will be
 given, declares the root. ``default_concrete_types`` says what an abstract
 declared type implies. Under the default ``object`` target, the tree reads back
 with no target at all.
+
+The tag rules and their example are in ``treekle``'s package docstring;
+``_implied`` is rule 1.
 """
 
 from __future__ import annotations
@@ -45,6 +48,7 @@ from typing import (
     cast,
     get_args,
     get_origin,
+    is_typeddict,
     overload,
 )
 from uuid import UUID
@@ -70,9 +74,13 @@ from treekle.deserialize import (
     _decode_untagged_tuple,
     _decode_uuid,
     _Decoder,
+    _dispatch,
     _element_type,
     _entry_types,
     _field_types,
+    _fits,
+    _is_any,
+    _is_protocol,
     _is_union,
     _reads_tags_as_keys,
     _resolve_alias,
@@ -102,7 +110,6 @@ from treekle.types import (
 
 
 __all__ = [
-    "record_implies",
     "to_plain",
 ]
 
@@ -195,24 +202,6 @@ def to_plain(
     return tree if mutable else immutable(tree)
 
 
-# The Rust core's fast paths write a record's fields as under ``object``, which
-# ``_form`` agrees with only where every field is declared ``object``.
-def record_implies(kind: type) -> bool:
-    """Return whether dataclass ``kind`` declares a field other than ``object``.
-
-    Args:
-      kind: The class of a record ``to_plain`` writes.
-
-    Returns:
-      implies: Whether a field's declared type decides how a container it holds
-        is written.
-
-    """
-    return is_dataclass(kind) and any(
-        hint is not object for hint in _field_types(kind).values()
-    )
-
-
 @dataclass(frozen=True, slots=True, kw_only=True)
 class _DeclaredParts:
     """A container's parts' declared types: one for each, or one per name or index.
@@ -238,10 +227,9 @@ class _DeclaredParts:
           declared: The type ``from_plain`` reads that part as.
 
         """
+        # A fixed tuple's parts are declared only for a tuple of its arity.
         if self.indexed is not None:
-            if isinstance(key, int) and key < len(self.indexed):
-                return self.indexed[key]
-            return object
+            return self.indexed[cast("int", key)]
         if self.named is not None:
             return self.named.get(key, object) if isinstance(key, str) else object
         return self.each
@@ -567,7 +555,10 @@ def _untagged_leaf(value: object, declared: object) -> str | int | float | None:
         return None
     if isinstance(value, Enum):
         text = cast("object", value.value)
-        if type(text) not in (str, int, float):
+        # A non-finite value has no plain form; its member is written by reduce.
+        if type(text) not in (str, int, float) or (
+            isinstance(text, float) and not isfinite(text)
+        ):
             return None
     elif isinstance(value, datetime):
         text = _datetime_text(value)
@@ -576,29 +567,19 @@ def _untagged_leaf(value: object, declared: object) -> str | int | float | None:
     else:
         return None
     plain = cast("str | int | float", text)
-    return plain if _implied_leaf(value, plain, declared) else None
+    implied, _ = _implied(value, plain, type(value), declared, {})
+    return plain if implied else None
 
 
-# As for a container: an untagged leaf reads as the first union member its kind
-# selects, ``None`` passed over, so the leaf goes untagged only where that member's
-# decoder builds the leaf's own class from its text.
-def _implied_leaf(value: object, text: str | float, declared: object) -> bool:
-    """Return whether ``declared`` reads ``text`` back as leaf ``value``."""
-    kind = type(value)
-    candidates = _union_candidates(text, _members(declared))
-    member = next(
-        (m for m in candidates if m is not None and m is not type(None)),
-        None,
-    )
-    decoder = _untagged_decoder(member, {})
+def _leaf_class(decoder: _Decoder, member: object) -> object:
+    """Return the class leaf ``decoder`` builds from text under ``member``, else ``object``."""
     if decoder is _decode_path:
-        built = member if _is_path_class(member) else Path
-        return type(built()) is kind
+        return type((member if _is_path_class(member) else Path)())
     if decoder is _decode_enum:
-        return member is kind
+        return member
     if decoder is _decode_uuid:
-        return kind is UUID
-    return decoder is _decode_datetime and kind is datetime
+        return UUID
+    return datetime if decoder is _decode_datetime else object
 
 
 def _is_path_class(member: object) -> TypeGuard[type[PurePath]]:
@@ -790,26 +771,34 @@ def _encode_function(value: object, state: _Encoding) -> object:
 def _encode_object(value: object, state: _Encoding) -> object:
     """Encode a dataclass or slotted object as ``py/object`` with its state."""
     kind = type(value)
-    if state.tags and kind not in state.tags:
-        raise TypeError(f"Cannot serialize {kind!r}: it is not in classes.")
     _register(value, state)
-    types = _field_types(kind) if is_dataclass(kind) else None
     members: dict[str, object] = {}
     for name in attribute_names(value, sort=state.sort):
         member: object = getattr(value, name, PENDING)
         if member is not PENDING:
             members[name] = member
-    if (
-        types is not None
-        and members.keys() <= types.keys()
-        and _implied_record(
-            kind,
-            state.declared,
-            state.default_concrete_types,
+    record = is_dataclass(kind)
+    implied = record and _record_implied(
+        kind,
+        state.declared,
+        state.default_concrete_types,
+    )
+    # Field types declare only parts that are not plain; reading them is most of
+    # a first write of a class, so a record of plain members skips it.
+    types = (
+        _field_types(kind)
+        if record
+        and (
+            implied
+            or any(type(member) not in _UNDECLARED for member in members.values())
         )
-    ):
+        else None
+    )
+    if implied and types is not None and members.keys() <= types.keys():
         node = members
     else:
+        if state.tags and kind not in state.tags:
+            raise TypeError(f"Cannot serialize {kind!r}: it is not in classes.")
         tag = state.tags[kind] if state.tags else _import_path(kind)
         node = {"py/object": tag, **members}
     _push_values(node, state, _DeclaredParts(named=types))
@@ -964,63 +953,247 @@ def _verified_path(path: str, value: object) -> str:
     return path
 
 
-# A part written untagged reads back as its own class only where ``from_plain``'s
-# dispatch builds that class, so this asks that dispatch rather than restating it.
-# A union reads untagged data by the first member its kind selects, and tagged
-# data by the first member the value fits, mapping members last for a value tag.
-# Under ``object`` an untagged mapping or sequence reads as a dict or list.
+# Rule 1 of the contract in ``treekle``'s package docstring. It asks
+# ``from_plain``'s own dispatch what untagged data builds, rather than restating
+# it: a union reads untagged data by the first member its kind selects, a leaf's
+# text passing over ``None``.
+def _implied(
+    value: object,
+    plain: PlainTree,
+    kind: type,
+    declared: object,
+    default_concrete_types: Mapping[object, type],
+) -> tuple[bool, object]:
+    """Return whether ``value``, written as a ``kind``, goes untagged under ``declared``."""
+    implied, member = _implied_by(
+        plain,
+        kind,
+        declared,
+        default_concrete_types,
+        _ValueFit(value=value),
+    )
+    return bool(implied), member
+
+
+type _Fit = Callable[[object, bool], bool | None]
+"""Whether the value fits a member, judged whole or not; ``None`` where it depends
+on more than the value's class."""
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _ValueFit:
+    """``from_plain``'s fit check of one value."""
+
+    value: object
+
+    def __call__(self, member: object, whole: bool) -> bool:
+        if whole:
+            return _fits(self.value, member, whole=True)
+        return _shallow_fit(self.value, member) is not False
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _KindFit:
+    """``from_plain``'s fit check of every value of one class, where they agree."""
+
+    kind: type
+    size: int | None = None
+
+    def __call__(self, member: object, whole: bool) -> bool | None:
+        # Each answer mirrors ``_shallow_fit`` for a container or record of
+        # ``kind``; a check that reads the value itself answers ``None``.
+        if whole:
+            return None
+        target = _resolve_alias(member)
+        origin: object = get_origin(target) or target
+        if origin is Literal or _is_union(origin):
+            return None
+        if origin is type:
+            return None if issubclass(self.kind, type) else False
+        if not isinstance(origin, type) or origin is object or _is_any(origin):
+            return True
+        if is_typeddict(origin) or _is_protocol(origin):
+            return None
+        if not issubclass(self.kind, origin):
+            return False
+        if origin is tuple:
+            fixed, _ = _tuple_types(target)
+            if fixed is None:
+                return True
+            return None if self.size is None else len(fixed) == self.size
+        return True
+
+
+# A union reads untagged data by the first member its kind selects, a leaf's
+# text passing over ``None``.
+def _implied_by(
+    plain: PlainTree,
+    kind: type,
+    declared: object,
+    default_concrete_types: Mapping[object, type],
+    fit: _Fit,
+) -> tuple[bool | None, object]:
+    """Return ``_implied``'s answer, judging the fit by ``fit``."""
+    if isinstance(plain, Mapping):
+        builds = _MAPPING_BUILDS
+    elif isinstance(plain, (str, int, float)):
+        builds = None
+    else:
+        builds = _SEQUENCE_BUILDS
+    chosen: list[tuple[object, object]] = []
+    for member in _union_candidates(plain, _members(declared)):
+        decoder = _untagged_decoder(member, default_concrete_types)
+        if builds is None:
+            if member is None or member is type(None):
+                continue
+            chosen.append((member, _leaf_class(decoder, member)))
+            break
+        built = builds.get(decoder)
+        if built is not None:
+            chosen.append((member, member if decoder is _decode_object else built))
+    if not chosen:
+        return False, object
+    (member, built), *rest = chosen
+    if built is not kind:
+        return False, member
+    # A union reads untagged data as the next member that builds it when a part
+    # does not read under this one; where that member builds another class, the
+    # whole value must fit this one. Judging only the node keeps a write linear.
+    return fit(member, any(other is not kind for _, other in rest)), member
+
+
+def _record_implied(
+    kind: type,
+    declared: object,
+    default_concrete_types: Mapping[object, type],
+) -> bool:
+    """Return whether ``declared`` implies record class ``kind``, the same for every record."""
+    if declared is object:
+        return False
+    built = _decided(
+        ("record", declared),
+        default_concrete_types,
+        lambda: _record_built(declared, default_concrete_types),
+    )
+    return built is kind
+
+
+# ``_implied_by`` for a record: the first member that builds from a mapping
+# decides, and every record fits the class its member names.
+def _record_built(
+    declared: object,
+    default_concrete_types: Mapping[object, type],
+) -> object:
+    """Return the class an untagged record under ``declared`` reads back as, else ``None``."""
+    for member in _union_candidates(_NO_ENTRIES, _members(declared)):
+        decoder = _untagged_decoder(member, default_concrete_types)
+        built = _MAPPING_BUILDS.get(decoder)
+        if built is not None:
+            return member if decoder is _decode_object else built
+    return None
+
+
+type _Form = tuple[bool, object, _DeclaredParts]
+"""Whether a container goes untagged, its keys' type, and its parts' types."""
+
+
 def _form(
     value: object,
     kind: type,
     declared: object,
     default_concrete_types: Mapping[object, type],
-) -> tuple[bool, object, _DeclaredParts]:
+) -> _Form:
     """Return whether ``value`` written as a ``kind`` goes untagged, and its parts' types."""
+    size = len(cast("tuple[object, ...]", value)) if kind is tuple else None
+    settled = _settled_form(kind, declared, default_concrete_types, size)
+    if settled is not None:
+        return settled
+    return cast(
+        "_Form",
+        _form_by(kind, declared, default_concrete_types, _ValueFit(value=value)),
+    )
+
+
+# The Rust core asks this once per container class and declared type.
+def _settled_form(
+    kind: type,
+    declared: object,
+    default_concrete_types: Mapping[object, type],
+    size: int | None = None,
+) -> _Form | None:
+    """Return ``_form``'s answer for every ``kind`` under ``declared``, else ``None``."""
     if declared is object:
         return kind is dict or kind is list, object, _DeclaredParts()
+    found = _decided(
+        ("form", kind, declared, size),
+        default_concrete_types,
+        lambda: _form_by(
+            kind,
+            declared,
+            default_concrete_types,
+            _KindFit(kind=kind, size=size),
+        ),
+    )
+    return cast("_Form | None", found)
+
+
+# A union reads tagged data by the first member the value fits, mapping members
+# last for a value tag, and by tags alone when none fits.
+def _form_by(
+    kind: type,
+    declared: object,
+    default_concrete_types: Mapping[object, type],
+    fit: _Fit,
+) -> _Form | None:
+    """Return ``_form``'s answer judging fits by ``fit``; ``None`` where one is ``None``."""
     mapping = kind is dict or kind is MappingProxyType
-    members = _members(declared)
-    builds = _MAPPING_BUILDS if mapping else _SEQUENCE_BUILDS
-    shape: PlainTree = MappingProxyType[str, PlainTree]({}) if mapping else ()
-    for member in _union_candidates(shape, members):
-        decoder = _untagged_decoder(member, default_concrete_types)
-        built = builds.get(decoder)
-        if built is None:
-            continue
-        if built is kind:
-            if decoder is _decode_typeddict:
-                named = _field_types(cast("type", member))
-                return True, object, _DeclaredParts(named=named)
-            return True, *_part_types(member, kind)
-        break
+    shape = _NO_ENTRIES if mapping else ()
+    implied, member = _implied_by(shape, kind, declared, default_concrete_types, fit)
+    if implied is None:
+        return None
+    if implied:
+        if is_typeddict(member):
+            named = _field_types(cast("type", member))
+            return True, object, _DeclaredParts(named=named)
+        return True, *_part_types(member, kind)
     valued = not mapping
     for member in sorted(
-        members,
+        _members(declared),
         key=lambda member: (
             valued and _reads_tags_as_keys(member, default_concrete_types)
         ),
     ):
-        if _shallow_fit(value, member) is not False:
+        fits = fit(member, False)
+        if fits is None:
+            return None
+        if fits:
             return False, *_part_types(member, kind)
     return False, object, _DeclaredParts()
 
 
-# As for a container: the first member whose decoder builds from an untagged
-# mapping is the one ``from_plain`` reads it as.
-def _implied_record(
-    kind: type,
-    declared: object,
+# Decisions name classes and types, which live as long as the code that made
+# them; the bound only stops a process that makes types without end.
+def _decided(
+    key: tuple[object, ...],
     default_concrete_types: Mapping[object, type],
-) -> bool:
-    """Return whether ``declared`` reads an untagged mapping as dataclass ``kind``."""
-    if declared is object:
-        return False
-    shape = MappingProxyType[str, PlainTree]({})
-    for member in _union_candidates(shape, _members(declared)):
-        decoder = _untagged_decoder(member, default_concrete_types)
-        if decoder in _MAPPING_BUILDS:
-            return decoder is _decode_object and member is kind
-    return False
+    decide: Callable[[], object],
+) -> object:
+    """Return ``decide()``, kept by ``key`` while ``from_plain``'s dispatch stands."""
+    try:
+        full = (*key, tuple(default_concrete_types.items()))
+        known = _DECISIONS.get(full, _DECISIONS)
+    except TypeError:
+        return decide()
+    dispatch = _dispatch()
+    if known is not _DECISIONS:
+        held, answer = cast("tuple[object, object]", known)
+        if held is dispatch:
+            return answer
+    answer = decide()
+    if len(_DECISIONS) >= _DECISION_LIMIT:
+        _DECISIONS.clear()
+    _DECISIONS[full] = (dispatch, answer)
+    return answer
 
 
 def _part_types(member: object, kind: type) -> tuple[object, _DeclaredParts]:
@@ -1048,6 +1221,22 @@ def _members(declared: object) -> tuple[object, ...]:
 
 
 _NATIVE_LEAVES: Final = frozenset((str, int, bool))
+
+
+_UNDECLARED: Final = frozenset((str, int, bool, float, type(None)))
+"""The classes written alike under every declared type."""
+
+
+_DECISIONS: Final[dict[tuple[object, ...], object]] = {}
+"""Each decision ``_decided`` keeps, with the decoder table it was made under."""
+
+
+_DECISION_LIMIT: Final = 4096
+"""How many decisions ``_DECISIONS`` holds before it starts over."""
+
+
+_NO_ENTRIES: Final = MappingProxyType[str, PlainTree]({})
+"""The shape of an untagged mapping or record, whatever its entries."""
 
 
 _IN_KEY: Final[_Here] = (None, "")

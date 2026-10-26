@@ -40,6 +40,7 @@ def _config(index: int, *, depth_count: int = 12) -> object:
     module = ModuleType(f"treekle_pgo_{index}")
     sys.modules[module.__name__] = module
     child: object = None
+    parent: object = object
     for depth in range(depth_count):
         kind = make_dataclass(
             f"Layer{depth}",
@@ -51,7 +52,7 @@ def _config(index: int, *, depth_count: int = 12) -> object:
                 ("shape", tuple[int, int]),
                 ("sizes", list[int], field(default_factory=list[int])),
                 ("extra", dict[str, float], field(default_factory=dict[str, float])),
-                ("child", object, None),
+                ("child", parent, None),
             ],
             module=module.__name__,
             slots=True,
@@ -59,6 +60,9 @@ def _config(index: int, *, depth_count: int = 12) -> object:
             frozen=True,
         )
         setattr(module, kind.__name__, kind)
+        # Each layer declares its child's class, so the records it holds go
+        # untagged, as a model config's nested configs do.
+        parent = kind | None
         child = cast(
             "object",
             kind(

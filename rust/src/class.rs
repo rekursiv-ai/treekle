@@ -11,7 +11,7 @@ use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyString, PyTuple};
 
-use crate::encode::Kept;
+use crate::encode::{Kept, Parts};
 use crate::py::*;
 use crate::sync;
 
@@ -203,6 +203,9 @@ pub struct ClassInfo {
     pub own_reduce: Option<bool>,
 }
 
+/// A slot name as quoted JSON text, where it needs no escape.
+pub type KeyText = Option<Box<[u8]>>;
+
 /// A class's slots, as ``attribute_names`` names them, and where each lives.
 pub struct Layout {
     /// Taken when the offsets were read, so a class changed while an
@@ -218,10 +221,44 @@ pub struct Layout {
     pub reading: Reading,
     /// Under ``Reading::Slots``, each slot name as JSON text, quoted, where
     /// it is ASCII that needs no escape and so reads the same under every
-    /// ``Style``.
-    pub key_texts: Vec<Option<Box<[u8]>>>,
+    /// ``Style``; written when a JSON walk first reads the layout.
+    pub key_texts: std::cell::OnceCell<Box<[KeyText]>>,
     /// Under ``Reading::Dict``, how the last instance dict read was named.
     pub dict_keys: std::cell::RefCell<Option<Rc<DictKeys>>>,
+    /// What the class's field types declare of its slots, read once.
+    pub plan: std::cell::OnceCell<Rc<Plan>>,
+}
+
+/// What a record class's field types declare of its slots, each slot's
+/// read when a part there first needs it: only those slots' annotations are
+/// touched, which a class met once has never brought into cache.
+pub struct Plan {
+    /// The decoder table the records were read under, and its size then.
+    pub dispatch: Option<(Py<PyAny>, usize)>,
+    /// The class's own annotations, where its field types are read from.
+    pub annotations: Option<Py<PyDict>>,
+    /// The class's field types, where it has no annotations to read.
+    pub parts: Option<Rc<Parts>>,
+    /// Each slot's field, in layout order; empty for a plan used once.
+    pub fields: Box<[Field]>,
+}
+
+/// A slot's declared type, and the record an untagged mapping reads as there.
+#[derive(Default)]
+pub struct Field {
+    /// The declared type, ``None`` inside where it is ``object``.
+    pub hint: std::cell::OnceCell<Option<Py<PyAny>>>,
+    pub record: std::cell::OnceCell<Record>,
+}
+
+/// The class ``_record_built`` gives for a declared type.
+pub enum Record {
+    /// No record class: no record goes untagged there.
+    None,
+    /// This record class, which goes untagged there.
+    Class(Py<PyAny>),
+    /// Only Python can say.
+    Ask,
 }
 
 /// How ``getattr`` finds the members of a class's instances.
@@ -282,6 +319,14 @@ pub unsafe fn type_lookup(
     }
 }
 
+/// Whether ``kind``'s MRO holds ``name``, read through the type cache: a
+/// class asked about again and again (each record's) finds its answer there,
+/// a miss included, without walking its MRO each time.
+#[inline]
+pub unsafe fn type_has(kind: *mut ffi::PyTypeObject, name: *mut ffi::PyObject) -> bool {
+    unsafe { !_PyType_Lookup(kind, name).is_null() }
+}
+
 /// ``namespace[key]`` as a borrowed reference, or null where it is absent.
 /// Callers pass an exact dict and an exact str key, whose lookup cannot fail.
 #[cfg(Py_3_13)]
@@ -312,6 +357,17 @@ unsafe fn dict_borrowed(
 impl Layout {
     pub fn len(&self) -> usize {
         self.offsets.len()
+    }
+
+    /// ``key_texts``, written on first use.
+    pub fn key_texts(&self, py: Python<'_>) -> &[KeyText] {
+        self.key_texts.get_or_init(|| {
+            self.names
+                .bind(py)
+                .iter()
+                .map(|name| crate::json::plain_key_text(&name))
+                .collect()
+        })
     }
 
     /// The name of slot ``index``, borrowed from ``names``.
@@ -357,20 +413,14 @@ impl Layout {
             Reading::Slots if !exact() => Reading::Generic,
             reading => reading,
         };
-        let key_texts = match reading {
-            Reading::Slots => names
-                .iter()
-                .map(|name| crate::json::plain_key_text(&name))
-                .collect(),
-            _ => Vec::new(),
-        };
         Self {
             stamp,
             names: names.unbind(),
             offsets,
             reading,
-            key_texts,
+            key_texts: std::cell::OnceCell::new(),
             dict_keys: std::cell::RefCell::new(None),
+            plan: std::cell::OnceCell::new(),
         }
     }
 }

@@ -17,7 +17,9 @@ from pathlib import Path, PurePosixPath
 from types import GenericAlias, MappingProxyType
 from typing import (
     TYPE_CHECKING,
+    Annotated,
     Final,
+    Literal,
     Protocol,
     SupportsIndex,
     TypedDict,
@@ -1575,6 +1577,10 @@ class LateHinted:
 
 
 class TestRecordImplies:
+    def test_a_class_outside_classes_is_not_written(self) -> None:
+        with pytest.raises(TypeError, match="not in classes"):
+            to_plain(Point(x=1), classes={"square": Square})
+
     def test_a_field_whose_alias_does_not_evaluate_reads_by_its_tags(self) -> None:
         value = LateHinted(hooks=[], names=("a",))
 
@@ -1586,23 +1592,6 @@ class TestRecordImplies:
             "names": ["a"],
         }
         assert from_plain(tree, object, allow_imports=True) == value
-
-    @pytest.mark.parametrize(
-        ("kind", "implies"),
-        [
-            (Pins, True),
-            (PinsHolder, True),
-            (Loose, False),
-            (int, False),
-        ],
-        ids=repr,
-    )
-    def test_a_record_implies_where_a_field_declares_more_than_object(
-        self,
-        kind: type,
-        implies: bool,
-    ) -> None:
-        assert serialize.record_implies(kind) is implies
 
 
 @dataclass(frozen=True, kw_only=True, slots=True)
@@ -1765,6 +1754,58 @@ class TestADeclaredContainerIsUntagged:
         assert restored[1] is (first["k"] if isinstance(first, Mapping) else first[0])
 
 
+_MISDECLARED: Final[list[tuple[object, object, PlainTree]]] = [
+    ((1,), tuple[int, str] | list[int], {"py/tuple": [1]}),
+    ([1], Literal["a"] | tuple[int, ...], {"py/list": [1]}),
+    ([1], type[int] | tuple[int, ...], {"py/list": [1]}),
+    ([1], tuple[int, ...] | object, {"py/list": [1]}),
+]
+"""A container, a declared union it is no member of, and its tree."""
+
+
+class TestAContainerNotOfItsDeclaredType:
+    @pytest.mark.parametrize(("value", "target", "expected"), _MISDECLARED, ids=repr)
+    def test_it_is_tagged(
+        self,
+        value: object,
+        target: object,
+        expected: PlainTree,
+    ) -> None:
+        tree = to_plain(value, target=target)
+        restored = from_plain(tree, object)
+
+        assert tree == expected
+        assert restored == value
+        assert type(restored) is type(value)
+
+    def test_a_fitting_tuple_judged_whole_is_untagged(self) -> None:
+        target = tuple[int, str] | set[int]
+
+        tree = to_plain((1, "a"), target=target)
+
+        assert tree == [1, "a"]
+        assert from_plain(tree, target) == (1, "a")
+
+    def test_an_unhashable_annotation_still_untags(self) -> None:
+        target = Annotated[list[int], {"unit": "m"}]
+
+        assert to_plain([1], target=target) == [1]
+
+    def test_decisions_start_over_once_full(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        decisions: dict[tuple[object, ...], object] = {}
+        monkeypatch.setattr(serialize, "_DECISIONS", decisions)
+        monkeypatch.setattr(serialize, "_DECISION_LIMIT", 1)
+
+        first = serialize._python_to_plain([1], target=list[int])
+        second = serialize._python_to_plain((1,), target=tuple[int, ...])
+
+        assert (first, second) == ([1], [1])
+        assert len(decisions) == 1
+
+
 class Ratio(Enum):
     HALF = 0.5
     PAIR = (1, 2)
@@ -1905,13 +1946,14 @@ class TestRecordsImplyTheirFields:
         assert isinstance(restored, Point)
         assert (restored.y, type(restored.y)) == (3, int)
 
-    def test_a_fixed_tuple_longer_than_declared_tags_its_extra_items(self) -> None:
+    def test_a_fixed_tuple_not_of_its_arity_is_tagged(self) -> None:
         value = Pins(pair=cast("tuple[int, str]", cast("object", (1, "b", (2,)))))
 
         tree = to_plain(value)
 
         assert isinstance(tree, dict)
-        assert tree["pair"] == [1, "b", {"py/tuple": [2]}]
+        assert tree["pair"] == {"py/tuple": [1, "b", {"py/tuple": [2]}]}
+        assert from_plain(tree, Pins, allow_imports=True) == value
 
     def test_a_record_writes_what_its_fields_imply_untagged(self) -> None:
         value = Pins(names=("a",), pair=(1, "b"), tags=frozenset({"t"}), loose=(2,))

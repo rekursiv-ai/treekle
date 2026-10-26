@@ -18,6 +18,8 @@ abstract declared type. For example, with ``{Mapping: MappingProxyType}``, an
 untagged mapping under a type declared ``Mapping`` reads as a
 ``MappingProxyType``. A ``py/dict`` or ``py/list`` tag still reads as a dict or
 a list.
+
+The tag rules and their example are in ``treekle``'s package docstring.
 """
 
 from __future__ import annotations
@@ -259,6 +261,8 @@ class _Decoding:
       reading: The ``id`` of each input container a frame is reading now.
       default_concrete_types: The class untagged data reads as under each
         abstract declared origin, where not the baseline.
+      choosing: Whether the node being started is a union's member trial, so a
+        tagged value that does not fit the member refuses it.
 
     """
 
@@ -279,6 +283,7 @@ class _Decoding:
     default_concrete_types: Mapping[object, type] = field(
         default_factory=dict[object, type],
     )
+    choosing: bool = False
 
 
 type _Decoder = Callable[[PlainTree, object, FieldPath, _Decoding], object]
@@ -402,10 +407,17 @@ def _start_node(
         )
         if frame is not None:
             return frame
+    # Rule 3 of the contract in ``treekle``'s package docstring: below the root a
+    # tag decides, so ``target`` refuses a tagged value only where a union is
+    # choosing the member to read by. A reference names a value its first
+    # occurrence decided, so it must always fit.
+    checked = not at or state.choosing
     if "py/ref" in data:
         value = _decode_path_reference(data, state)
+        checked = True
     elif "py/id" in data:
         value = _decode_reference(data, state)
+        checked = True
     else:
         tag = _tag_of(data)
         # A mapping target reads a tag key as data, as ``custom_json.convert``
@@ -426,9 +438,10 @@ def _start_node(
         payload = data if tag == "py/object" else data[tag]
         value = _TAG_DECODERS[tag](payload, target, at, state)
         if isinstance(value, _Frame):
-            value.check = target
+            if checked:
+                value.check = target
             return value
-    if not _fits(value, target):
+    if checked and not _fits(value, target):
         raise ReadError(f"cannot read {_shown(value)} as {target}")
     return value
 
@@ -470,7 +483,7 @@ def _is_plain(data: object) -> bool:
 def _decoder_for(target: object) -> _Decoder:
     """Return the decoder for ``target``, keyed on its origin."""
     origin: object = get_origin(target) or target
-    decoder = _DECODERS.get(origin)
+    decoder = _dispatch().get(origin)
     if decoder is not None:
         return decoder
     if not _is_class(origin):
@@ -496,7 +509,7 @@ def _untagged_decoder(
     if default_concrete_types:
         chosen = default_concrete_types.get(get_origin(target) or target)
         if chosen is not None:
-            return _DECODERS[chosen]
+            return _dispatch()[chosen]
     return _decoder_for(target)
 
 
@@ -554,10 +567,10 @@ type _Judging = tuple[bool, Iterator[tuple[object, object]], tuple[int, int]]
 
 # Judged with a stack, as decoding is: a referenced value is as deep as its data. A
 # pair met again while still being judged fits; the rest of the walk decides.
-def _fits(value: object, target: object) -> bool:
+def _fits(value: object, target: object, *, whole: bool = False) -> bool:
     """Return whether a tag-decoded or referenced ``value`` is acceptable as ``target``."""
     key = (id(value), id(target))
-    verdict = _shallow_fit(value, target)
+    verdict = _shallow_fit(value, target, whole=whole)
     stack: list[_Judging] = []
     judging: set[tuple[int, int]] = set()
     while True:
@@ -576,7 +589,7 @@ def _fits(value: object, target: object) -> bool:
             verdict = needs_all
         else:
             key = (id(pair[0]), id(pair[1]))
-            verdict = key in judging or _shallow_fit(*pair)
+            verdict = key in judging or _shallow_fit(*pair, whole=whole)
 
 
 # ``isinstance`` alone refuses to judge a ``TypedDict`` or a Protocol that is not
@@ -584,8 +597,14 @@ def _fits(value: object, target: object) -> bool:
 # value was decoded as whatever its first occurrence was, and a reduce, hook, or
 # ``py/object`` builds its items untyped, so items are checked against ``target``'s
 # element types too. Only the containers a reference can name are walked: lists,
-# sets, and mappings; a tuple or frozenset was read item by item already.
-def _shallow_fit(value: object, target: object) -> bool | _Parts:
+# sets, and mappings; a tuple or frozenset was read item by item already, so of a
+# tuple only a fixed arity is checked, unless the whole value is judged.
+def _shallow_fit(
+    value: object,
+    target: object,
+    *,
+    whole: bool = False,
+) -> bool | _Parts:
     """Judge ``value`` against ``target`` alone, or return the parts left to judge."""
     # A part that did not read is already recorded where it sits.
     if isinstance(value, Invalid):
@@ -602,9 +621,10 @@ def _shallow_fit(value: object, target: object) -> bool | _Parts:
     if not _is_class(origin) or origin is object or _is_any(origin):
         return True
     if is_typeddict(origin):
-        return isinstance(value, Mapping) and _required_keys(origin) <= set(
-            cast("Mapping[object, object]", value),
-        )
+        if not isinstance(value, Mapping):
+            return False
+        keys = set(cast("Mapping[object, object]", value))
+        return _required_keys(origin) <= keys <= set(_field_types(origin))
     if _is_protocol(origin):
         return _has_members(value, origin)
     # An int is a float as typing reads one, and keeps its class when read.
@@ -612,6 +632,14 @@ def _shallow_fit(value: object, target: object) -> bool | _Parts:
         return True
     if not isinstance(value, origin):
         return False
+    if origin is tuple:
+        items = cast("tuple[object, ...]", value)
+        fixed, each = _tuple_types(target)
+        if fixed is not None and len(fixed) != len(items):
+            return False
+        if not whole:
+            return True
+        return True, zip(items, fixed or repeat(each), strict=False)
     if isinstance(value, Mapping) and len(args) == 2:
         mapping = cast("Mapping[object, object]", value)
         key_type, item_type = args
@@ -620,9 +648,9 @@ def _shallow_fit(value: object, target: object) -> bool | _Parts:
             for key, member in mapping.items()
             for pair in ((key, key_type), (member, item_type))
         )
-    if isinstance(value, (list, set)) and args:
-        items = cast("list[object] | set[object]", value)
-        return True, ((item, args[0]) for item in items)
+    if isinstance(value, (list, set, frozenset) if whole else (list, set)) and args:
+        members = cast("list[object] | AbstractSet[object]", value)
+        return True, ((member, args[0]) for member in members)
     return True
 
 
@@ -1044,12 +1072,11 @@ def _decode_tuple(
     if not isinstance(data, Sequence) or isinstance(data, str):
         raise ReadError(f"cannot read {_shown(data)} as {target}")
     fixed, each = _tuple_types(target)
-    if fixed is None:
-        types: Iterator[object] = repeat(each)
-    elif len(fixed) != len(data):
-        raise ReadError(f"expected {len(fixed)} items for {target}, got {len(data)}")
-    else:
-        types = iter(fixed)
+    # ``to_plain`` writes a tuple not of a fixed tuple's arity tagged, its items
+    # untyped.
+    types: Iterator[object] = (
+        iter(fixed) if fixed is not None and len(fixed) == len(data) else repeat(each)
+    )
     return _Items(at, raws=data, types=types, values=[], done=tuple)
 
 
@@ -1074,6 +1101,10 @@ def _decode_untagged_tuple(
     """Decode an untagged sequence as a tuple, placed by path once built."""
     frame = _decode_tuple(data, target, at, state)
     assert isinstance(frame, _Items)
+    fixed, _ = _tuple_types(target)
+    count = len(cast("Sequence[PlainTree]", data))
+    if fixed is not None and len(fixed) != count:
+        raise ReadError(f"expected {len(fixed)} items for {target}, got {count}")
     frame.done = partial(_placed_tuple, at=at, state=state)
     return frame
 
@@ -1612,12 +1643,24 @@ def _decode_union(
             sorted(
                 members,
                 key=lambda member: (
-                    _class_tag(member, state) != path,
+                    path is not None and _class_tag(member, state) != path,
                     valued
                     and _reads_tags_as_keys(member, state.default_concrete_types),
                 ),
             ),
         )
+        # Below the root a tag decides (rule 3 of the contract in ``treekle``'s
+        # package docstring): a value fitting no member reads by tags alone. A
+        # union tried as another's member leaves that to the outer one, and a
+        # reference must fit a member. A ``py/object`` naming no class to build
+        # would read as data, not by its tag.
+        if (
+            at
+            and not state.choosing
+            and not {"py/ref", "py/id"} & tagged.keys()
+            and (path is None or _objects_named(state))
+        ):
+            members = (*members, object)
     else:
         members = _union_candidates(data, members)
     return _Union(
@@ -2113,11 +2156,14 @@ class _Union(_Frame):
             if self.value is not PENDING:
                 return None
             self.marks = (len(state.built), len(state.bad), len(state.placed))
+            state.choosing = True
             try:
                 value = _start(self.data, member, self.at, state)
             except ReadError:
                 self._rollback(state)
                 continue
+            finally:
+                state.choosing = False
             if isinstance(value, _Frame):
                 return value
             self.take(value, state)
@@ -2218,6 +2264,11 @@ def _allocate(kind: type) -> object:
 def _objects_named(state: _Decoding) -> bool:
     """Return whether a ``py/object`` tag names a class to build."""
     return bool(state.classes) or state.allow_imports
+
+
+def _dispatch() -> Mapping[object, _Decoder]:
+    """Return the decoder table ``from_plain`` dispatches by now."""
+    return _DECODERS
 
 
 def _class_tag(member: object, state: _Decoding) -> str | None:
