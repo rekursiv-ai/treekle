@@ -1,4 +1,5 @@
 //! ``to_plain``: Python values to plain trees, matching ``treekle.serialize``.
+//! The tag rules and their example are in ``treekle``'s package docstring.
 //!
 //! The walk is Python's ``_encode``: each container is built at once with its
 //! leaves in place, and every other part waits on an explicit stack until it
@@ -59,8 +60,6 @@ pub enum Nat {
     Uuid,
     Datetime,
     Object,
-    /// ``_encode_object`` for a record whose field types declare its parts.
-    Implied,
     Hooked,
     Unreduced,
 }
@@ -95,6 +94,68 @@ impl Enc<'_> {
     }
 }
 
+/// The offsets of ``GenericAlias``'s ``__origin__``, ``__args__`` and
+/// ``__unpacked__`` and ``UnionType``'s ``__args__``, each a member of an
+/// immutable builtin type, so reading there is what ``getattr`` reads;
+/// ``None`` where a member is not one, which is then read by ``getattr``.
+struct HintSlots {
+    origin: Option<isize>,
+    args: Option<isize>,
+    unpacked: Option<isize>,
+    union_args: Option<isize>,
+}
+
+impl HintSlots {
+    fn new(py: Python<'_>) -> PyResult<Self> {
+        let types = py.import("types")?;
+        let member = |kind: &str, name: &str, code: std::ffi::c_int| -> PyResult<Option<isize>> {
+            let found = types.getattr(kind)?.getattr("__dict__")?.get_item(name)?;
+            if ob_type(found.as_ptr()) != &raw mut ffi::PyMemberDescr_Type {
+                return Ok(None);
+            }
+            let def = unsafe {
+                (*found.as_ptr().cast::<ffi::PyMemberDescrObject>())
+                    .d_member
+                    .cast::<ffi::PyMemberDef>()
+            };
+            Ok(unsafe { ((*def).type_code == code).then_some((*def).offset) })
+        };
+        Ok(Self {
+            origin: member("GenericAlias", "__origin__", T_OBJECT)?,
+            args: member("GenericAlias", "__args__", T_OBJECT)?,
+            unpacked: member("GenericAlias", "__unpacked__", ffi::Py_T_BOOL)?,
+            union_args: member("UnionType", "__args__", T_OBJECT)?,
+        })
+    }
+}
+
+/// ``_Py_T_OBJECT``, which those members are, read as ``None`` where unset.
+const T_OBJECT: std::ffi::c_int = 6;
+
+/// ``getattr(hint, name)`` for an object member at ``offset``, of an
+/// object of the type the offset was read from.
+fn hint_part<'py>(
+    hint: &B<'py>,
+    offset: Option<isize>,
+    name: &Bound<'py, PyString>,
+) -> PyResult<B<'py>> {
+    let Some(offset) = offset else {
+        return hint.getattr(name);
+    };
+    let raw = unsafe {
+        *hint
+            .as_ptr()
+            .cast::<u8>()
+            .offset(offset)
+            .cast::<*mut ffi::PyObject>()
+    };
+    // A ``_Py_T_OBJECT`` member reads ``None`` where unset.
+    Ok(match raw.is_null() {
+        true => hint.py().None().into_bound(hint.py()),
+        false => unsafe { Bound::from_borrowed_ptr(hint.py(), raw) },
+    })
+}
+
 pub struct EncGlobals {
     module: Py<PyDict>,
     reflect: Py<PyDict>,
@@ -109,17 +170,35 @@ pub struct EncGlobals {
     verified_path: Py<PyAny>,
     resolve_import: Py<PyAny>,
     is_dataclass: Py<PyAny>,
-    /// ``record_implies``: whether a record's field types write a container
-    /// untagged, so the walk carries its fields' declared types.
-    record_implies: Py<PyAny>,
     /// ``_form``: whether a container goes untagged under its declared type,
     /// and its parts' declared types, decided by ``from_plain``'s dispatch.
     form: Py<PyAny>,
-    /// ``_DeclaredParts``, built for a record from ``_field_types``.
-    declared_parts: Py<PyAny>,
-    /// ``_implied_record``: whether a declared type implies a record's class,
-    /// so its ``py/object`` is not written.
-    implied_record: Py<PyAny>,
+    /// ``types.GenericAlias`` and ``types.UnionType``: the plain hints'
+    /// generic and union classes.
+    generic_alias: Py<PyAny>,
+    union_type: Py<PyAny>,
+    /// Where those hints keep their parts, read with no lookup.
+    hint_slots: HintSlots,
+    /// ``dataclasses._FIELD``, the kind of field ``dataclasses.fields`` gives.
+    field_kind: Py<PyAny>,
+    /// Where ``dataclasses.Field`` keeps ``_field_type``, read without a lookup.
+    field_slots: Option<crate::attrs::FieldSlots>,
+    /// ``type.__dict__["__annotations__"]``, which reads a class's own
+    /// annotations as ``inspect.get_annotations`` does.
+    annotations: Py<PyAny>,
+    /// ``type``, whose own ``__annotations__`` descriptor a plain class's
+    /// attribute lookup reaches first.
+    type_type: Py<PyAny>,
+    /// ``_record_built``: the class an untagged record under a declared type
+    /// reads back as, which rule 1 of the contract in ``treekle``'s docstring
+    /// leaves untagged.
+    record_built: Py<PyAny>,
+    /// ``_settled_form``: ``_form``'s answer for every value of a class.
+    settled_form: Py<PyAny>,
+    /// ``_FIELD_TYPES``, which holds a class's field types once its hints resolve.
+    field_types_cache: Py<PyAny>,
+    /// ``treekle.deserialize``'s globals, whose ``_DECODERS`` the decisions read.
+    reader: Py<PyDict>,
     /// ``_untagged_leaf``: a path, UUID, datetime or enum member's text where
     /// its declared type reads that text back as it, else ``None``.
     untagged_leaf: Py<PyAny>,
@@ -381,10 +460,31 @@ pub fn setup(module: &Bound<'_, PyDict>) -> PyResult<()> {
         verified_path: get("_verified_path")?,
         resolve_import: get("resolve_import")?,
         is_dataclass: get("is_dataclass")?,
-        record_implies: get("record_implies")?,
         form: get("_form")?,
-        declared_parts: get("_DeclaredParts")?,
-        implied_record: get("_implied_record")?,
+        generic_alias: py.import("types")?.getattr("GenericAlias")?.unbind(),
+        union_type: py.import("types")?.getattr("UnionType")?.unbind(),
+        hint_slots: HintSlots::new(py)?,
+        field_kind: py.import("dataclasses")?.getattr("_FIELD")?.unbind(),
+        field_slots: crate::attrs::FieldSlots::new(
+            py,
+            &py.import("dataclasses")?.getattr("fields")?,
+        )?,
+        type_type: builtins.getattr("type")?.unbind(),
+        annotations: builtins
+            .getattr("type")?
+            .getattr("__dict__")?
+            .get_item("__annotations__")?
+            .unbind(),
+        record_built: get("_record_built")?,
+        settled_form: get("_settled_form")?,
+        field_types_cache: item(module, "_field_types")?
+            .getattr("__globals__")?
+            .get_item("_FIELD_TYPES")?
+            .unbind(),
+        reader: item(module, "_dispatch")?
+            .getattr("__globals__")?
+            .cast_into::<PyDict>()?
+            .unbind(),
         untagged_leaf: get("_untagged_leaf")?,
         field_types: get("_field_types")?,
         form_kinds: [
@@ -691,12 +791,18 @@ fn plain_dict_attr(kind: *mut ffi::PyTypeObject, dict_name: &B<'_>, getter: Opti
 }
 
 /// An object node holding only its ``py/object`` tag, sized for ``members``.
-fn object_node<'py>(py: Python<'py>, path: B<'py>, members: usize) -> PyResult<Bound<'py, PyDict>> {
+fn object_node<'py>(
+    py: Python<'py>,
+    path: Option<B<'py>>,
+    members: usize,
+) -> PyResult<Bound<'py, PyDict>> {
     let node = unsafe {
         Bound::from_owned_ptr_or_err(py, _PyDict_NewPresized(members as ffi::Py_ssize_t + 1))?
             .cast_into_unchecked::<PyDict>()
     };
-    node.set_item(intern!(py, "py/object"), path)?;
+    if let Some(path) = path {
+        node.set_item(intern!(py, "py/object"), path)?;
+    }
     Ok(node)
 }
 
@@ -947,6 +1053,21 @@ fn write<'py>(node: &B<'py>, slot: &Slot<'py>, done: B<'py>) -> PyResult<()> {
     }
 }
 
+/// An exact tuple's items, copied straight into a list of its size.
+fn tuple_list<'py>(value: &B<'py>) -> PyResult<Bound<'py, PyList>> {
+    let source = value.as_ptr();
+    unsafe {
+        let size = ffi::PyTuple_GET_SIZE(source);
+        let list = Bound::from_owned_ptr_or_err(value.py(), ffi::PyList_New(size))?;
+        for index in 0..size {
+            let item = ffi::PyTuple_GET_ITEM(source, index);
+            ffi::Py_INCREF(item);
+            ffi::PyList_SET_ITEM(list.as_ptr(), index, item);
+        }
+        Ok(list.cast_into_unchecked::<PyList>())
+    }
+}
+
 /// Whether ``value`` is an exact list or tuple of ``is_leaf_value`` items.
 #[inline]
 fn all_leaf_items(value: &B<'_>) -> bool {
@@ -1121,12 +1242,195 @@ struct Encoder<'py, 'g> {
     holes: Vec<Hole<'py>>,
     /// ``concrete_overrides(default_concrete_types)``, which ``_form`` applies.
     overrides: B<'py>,
-    /// Each record class's ``_DeclaredParts`` this walk built, by address.
-    record_parts: HashMap<usize, B<'py>>,
+    /// Whether ``overrides`` is empty.
+    no_overrides: bool,
+    /// What types alone decide, kept across calls where ``overrides`` is empty.
+    decisions: Decisions,
 }
 
 /// Spare ``Items`` vectors a JSON walk keeps; enough for its nesting depth.
 const SPARE_LIMIT: usize = 64;
+
+/// A ``_DeclaredParts`` read once, so ``of`` runs no Python code.
+pub struct Parts {
+    /// ``each``, ``None`` where it is ``object``.
+    each: Option<Py<PyAny>>,
+    /// ``named``, copied into a dict.
+    named: Option<Py<PyDict>>,
+    indexed: Option<Py<PyTuple>>,
+}
+
+impl Parts {
+    fn read<'py>(parts: &B<'py>, object: &B<'py>) -> PyResult<Self> {
+        let py = parts.py();
+        let each = parts.getattr(intern!(py, "each"))?;
+        let named = parts.getattr(intern!(py, "named"))?;
+        let indexed = parts.getattr(intern!(py, "indexed"))?;
+        Ok(Self {
+            each: (!each.is(object)).then(|| each.unbind()),
+            named: if named.is_none() {
+                None
+            } else {
+                Some(PyDict::from_sequence(&named.call_method0(intern!(py, "items"))?)?.unbind())
+            },
+            indexed: if indexed.is_none() {
+                None
+            } else {
+                Some(indexed.cast_into::<PyTuple>()?.unbind())
+            },
+        })
+    }
+
+    /// ``_DeclaredParts(named=types)``: a record's parts, by its field types,
+    /// keeping only those other than ``object``.
+    fn named<'py>(types: &B<'py>, object: &B<'py>) -> PyResult<Self> {
+        let named = PyDict::new(types.py());
+        for item in types
+            .call_method0(intern!(types.py(), "items"))?
+            .try_iter()?
+        {
+            let (name, hint) = item?.extract::<(B<'py>, B<'py>)>()?;
+            if !hint.is(object) {
+                named.set_item(name, hint)?;
+            }
+        }
+        Ok(Self {
+            each: None,
+            named: (!named.is_empty()).then(|| named.unbind()),
+            indexed: None,
+        })
+    }
+
+    /// Every part declared ``object``.
+    pub fn none() -> Self {
+        Self {
+            each: None,
+            named: None,
+            indexed: None,
+        }
+    }
+
+    /// Whether every part is declared ``object``.
+    fn undeclared(&self) -> bool {
+        self.each.is_none() && self.named.is_none() && self.indexed.is_none()
+    }
+
+    /// ``of(index)`` for a sequence's item, ``None`` where it is ``object``.
+    fn item<'py>(
+        &self,
+        py: Python<'py>,
+        index: usize,
+        object: &B<'py>,
+    ) -> PyResult<Option<B<'py>>> {
+        let found = match (&self.indexed, &self.each) {
+            (Some(indexed), _) => indexed.bind(py).get_item(index)?,
+            (None, Some(each)) => each.bind(py).clone(),
+            (None, None) => return Ok(None),
+        };
+        Ok((!found.is(object)).then_some(found))
+    }
+
+    /// ``_DeclaredParts.of(key)``, ``None`` where it is ``object``.
+    pub fn of<'py>(&self, key: &B<'py>, object: &B<'py>) -> PyResult<Option<B<'py>>> {
+        let py = key.py();
+        let found = if let Some(indexed) = &self.indexed {
+            indexed.bind(py).get_item(key.extract::<usize>()?)?
+        } else if let Some(named) = &self.named {
+            if tp(key) != t_str() {
+                return Ok(None);
+            }
+            match named.bind(py).get_item(key)? {
+                Some(found) => found,
+                None => return Ok(None),
+            }
+        } else {
+            return Ok(self.each.as_ref().map(|each| each.bind(py).clone()));
+        };
+        Ok((!found.is(object)).then_some(found))
+    }
+}
+
+/// ``_settled_form``'s answer: whether the container goes untagged, its keys'
+/// declared type, and its parts' ``_DeclaredParts``.
+struct Form {
+    untagged: bool,
+    keys: Py<PyAny>,
+    parts: Rc<Parts>,
+    /// Whether the keys and every part are declared ``object``, so an
+    /// untagged list or dict is written as an undeclared one.
+    undeclared: bool,
+}
+
+/// A record class's field types and its parts' ``_DeclaredParts``.
+type Fields = (Py<PyAny>, Rc<Parts>);
+
+/// A leaf decision's key: (leaf class, declared type, text class), by address.
+type LeafKey = (usize, usize, usize);
+
+/// A leaf decision: the leaf class and declared type held, and the verdict.
+type LeafVerdict = (Py<PyAny>, Py<PyAny>, bool);
+
+/// A form decision's key: (``form_kinds`` index, declared type, a tuple's length).
+type FormKey = (usize, usize, Option<usize>);
+
+/// What ``serialize`` decides from types alone, kept across calls while
+/// ``sync::ENCODE`` stands and ``from_plain`` dispatches by the same
+/// ``_DECODERS``. Each entry holds the objects its key names, so no address
+/// is reused while it is kept.
+#[derive(Default)]
+struct Decisions {
+    generation: Option<u64>,
+    dispatch: Option<Py<PyAny>>,
+    /// ``dispatch``'s size when read, and whether a heap class is a key.
+    dispatch_size: usize,
+    heap_keys: bool,
+    /// ``_untagged_leaf``'s verdict, by (leaf class, declared type, text class).
+    leaves: HashMap<LeafKey, LeafVerdict>,
+    /// ``_record_built``, by declared type, and whether that class is a dataclass.
+    records: HashMap<usize, (Py<PyAny>, Py<PyAny>, bool)>,
+    /// ``_settled_form``, by (container class's ``form_kinds`` index, declared
+    /// type, a tuple's length).
+    forms: HashMap<FormKey, (Py<PyAny>, Option<Rc<Form>>)>,
+    /// A class's field types and parts, ``None`` for one that is no
+    /// dataclass; kept while the class keeps its stamp, once ``_FIELD_TYPES``
+    /// holds them or every hint was read natively.
+    fields: HashMap<usize, (Py<PyAny>, Stamp, Option<Fields>)>,
+    /// A dataclass's field types that ``_FIELD_TYPES`` does not hold, since a
+    /// hint did not resolve: kept while the class and ``sys.modules`` stand,
+    /// with every namespace its hints evaluate in watched, so a pending
+    /// import that lands moves the generations and drops them.
+    pending: HashMap<usize, (Py<PyAny>, Stamp, u64, Fields)>,
+    /// ``_IMPORT_PATHS``' path for a value, by its address, with the check
+    /// that keeps it.
+    paths: HashMap<usize, (Py<PyAny>, Py<PyAny>, PathCheck)>,
+}
+
+impl Decisions {
+    fn len(&self) -> usize {
+        self.records.len()
+            + self.leaves.len()
+            + self.forms.len()
+            + self.fields.len()
+            + self.pending.len()
+            + self.paths.len()
+    }
+
+    fn clear(&mut self) {
+        self.records.clear();
+        self.leaves.clear();
+        self.forms.clear();
+        self.fields.clear();
+        self.pending.clear();
+        self.paths.clear();
+    }
+}
+
+/// How many decisions are kept before they start over; types live as long as
+/// the code that made them, so only a process making types without end fills it.
+const DECISION_LIMIT: usize = 1 << 12;
+
+/// The decisions the last call with no ``default_concrete_types`` kept.
+static DECISIONS: GilCell<Option<Decisions>> = GilCell::new(None);
 
 impl<'py, 'g> Encoder<'py, 'g> {
     #[allow(clippy::too_many_arguments)]
@@ -1183,9 +1487,717 @@ impl<'py, 'g> Encoder<'py, 'g> {
             spare_entries: Vec::new(),
             holes: Vec::new(),
             overrides: PyDict::new(py).into_any(),
-            record_parts: HashMap::new(),
+            no_overrides: true,
+            decisions: Decisions::default(),
         };
         Ok(encoder)
+    }
+
+    /// Start the walk with ``overrides`` and the decisions kept for them:
+    /// those of earlier calls where there are none, else a fresh set.
+    fn adopt(&mut self, overrides: B<'py>) -> PyResult<()> {
+        let kept = overrides.len()? == 0;
+        self.overrides = overrides;
+        self.no_overrides = kept;
+        if kept && let Some(decisions) = DECISIONS.take(self.py) {
+            self.decisions = decisions;
+        }
+        let dispatch = self
+            .b(&self.g.reader)
+            .get_item(intern!(self.py, "_DECODERS"))?
+            .ok_or_else(|| PyAttributeError::new_err("treekle.deserialize has no _DECODERS"))?;
+        let size = dispatch.len()?;
+        let same = self
+            .decisions
+            .dispatch
+            .as_ref()
+            .is_some_and(|held| held.bind(self.py).is(&dispatch))
+            && self.decisions.dispatch_size == size;
+        if !same {
+            self.decisions.clear();
+            // Whether a class Python defines has a decoder of its own; read
+            // again whenever the table's size changes.
+            let mut heap_keys = false;
+            for key in dispatch.try_iter()? {
+                let key = key?;
+                heap_keys |= is_class(&key)
+                    && unsafe {
+                        ffi::PyType_HasFeature(key.as_ptr().cast(), ffi::Py_TPFLAGS_HEAPTYPE) != 0
+                    };
+            }
+            self.decisions.dispatch = Some(dispatch.unbind());
+            self.decisions.dispatch_size = size;
+            self.decisions.heap_keys = heap_keys;
+        }
+        Ok(())
+    }
+
+    /// Keep this walk's decisions for the next call, where it had no overrides.
+    fn release(&mut self) -> PyResult<()> {
+        if self.no_overrides {
+            let decisions = std::mem::take(&mut self.decisions);
+            let stale = DECISIONS.replace(self.py, Some(decisions));
+            drop(stale);
+        }
+        Ok(())
+    }
+
+    /// The kept decisions, emptied first if ``sync::ENCODE`` has moved on or
+    /// they fill; ``None`` where nothing may be kept past this use.
+    fn decided(&mut self) -> PyResult<Option<&mut Decisions>> {
+        let now = self.current()?;
+        let Some(now) = now else {
+            return Ok(None);
+        };
+        if self.decisions.generation != Some(now) || self.decisions.len() >= DECISION_LIMIT {
+            self.decisions.clear();
+            self.decisions.generation = Some(now);
+        }
+        Ok(Some(&mut self.decisions))
+    }
+
+    /// The parts dataclass ``kind``'s field types declare; ``None`` where
+    /// every field is ``object`` or ``kind`` is no dataclass.
+    fn record_parts(&mut self, kind: &B<'py>) -> PyResult<Option<Rc<Parts>>> {
+        Ok(self
+            .record_fields(kind)?
+            .map(|(_, parts)| parts)
+            .filter(|parts| !parts.undeclared()))
+    }
+
+    /// ``is_dataclass(kind) and _record_implied(kind, declared, overrides)``, kept.
+    fn record_implied(&mut self, kind: &B<'py>, declared: &B<'py>) -> PyResult<bool> {
+        // A builtin class is no dataclass; asked first, as most parts are lists.
+        let heap =
+            unsafe { ffi::PyType_HasFeature(kind.as_ptr().cast(), ffi::Py_TPFLAGS_HEAPTYPE) != 0 };
+        if !heap || declared.is(self.b(&self.g.object_type)) {
+            return Ok(false);
+        }
+        // What ``declared`` builds from an untagged mapping, and whether that
+        // class is a dataclass, as rule 1 asks of a record.
+        let key = declared.as_ptr() as usize;
+        if let Some(decisions) = self.decided()?
+            && let Some((_, built, record)) = decisions.records.get(&key)
+        {
+            return Ok(*record && built.is(kind));
+        }
+        let is_record = |class: &B<'py>| unsafe {
+            ffi::PyType_HasFeature(class.as_ptr().cast(), ffi::Py_TPFLAGS_HEAPTYPE) != 0
+                && type_has(
+                    class.as_ptr().cast(),
+                    intern!(class.py(), "__dataclass_fields__").as_ptr(),
+                )
+        };
+        let native = match self.no_overrides {
+            true => self.record_of(declared)?,
+            false => Record::Ask,
+        };
+        let (built, record) = match native {
+            Record::Class(built) => (built.into_bound(self.py), true),
+            Record::None => (self.py.None().into_bound(self.py), false),
+            Record::Ask => {
+                let built = self
+                    .b(&self.g.record_built)
+                    .call1((declared, &self.overrides))?;
+                let record = is_class(&built) && is_record(&built);
+                (built, record)
+            }
+        };
+        let implied = record && built.is(kind);
+        if let Some(decisions) = self.decided()? {
+            decisions
+                .records
+                .insert(key, (declared.clone().unbind(), built.unbind(), record));
+        }
+        Ok(implied)
+    }
+
+    /// ``_untagged_leaf(value, declared)``, kept: whether ``declared`` reads
+    /// the leaf's text back as it depends only on the leaf's class and the
+    /// text's class, so the answer is kept by those and the declared type.
+    fn untagged_leaf(
+        &mut self,
+        value: &B<'py>,
+        kind: &B<'py>,
+        nat: Nat,
+        declared: &B<'py>,
+    ) -> PyResult<Option<B<'py>>> {
+        let py = self.py;
+        let text = match nat {
+            Nat::Reduce if value.is_instance(self.b(&self.g.enum_type))? => {
+                let text = value.getattr(intern!(py, "value"))?;
+                let exact = tp(&text);
+                let finite = exact != t_float()
+                    || unsafe { ffi::PyFloat_AS_DOUBLE(text.as_ptr()) }.is_finite();
+                if !(exact == t_str() || exact == t_int() || exact == t_float()) || !finite {
+                    return Ok(None);
+                }
+                text
+            }
+            Nat::Datetime => self.datetime_text(value)?,
+            _ => value.str()?.into_any(),
+        };
+        let key = (
+            kind.as_ptr() as usize,
+            declared.as_ptr() as usize,
+            tp(&text) as usize,
+        );
+        if let Some(decisions) = self.decided()?
+            && let Some((_, _, implied)) = decisions.leaves.get(&key)
+        {
+            return Ok(implied.then_some(text));
+        }
+        let found = self.b(&self.g.untagged_leaf).call1((value, declared))?;
+        let implied = !found.is_none();
+        if let Some(decisions) = self.decided()? {
+            decisions.leaves.insert(
+                key,
+                (kind.clone().unbind(), declared.clone().unbind(), implied),
+            );
+        }
+        Ok(implied.then_some(found))
+    }
+
+    /// ``_datetime_text``: ``isoformat()``, a ``ZoneInfo``'s key after it.
+    fn datetime_text(&self, value: &B<'py>) -> PyResult<B<'py>> {
+        let py = self.py;
+        let text = value.call_method0(intern!(py, "isoformat"))?;
+        let zone = value.getattr(intern!(py, "tzinfo"))?;
+        if zone.is_instance(self.b(&self.g.zoneinfo))? {
+            let key = zone.getattr(intern!(py, "key"))?;
+            return Ok(pystr(
+                py,
+                &format!("{}[{}]", text.str()?.to_cow()?, key.str()?.to_cow()?),
+            ));
+        }
+        Ok(text)
+    }
+
+    /// ``_record_built(declared)`` with no ``default_concrete_types``, as a
+    /// ``Record``, read natively where ``from_plain``'s dispatch is plain to
+    /// read. A builtin class or generic builds no record. A plain dataclass
+    /// ``from_plain`` reads by its own decoder builds itself. A union builds
+    /// its first such dataclass, where only ``None`` precedes it and nothing
+    /// after is a mapping origin, which ``_union_candidates`` would try first.
+    fn record_of(&self, declared: &B<'py>) -> PyResult<Record> {
+        let py = self.py;
+        let Some(dispatch) = &self.decisions.dispatch else {
+            return Ok(Record::Ask);
+        };
+        let dispatch = dispatch.bind(py);
+        if tp(dispatch) != t_proxy() {
+            return Ok(Record::Ask);
+        }
+        let kind = tp(declared);
+        let generic = self.b(&self.g.generic_alias).as_ptr().cast();
+        if kind == &raw mut ffi::PyType_Type {
+            let heap = unsafe {
+                ffi::PyType_HasFeature(declared.as_ptr().cast(), ffi::Py_TPFLAGS_HEAPTYPE) != 0
+            };
+            return Ok(match (heap, self.plain_record(declared, dispatch)?) {
+                (false, _) => Record::None,
+                (true, true) => Record::Class(declared.clone().unbind()),
+                (true, false) => Record::Ask,
+            });
+        }
+        if kind == generic {
+            return Ok(Record::None);
+        }
+        if kind != self.b(&self.g.union_type).as_ptr().cast() {
+            return Ok(Record::Ask);
+        }
+        let none = py.None().into_bound(py).get_type().into_any();
+        let dict = self.b(&self.g.dict_type);
+        let mut first = None;
+        let args = hint_part(
+            declared,
+            self.g.hint_slots.union_args,
+            intern!(py, "__args__"),
+        )?
+        .cast_into::<PyTuple>()?;
+        for member in args.iter() {
+            if member.is(&none) {
+                continue;
+            }
+            if first.is_none() {
+                if !self.plain_record(&member, dispatch)? {
+                    return Ok(Record::Ask);
+                }
+                first = Some(member);
+                continue;
+            }
+            // After the record, only a member ``_union_candidates`` would move
+            // ahead of it matters: an exact class that is ``dict`` or an alias.
+            let stays = tp(&member) == &raw mut ffi::PyType_Type
+                && !member.is(dict)
+                && !unsafe { type_has(member.as_ptr().cast(), intern!(py, "__value__").as_ptr()) };
+            if !stays {
+                return Ok(Record::Ask);
+            }
+        }
+        Ok(match first {
+            Some(first) => Record::Class(first.unbind()),
+            None => Record::None,
+        })
+    }
+
+    /// Whether ``member`` is a plain dataclass straight under ``object`` that
+    /// ``from_plain`` reads by ``_decode_object``: no alias, no decoder of its own.
+    fn plain_record(&self, member: &B<'py>, dispatch: &B<'py>) -> PyResult<bool> {
+        let py = self.py;
+        if !plain_heap_class(member) {
+            return Ok(false);
+        }
+        let Some(namespace) = own_namespace(member) else {
+            return Ok(false);
+        };
+        Ok(namespace
+            .get_item(intern!(py, "__dataclass_fields__"))?
+            .is_some()
+            && namespace.get_item(intern!(py, "__value__"))?.is_none()
+            && !(self.decisions.heap_keys && dispatch.contains(member)?))
+    }
+
+    /// ``_settled_form`` for the ``form_kinds[index]`` class under
+    /// ``declared``, kept; ``None`` where the value decides.
+    fn settled_form(
+        &mut self,
+        index: usize,
+        declared: &B<'py>,
+        size: Option<usize>,
+    ) -> PyResult<Option<Rc<Form>>> {
+        let key = (index, declared.as_ptr() as usize, size);
+        if let Some(decisions) = self.decided()?
+            && let Some((_, form)) = decisions.forms.get(&key)
+        {
+            return Ok(form.clone());
+        }
+        let form = match self.native_form(index, declared, size)? {
+            Some(form) => Some(Rc::new(form)),
+            None => self.python_form(index, declared, size)?,
+        };
+        if let Some(decisions) = self.decided()? {
+            decisions
+                .forms
+                .insert(key, (declared.clone().unbind(), form.clone()));
+        }
+        Ok(form)
+    }
+
+    /// ``_settled_form``, asked of Python.
+    fn python_form(
+        &mut self,
+        index: usize,
+        declared: &B<'py>,
+        size: Option<usize>,
+    ) -> PyResult<Option<Rc<Form>>> {
+        let kind = self.b(&self.g.form_kinds[index]);
+        let found = self
+            .b(&self.g.settled_form)
+            .call1((kind, declared, &self.overrides, size))?;
+        if found.is_none() {
+            return Ok(None);
+        }
+        let keys = found.get_item(1)?;
+        let parts = Parts::read(&found.get_item(2)?, self.b(&self.g.object_type))?;
+        Ok(Some(Rc::new(Form {
+            untagged: found.get_item(0)?.is_truthy()?,
+            undeclared: keys.is(self.b(&self.g.object_type)) && parts.undeclared(),
+            keys: keys.unbind(),
+            parts: Rc::new(parts),
+        })))
+    }
+
+    /// ``_settled_form`` where ``declared`` is a builtin generic of the
+    /// container's own class, with no ``default_concrete_types``: the class
+    /// reads untagged data as itself, so the container goes untagged, its
+    /// parts declared by the generic's arguments as ``_part_types`` reads
+    /// them. ``None`` for anything else, which Python decides.
+    fn native_form(
+        &self,
+        index: usize,
+        declared: &B<'py>,
+        size: Option<usize>,
+    ) -> PyResult<Option<Form>> {
+        let py = self.py;
+        if !self.no_overrides || tp(declared) != self.b(&self.g.generic_alias).as_ptr().cast() {
+            return Ok(None);
+        }
+        let slots = &self.g.hint_slots;
+        let origin = hint_part(declared, slots.origin, intern!(py, "__origin__"))?;
+        if !origin.is(self.b(&self.g.form_kinds[index])) {
+            return Ok(None);
+        }
+        let args =
+            hint_part(declared, slots.args, intern!(py, "__args__"))?.cast_into::<PyTuple>()?;
+        let object = self.b(&self.g.object_type);
+        let declared_or_none = |item: B<'py>| (!item.is(object)).then(|| item.unbind());
+        let (keys, parts) = match index {
+            // dict, MappingProxyType: ``_entry_types``.
+            4 | 5 => {
+                let (keys, each) = if args.len() == 2 {
+                    (args.get_item(0)?, args.get_item(1)?)
+                } else {
+                    (object.clone(), object.clone())
+                };
+                (
+                    keys,
+                    Parts {
+                        each: declared_or_none(each),
+                        named: None,
+                        indexed: None,
+                    },
+                )
+            }
+            // tuple: ``_tuple_types``, fixed only for a tuple of its arity.
+            1 => {
+                if args.len() == 2 && args.get_item(1)?.is(py.Ellipsis()) {
+                    (
+                        object.clone(),
+                        Parts {
+                            each: declared_or_none(args.get_item(0)?),
+                            named: None,
+                            indexed: None,
+                        },
+                    )
+                } else {
+                    if size != Some(args.len()) {
+                        return Ok(None);
+                    }
+                    (
+                        object.clone(),
+                        Parts {
+                            each: None,
+                            named: None,
+                            indexed: Some(args.unbind()),
+                        },
+                    )
+                }
+            }
+            // list, set, frozenset: ``_element_type``.
+            _ => {
+                let each = if args.len() == 1 {
+                    args.get_item(0)?
+                } else {
+                    object.clone()
+                };
+                (
+                    object.clone(),
+                    Parts {
+                        each: declared_or_none(each),
+                        named: None,
+                        indexed: None,
+                    },
+                )
+            }
+        };
+        Ok(Some(Form {
+            untagged: true,
+            undeclared: keys.is(object) && parts.undeclared(),
+            keys: keys.unbind(),
+            parts: Rc::new(parts),
+        }))
+    }
+
+    /// Dataclass ``kind``'s field types and their parts, ``None`` for any
+    /// other class; kept while the class keeps its stamp.
+    fn record_fields(&mut self, kind: &B<'py>) -> PyResult<Option<(B<'py>, Rc<Parts>)>> {
+        let py = self.py;
+        let key = kind.as_ptr() as usize;
+        if let Some(decisions) = self.decided()? {
+            if let Some((_, stamp, fields)) = decisions.fields.get(&key)
+                && stamp.holds(kind)
+            {
+                return Ok(fields
+                    .as_ref()
+                    .map(|(types, parts)| (types.bind(py).clone(), parts.clone())));
+            }
+            if let Some((_, stamp, at, (types, parts))) = decisions.pending.get(&key)
+                && sync::MODULES.generation() == Some(*at)
+                && stamp.holds(kind)
+            {
+                return Ok(Some((types.bind(py).clone(), parts.clone())));
+            }
+        }
+        let stamp = Stamp::always(kind);
+        let dataclass = unsafe {
+            !type_lookup(
+                kind.as_ptr().cast(),
+                intern!(py, "__dataclass_fields__").as_ptr(),
+            )
+            .is_null()
+        };
+        if !dataclass {
+            if let Some(decisions) = self.decided()? {
+                decisions
+                    .fields
+                    .insert(key, (kind.clone().unbind(), stamp, None));
+            }
+            return Ok(None);
+        }
+        if let Some((types, parts)) = self.native_field_types(kind)? {
+            let parts = Rc::new(parts);
+            if let Some(decisions) = self.decided()? {
+                decisions.fields.insert(
+                    key,
+                    (
+                        kind.clone().unbind(),
+                        stamp,
+                        Some((types.clone().unbind(), parts.clone())),
+                    ),
+                );
+            }
+            return Ok(Some((types, parts)));
+        }
+        // Read before the hints, so an import landing while they are read is seen.
+        let watched = self.watch_hint_namespaces(kind)?;
+        let at = sync::MODULES.generation();
+        let types = self.b(&self.g.field_types).call1((kind,))?;
+        let parts = Rc::new(Parts::named(&types, self.b(&self.g.object_type))?);
+        let cached = self.b(&self.g.field_types_cache).contains(kind)?;
+        if let Some(decisions) = self.decided()? {
+            if cached {
+                decisions.fields.insert(
+                    key,
+                    (
+                        kind.clone().unbind(),
+                        stamp,
+                        Some((types.clone().unbind(), parts.clone())),
+                    ),
+                );
+            } else if let (true, Some(at)) = (watched, at) {
+                decisions.pending.insert(
+                    key,
+                    (
+                        kind.clone().unbind(),
+                        stamp,
+                        at,
+                        (types.clone().unbind(), parts.clone()),
+                    ),
+                );
+            }
+        }
+        Ok(Some((types, parts)))
+    }
+
+    /// ``_field_types(kind)`` for a dataclass whose every annotation is a
+    /// plain hint, read as ``_plain_hints`` reads it, and its parts; ``None``
+    /// where one is not, which Python reads.
+    fn native_field_types(&mut self, kind: &B<'py>) -> PyResult<Option<(B<'py>, Parts)>> {
+        let py = self.py;
+        if optional_attr(kind, intern!(py, "__no_type_check__").as_any())?
+            .is_some_and(|flag| flag.is_truthy().unwrap_or(true))
+        {
+            return Ok(None);
+        }
+        let annotations = self.b(&self.g.annotations);
+        // Each heap base's own annotations, most derived first, as the
+        // ``__annotations__`` of a later base overrides an earlier one's.
+        let mut sources: Vec<Bound<'py, PyDict>> = Vec::new();
+        let mro = kind
+            .getattr(intern!(py, "__mro__"))?
+            .cast_into::<PyTuple>()?;
+        for base in mro.iter().rev() {
+            // ``inspect.get_annotations(base)``: the class's own, by the
+            // ``type.__annotations__`` descriptor; a builtin class has none.
+            let heap = unsafe {
+                ffi::PyType_HasFeature(base.as_ptr().cast(), ffi::Py_TPFLAGS_HEAPTYPE) != 0
+            };
+            if !heap {
+                continue;
+            }
+            // The metaclass's ``__annotations__`` data descriptor answers
+            // before the class's own dict, so this is the class's own.
+            let Ok(own) = (if base.get_type().is(self.b(&self.g.type_type)) {
+                base.getattr(intern!(py, "__annotations__"))
+            } else {
+                annotations.call_method1(intern!(py, "__get__"), (&base, base.get_type()))
+            }) else {
+                return Ok(None);
+            };
+            let Ok(own) = own.cast_into_exact::<PyDict>() else {
+                return Ok(None);
+            };
+            for (_, hint) in dict_entries(&own) {
+                if !self.plain_hint(&hint)? {
+                    return Ok(None);
+                }
+            }
+            sources.insert(0, own);
+        }
+        let fields = unsafe {
+            Bound::from_borrowed_ptr(
+                py,
+                type_lookup(
+                    kind.as_ptr().cast(),
+                    intern!(py, "__dataclass_fields__").as_ptr(),
+                ),
+            )
+        };
+        let Ok(fields) = fields.cast_into_exact::<PyDict>() else {
+            return Ok(None);
+        };
+        let Some(slots) = self.plain_slot_names(&mro)? else {
+            return Ok(None);
+        };
+        let object = self.b(&self.g.object_type);
+        let types = PyDict::new(py);
+        let named = PyDict::new(py);
+        let add = |name: &B<'py>| -> PyResult<()> {
+            let mut hint = object.clone();
+            for own in &sources {
+                if let Some(found) = own.get_item(name)? {
+                    hint = if found.is_none() {
+                        py.None().into_bound(py).get_type().into_any()
+                    } else {
+                        found
+                    };
+                    break;
+                }
+            }
+            if !hint.is(object) {
+                named.set_item(name, &hint)?;
+            }
+            types.set_item(name, hint)
+        };
+        for (name, field) in dict_entries(&fields) {
+            let regular = match &self.g.field_slots {
+                Some(slots) => slots.field_type(&field)?.is(slots.marker(py)),
+                None => field
+                    .getattr(intern!(py, "_field_type"))?
+                    .is(self.b(&self.g.field_kind)),
+            };
+            if regular {
+                add(&name)?;
+            }
+        }
+        for name in slots {
+            if !types.contains(&name)? {
+                add(&name)?;
+            }
+        }
+        let parts = Parts {
+            each: None,
+            named: (!named.is_empty()).then(|| named.unbind()),
+            indexed: None,
+        };
+        Ok(Some((types.into_any(), parts)))
+    }
+
+    /// ``reflect.slot_names`` for classes ``mro`` whose slots are none of
+    /// them private, so none is mangled; ``None`` where one is, which the
+    /// layout names. A name repeated down the MRO stays repeated.
+    fn plain_slot_names(&self, mro: &Bound<'py, PyTuple>) -> PyResult<Option<Vec<B<'py>>>> {
+        let py = self.py;
+        let mut names: Vec<B<'py>> = Vec::new();
+        for base in mro.iter() {
+            let found = unsafe {
+                let dict = (*base.as_ptr().cast::<ffi::PyTypeObject>()).tp_dict;
+                if dict.is_null() {
+                    continue;
+                }
+                ffi::PyDict_GetItemWithError(dict, intern!(py, "__slots__").as_ptr())
+            };
+            if found.is_null() {
+                if unsafe { !ffi::PyErr_Occurred().is_null() } {
+                    return Err(PyErr::fetch(py));
+                }
+                continue;
+            }
+            let slots = unsafe { Bound::from_borrowed_ptr(py, found) };
+            let declared: Vec<B<'py>> = if is_str(&slots) {
+                vec![slots]
+            } else {
+                slots.try_iter()?.collect::<PyResult<_>>()?
+            };
+            for slot in declared {
+                let Some(text) = (tp(&slot) == t_str()).then(|| utf8(&slot)).flatten() else {
+                    return Ok(None);
+                };
+                if text == b"__dict__" || text == b"__weakref__" {
+                    continue;
+                }
+                if text.starts_with(b"__") && !text.ends_with(b"__") {
+                    return Ok(None);
+                }
+                names.push(slot);
+            }
+        }
+        Ok(Some(names))
+    }
+
+    /// ``_is_plain_hint``: whether ``hint`` is its own evaluated,
+    /// ``Annotated``-free form.
+    fn plain_hint(&self, hint: &B<'py>) -> PyResult<bool> {
+        let py = self.py;
+        if hint.is_none() || hint.is(py.Ellipsis()) {
+            return Ok(true);
+        }
+        let kind = tp(hint);
+        if kind == &raw mut ffi::PyType_Type {
+            return Ok(true);
+        }
+        let union = kind == self.b(&self.g.union_type).as_ptr().cast();
+        let generic = kind == self.b(&self.g.generic_alias).as_ptr().cast();
+        if !(union || generic) {
+            return Ok(false);
+        }
+        let slots = &self.g.hint_slots;
+        let unpacked = generic
+            && match slots.unpacked {
+                Some(offset) => unsafe { *hint.as_ptr().cast::<u8>().offset(offset) != 0 },
+                None => hint.getattr(intern!(py, "__unpacked__"))?.is_truthy()?,
+            };
+        if unpacked {
+            return Ok(false);
+        }
+        let at = if generic {
+            slots.args
+        } else {
+            slots.union_args
+        };
+        for arg in hint_part(hint, at, intern!(py, "__args__"))?
+            .cast_into::<PyTuple>()?
+            .iter()
+        {
+            if !self.plain_hint(&arg)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Watch every namespace ``kind``'s hints evaluate in: each base's
+    /// module, as ``_namespaces`` finds it, and ``builtins``; ``false`` where
+    /// one cannot be watched. A base's own dict is covered by ``kind``'s stamp.
+    fn watch_hint_namespaces(&self, kind: &B<'py>) -> PyResult<bool> {
+        let py = self.py;
+        let modules = self
+            .b(&self.g.paths.sys_dict)
+            .get_item(intern!(py, "modules"))?
+            .ok_or_else(|| PyAttributeError::new_err("sys has no modules"))?;
+        let modules = modules.cast_into::<PyDict>()?;
+        if !sync::watch_namespace(py, &py.import("builtins")?.dict()) {
+            return Ok(false);
+        }
+        let mro = kind.getattr(intern!(py, "__mro__"))?;
+        for base in mro.try_iter()? {
+            let base = base?;
+            let name = base.getattr(intern!(py, "__module__"))?;
+            let Some(module) = modules.get_item(&name)? else {
+                continue;
+            };
+            let Ok(namespace) = module
+                .getattr(intern!(py, "__dict__"))?
+                .cast_into::<PyDict>()
+            else {
+                return Ok(false);
+            };
+            if !sync::watch_namespace(py, &namespace) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     #[inline(always)]
@@ -1271,7 +2283,7 @@ impl<'py, 'g> Encoder<'py, 'g> {
         declared: Option<&B<'py>>,
     ) -> PyResult<B<'py>> {
         let root = unsafe { Bound::from_borrowed_ptr(self.py, ffi::Py_None()) };
-        let done = match self.encode_node(value, frame, &root, &Slot::Index(0), declared) {
+        let done = match self.encode_node(value, frame, &root, &Slot::Index(0), declared, None) {
             Ok(done) => done,
             // Only the root's own reduce can have checked in below its parts.
             Err(error) => self.recover(error, base)?.2,
@@ -1333,7 +2345,7 @@ impl<'py, 'g> Encoder<'py, 'g> {
             return Ok((slot, done?));
         }
         let frame = self.push_frame(parent, slot.clone());
-        let done = self.encode_node(value, frame, node, &slot, declared)?;
+        let done = self.encode_node(value, frame, node, &slot, declared, None)?;
         Ok((slot, done))
     }
 
@@ -1409,6 +2421,20 @@ impl<'py, 'g> Encoder<'py, 'g> {
         parent: u32,
         declared: Option<B<'py>>,
     ) -> PyResult<()> {
+        self.part_hinted(node, slot, item, parent, declared, None)
+    }
+
+    /// ``part_as`` given whether ``declared`` implies the item's class, where
+    /// that is known.
+    fn part_hinted(
+        &mut self,
+        node: &B<'py>,
+        slot: Slot<'py>,
+        item: B<'py>,
+        parent: u32,
+        declared: Option<B<'py>>,
+        implied: Option<bool>,
+    ) -> PyResult<()> {
         if self.is_plain(&item) {
             return Ok(());
         }
@@ -1421,12 +2447,18 @@ impl<'py, 'g> Encoder<'py, 'g> {
             // part that queues nothing (the walk is shallow, so most queue
             // nothing) needs no drain; a reduce queues its checkpoint.
             let root = unsafe { Bound::from_borrowed_ptr(self.py, ffi::Py_None()) };
-            let done =
-                match self.encode_node(&item, frame, &root, &Slot::Index(0), declared.as_ref()) {
-                    Ok(done) if self.stack.len() == base => Ok(done),
-                    Ok(done) => self.drain_from(done, base),
-                    Err(error) => self.recover(error, base).map(|(_, _, done)| done),
-                };
+            let done = match self.encode_node(
+                &item,
+                frame,
+                &root,
+                &Slot::Index(0),
+                declared.as_ref(),
+                implied,
+            ) {
+                Ok(done) if self.stack.len() == base => Ok(done),
+                Ok(done) => self.drain_from(done, base),
+                Err(error) => self.recover(error, base).map(|(_, _, done)| done),
+            };
             self.stack.truncate(base);
             self.depth -= 1;
             return write(node, &slot, done?);
@@ -1450,38 +2482,44 @@ impl<'py, 'g> Encoder<'py, 'g> {
         self.stack[base..].reverse();
     }
 
-    /// ``_push_items`` with ``parts``, a ``_DeclaredParts``: each part of
-    /// ``node`` that is not plain, declared ``parts.of(index)``.
-    fn push_items_as(
+    /// ``record_implied`` for ``item``'s class under ``hint``, kept in
+    /// ``memo`` for the parts that follow: a container's parts are mostly of
+    /// one class and one declared type. The container holds each part, and so
+    /// its class, while the memo is used.
+    fn implied_memo(
         &mut self,
-        node: &Bound<'py, PyList>,
-        parent: u32,
-        parts: &B<'py>,
-    ) -> PyResult<()> {
-        let base = self.stack.len();
-        let shared = node.as_any();
-        for index in 0..node.len() {
-            let item = node.get_item(index)?;
-            if self.is_plain(&item) {
-                continue;
-            }
-            let declared = self.declared_of(parts, index.into_pyobject(self.py)?.as_any())?;
-            self.part_as(shared, Slot::Index(index), item, parent, declared)?;
+        item: &B<'py>,
+        hint: &B<'py>,
+        memo: &mut Option<(*mut ffi::PyObject, *mut ffi::PyObject, bool)>,
+    ) -> PyResult<bool> {
+        let class = tp(item).cast::<ffi::PyObject>();
+        if let Some((seen, under, implied)) = *memo
+            && seen == class
+            && under == hint.as_ptr()
+        {
+            return Ok(implied);
         }
-        self.queued(base);
-        Ok(())
+        let implied = self.record_implied(&item.get_type().into_any(), hint)?;
+        *memo = Some((class, hint.as_ptr(), implied));
+        Ok(implied)
     }
 
     /// ``parts.of(key)``, ``None`` where it is ``object``.
-    fn declared_of(&self, parts: &B<'py>, key: &B<'py>) -> PyResult<Option<B<'py>>> {
-        let declared = parts.call_method1(intern!(self.py, "of"), (key,))?;
-        Ok((!declared.is(self.b(&self.g.object_type))).then_some(declared))
+    fn declared_of(&self, parts: &Parts, key: &B<'py>) -> PyResult<Option<B<'py>>> {
+        parts.of(key, self.b(&self.g.object_type))
     }
 
-    /// ``_push_items``: each part of ``node``, as ``part`` takes it.
-    fn push_items(&mut self, node: &Bound<'py, PyList>, parent: u32) -> PyResult<()> {
+    /// ``_push_items``: each part of ``node``, as ``part`` takes it, declared
+    /// ``parts.of(index)`` where given.
+    fn push_items(
+        &mut self,
+        node: &Bound<'py, PyList>,
+        parent: u32,
+        parts: Option<&Parts>,
+    ) -> PyResult<()> {
         let base = self.stack.len();
         let shared = node.as_any();
+        let mut memo = None;
         // ``node`` is this walk's own list, which no code but it sees, so it
         // keeps its size and each item until that item is written.
         let list = node.as_ptr();
@@ -1493,7 +2531,16 @@ impl<'py, 'g> Encoder<'py, 'g> {
                 continue;
             }
             let item = unsafe { Bound::from_borrowed_ptr(self.py, raw) };
-            self.part(shared, Slot::Index(index as usize), item, parent)?;
+            let index = index as usize;
+            let declared = match parts {
+                Some(parts) => parts.item(self.py, index, self.b(&self.g.object_type))?,
+                None => None,
+            };
+            let implied = match &declared {
+                Some(hint) => Some(self.implied_memo(&item, hint, &mut memo)?),
+                None => None,
+            };
+            self.part_hinted(shared, Slot::Index(index), item, parent, declared, implied)?;
         }
         self.queued(base);
         Ok(())
@@ -1522,7 +2569,7 @@ impl<'py, 'g> Encoder<'py, 'g> {
         lead: Option<(&Bound<'py, PyString>, B<'py>)>,
         entries: Vec<(B<'py>, B<'py>)>,
         parent: u32,
-        parts: Option<&B<'py>>,
+        parts: Option<&Parts>,
     ) -> PyResult<Bound<'py, PyDict>> {
         let py = self.py;
         let size = entries.len() + usize::from(lead.is_some());
@@ -1566,7 +2613,7 @@ impl<'py, 'g> Encoder<'py, 'g> {
         &mut self,
         node: &Bound<'py, PyDict>,
         parent: u32,
-        parts: Option<&B<'py>>,
+        parts: Option<&Parts>,
     ) -> PyResult<()> {
         let base = self.stack.len();
         let shared = node.as_any();
@@ -1754,12 +2801,14 @@ impl<'py, 'g> Encoder<'py, 'g> {
     /// ``value`` encoded as ``_encode_object`` with its slots read in place,
     /// when its class is one whose every fact ``encode_object`` would read is
     /// known, or read now in one pass; ``None`` leaves it to ``encoder_of``.
+    /// Untagged where ``implied`` and its field types name every member.
     #[inline]
     fn encode_planned(
         &mut self,
         value: &B<'py>,
         kind: &B<'py>,
         frame: u32,
+        implied: bool,
     ) -> PyResult<Option<B<'py>>> {
         let now = self.current()?;
         if !self.env.names_own {
@@ -1770,38 +2819,50 @@ impl<'py, 'g> Encoder<'py, 'g> {
         let planned = match (self.known(kind, now), now) {
             (Some(info), _) => {
                 let layout = info.layouts[usize::from(sort)].as_ref();
-                match (&info.encoder, &info.path, layout) {
-                    (Some(Kept::Native(Nat::Object)), Some(path), Some(layout))
+                match (&info.encoder, layout) {
+                    (Some(Kept::Native(Nat::Object)), Some(layout))
                         if matches!(layout.reading, Reading::Slots | Reading::Dict) =>
                     {
-                        path.current(paths, kind)?
-                            .map(|path| (path, layout.clone()))
+                        // An implied record writes no path, so needs none kept.
+                        match (implied, &info.path) {
+                            (true, _) => Some((None, layout.clone())),
+                            (false, Some(path)) => path
+                                .current(paths, kind)?
+                                .map(|path| (Some(path), layout.clone())),
+                            (false, None) => None,
+                        }
                     }
                     _ => None,
                 }
             }
             (None, Some(now)) => {
-                return self.first_sight(value, kind, frame, now, sort);
+                return self.first_sight(value, kind, frame, now, sort, implied);
             }
             (None, _) => return Ok(None),
         };
         let Some((path, layout)) = planned else {
             return Ok(None);
         };
-        let path = self.short_name(kind)?.unwrap_or(path);
+        // ``classes`` need not list a record whose class is implied.
+        let path = match path {
+            None => None,
+            Some(path) => Some(self.short_name(kind)?.unwrap_or(path)),
+        };
         self.object_fast(value, kind, path, &layout, sort, frame, true)
     }
 
     /// ``encode_object`` read from ``layout``: a ``Reading::Slots`` class's
-    /// slots, or a ``Reading::Dict`` instance's dict by ``dict_read``. ``None``, with nothing
-    /// registered, where neither applies. ``register`` registers ``value``
-    /// once the read is certain, for a caller that has not.
+    /// slots, or a ``Reading::Dict`` instance's dict by ``dict_read``.
+    /// ``None``, with nothing registered, where neither applies. ``register``
+    /// registers ``value`` once the read is certain, for a caller that has
+    /// not. Without a ``path`` the record is implied: untagged where its field
+    /// types name every member, which a slotted dataclass's always do.
     #[allow(clippy::too_many_arguments)]
     fn object_fast(
         &mut self,
         value: &B<'py>,
         kind: &B<'py>,
-        path: B<'py>,
+        path: Option<B<'py>>,
         layout: &Layout,
         sort: bool,
         frame: u32,
@@ -1811,19 +2872,42 @@ impl<'py, 'g> Encoder<'py, 'g> {
             if register {
                 self.register(value, frame);
             }
-            return self.direct_object(value, path, layout, frame).map(Some);
+            return self
+                .direct_object(value, kind, path, layout, frame)
+                .map(Some);
         }
         if !(layout.reading == Reading::Dict && layout.stamp.holds(kind)) {
             return Ok(None);
         }
+        // Read before the members, which the dict holds only until code runs.
+        let types = match &path {
+            None => self.record_fields(kind)?.map(|(types, _)| types),
+            Some(_) => None,
+        };
         let mut found = [std::ptr::null_mut(); DICT_LIMIT];
         let Some((_dict, order)) = self.dict_read(value, kind, layout, sort, &mut found)? else {
             return Ok(None);
         };
+        if path.is_none() {
+            // Exact str names test no code against the types; a member they
+            // do not name leaves the record to the general reading.
+            let Some(types) = &types else {
+                return Ok(None);
+            };
+            let pending = self.g.pending.as_ptr();
+            for &(index, _) in &order.members {
+                if found[index as usize] != pending
+                    && !types.contains(order.keys[index as usize].bind(self.py))?
+                {
+                    return Ok(None);
+                }
+            }
+        }
         if register {
             self.register(value, frame);
         }
-        self.dict_object(path, &order, &found, frame).map(Some)
+        self.dict_object(path, &order, &found, frame, kind)
+            .map(Some)
     }
 
     fn native_or_foreign(&self, func: B<'py>) -> Enc<'py> {
@@ -1845,6 +2929,7 @@ impl<'py, 'g> Encoder<'py, 'g> {
         frame: u32,
         now: u64,
         sort: bool,
+        implied: bool,
     ) -> PyResult<Option<B<'py>>> {
         let py = self.py;
         let env = &self.env;
@@ -1876,18 +2961,21 @@ impl<'py, 'g> Encoder<'py, 'g> {
         {
             return Ok(None);
         }
-        let mut offsets = [None; STACK_SLOTS];
-        let Some(read) = (unsafe { own_offsets(class, sort, py, &mut offsets) }) else {
+        let mut stack = [None; STACK_SLOTS];
+        let mut heap = Vec::new();
+        let Some(first) = (unsafe { own_offsets(class, sort, py, &mut stack) }) else {
             return Ok(None);
         };
-        // More slots than the stack holds: read again into the heap.
-        let spilled = (read.count > STACK_SLOTS)
-            .then(|| own_layout(class, &Stamp::none(), sort, py))
-            .flatten();
-        let offsets = match &spilled {
-            Some(layout) => &layout.offsets[..],
-            None if read.count <= STACK_SLOTS => &offsets[..read.count],
-            None => return Ok(None),
+        // More slots than the stack holds: read again into a buffer of their size.
+        let (read, offsets) = if first.count <= STACK_SLOTS {
+            let count = first.count;
+            (first, &stack[..count])
+        } else {
+            heap.resize(first.count, None);
+            let Some(read) = (unsafe { own_offsets(class, sort, py, &mut heap) }) else {
+                return Ok(None);
+            };
+            (read, &heap[..])
         };
         let Some(path) = self.native_import_path(kind)? else {
             return Ok(None);
@@ -1895,9 +2983,7 @@ impl<'py, 'g> Encoder<'py, 'g> {
         // The slots were read from the class's own dict; a dataclass is one
         // whose MRO finds ``__dataclass_fields__``, which for a class
         // straight under ``object`` means its own dict.
-        if unsafe { type_lookup(class, intern!(py, "__dataclass_fields__").as_ptr()) }.is_null()
-            || self.implies(kind)?
-        {
+        if unsafe { type_lookup(class, intern!(py, "__dataclass_fields__").as_ptr()) }.is_null() {
             return Ok(None);
         }
         // Most classes a cold walk meets are met once: one is kept only when
@@ -1939,12 +3025,16 @@ impl<'py, 'g> Encoder<'py, 'g> {
         if !sort && layout.is_none() {
             return Ok(None);
         }
-        // The class's facts keep its import path; the node takes its name.
-        let path = self.short_name(kind)?.unwrap_or(path);
+        // The class's facts keep its import path; the node takes its name,
+        // and an implied record none.
+        let path = match implied {
+            true => None,
+            false => Some(self.short_name(kind)?.unwrap_or(path)),
+        };
         self.register(value, frame);
         let done = match &layout {
-            Some(layout) => self.direct_object(value, path, layout, frame),
-            None => self.direct_slots(value, path, read.names, offsets, frame),
+            Some(layout) => self.direct_object(value, kind, path, layout, frame),
+            None => self.direct_slots(value, kind, path, read.names, offsets, frame, None),
         };
         done.map(Some)
     }
@@ -1964,19 +3054,11 @@ impl<'py, 'g> Encoder<'py, 'g> {
             return Ok(encoder.bind(self.py));
         }
         let before = Stamp::always(kind);
-        let (mut encoder, keepable) = self.resolve_encoder(kind)?;
-        if matches!(encoder, Enc::Native(Nat::Object)) && self.implies(kind)? {
-            encoder = Enc::Native(Nat::Implied);
-        }
+        let (encoder, keepable) = self.resolve_encoder(kind)?;
         if keepable && let Some(info) = self.keep(kind, now, &before) {
             info.encoder = Some(encoder.kept());
         }
         Ok(encoder)
-    }
-
-    /// ``record_implies(kind)``.
-    fn implies(&self, kind: &B<'py>) -> PyResult<bool> {
-        self.b(&self.g.record_implies).call1((kind,))?.is_truthy()
     }
 
     /// ``_ENCODERS.get(kind) or _ENCODER_CACHE.get(kind)``, else what the
@@ -2063,8 +3145,19 @@ impl<'py, 'g> Encoder<'py, 'g> {
     }
 
     /// ``_import_path(value)``, and whether ``_IMPORT_PATHS`` answered.
-    fn import_path(&self, value: &B<'py>) -> PyResult<(B<'py>, bool)> {
+    fn import_path(&mut self, value: &B<'py>) -> PyResult<(B<'py>, bool)> {
         let py = self.py;
+        let g = self.g;
+        let key = value.as_ptr() as usize;
+        // An ``_IMPORT_PATHS`` entry found before, with the check that read
+        // it: the dict is watched, so the entry stands while the decisions do.
+        if let Some(decisions) = self.decided()?
+            && let Some((held, path, check)) = decisions.paths.get(&key)
+            && held.is(value)
+            && check.holds(&g.paths, value)? == Some(true)
+        {
+            return Ok((path.bind(py).clone(), true));
+        }
         // ``_import_path`` trusts an entry only while its path still names the
         // value (``resolves_to``), which is read natively where it can be; any
         // other entry is ``_import_path``'s to judge, below.
@@ -2081,6 +3174,11 @@ impl<'py, 'g> Encoder<'py, 'g> {
             if let Some(check) = PathCheck::loaded(&self.g.paths, &path)?
                 && check.holds(&self.g.paths, value)? == Some(true)
             {
+                if let Some(decisions) = self.decided()? {
+                    let kept = (value.clone().unbind(), path.clone().unbind(), check);
+                    let stale = decisions.paths.insert(key, kept);
+                    drop(stale);
+                }
                 return Ok((path, true));
             }
         }
@@ -2324,7 +3422,8 @@ impl<'py, 'g> Encoder<'py, 'g> {
 
     /// ``_encode_node``: a leaf, a ``py/ref`` repeat, a hook, or the encoder's
     /// output. ``node`` and ``slot`` are where the output is written, which a
-    /// reduce's checkpoint needs.
+    /// reduce's checkpoint needs. ``implied`` is whether ``declared`` implies
+    /// the value's class, where the caller knows.
     fn encode_node(
         &mut self,
         value: &B<'py>,
@@ -2332,6 +3431,7 @@ impl<'py, 'g> Encoder<'py, 'g> {
         node: &B<'py>,
         slot: &Slot<'py>,
         declared: Option<&B<'py>>,
+        implied: Option<bool>,
     ) -> PyResult<B<'py>> {
         if let Some(done) = self.leaf(value) {
             return done;
@@ -2351,31 +3451,6 @@ impl<'py, 'g> Encoder<'py, 'g> {
                 )));
             }
         }
-        if let Some(declared) = declared {
-            let kind = value.get_type().into_any();
-            if !self.hooks_are_immutable_empty && self.hooks.contains(&kind)? {
-                return self.encode_hooked(value, &kind, frame);
-            }
-            let encoder = self.encoder_of(&kind)?;
-            return match encoder {
-                Enc::Native(Nat::Object | Nat::Implied) => {
-                    self.encode_record_as(value, &kind, frame, declared)
-                }
-                Enc::Native(nat @ (Nat::Path | Nat::Uuid | Nat::Datetime | Nat::Reduce)) => {
-                    let text = self.b(&self.g.untagged_leaf).call1((value, declared))?;
-                    if text.is_none() {
-                        self.run(Enc::Native(nat), value, &kind, frame, node, slot)
-                    } else {
-                        Ok(text)
-                    }
-                }
-                Enc::Native(nat) => match form_index(nat) {
-                    Some(index) => self.encode_declared(value, nat, index, frame, declared),
-                    None => self.run(Enc::Native(nat), value, &kind, frame, node, slot),
-                },
-                Enc::Foreign(_) => self.foreign_as(value, frame, Some(declared)),
-            };
-        }
         // The builtin containers, while no hook and no rebound ``_ENCODERS``
         // could claim them: ``_encoder_for`` gives their native encoders.
         if self.hooks_are_immutable_empty
@@ -2383,25 +3458,64 @@ impl<'py, 'g> Encoder<'py, 'g> {
             && sync::ENCODE.rewrites() == self.generation
         {
             let exact = tp(value);
-            if exact == t_list() {
-                return self.encode_list(value, frame);
-            }
-            if exact == t_dict() {
-                return self.encode_dict(value, frame);
-            }
-            if exact == t_tuple() {
-                return self.encode_tuple(value, frame);
+            let nat = if exact == t_list() {
+                Some(Nat::List)
+            } else if exact == t_dict() {
+                Some(Nat::Dict)
+            } else if exact == t_tuple() {
+                Some(Nat::Tuple)
+            } else {
+                None
+            };
+            match (nat, declared) {
+                (Some(nat), Some(declared)) => {
+                    let index = form_index(nat).expect("a builtin container has a form");
+                    return self.encode_declared(value, nat, index, frame, declared);
+                }
+                (Some(Nat::List), None) => return self.encode_list(value, frame),
+                (Some(Nat::Dict), None) => return self.encode_dict(value, frame),
+                (Some(_), None) => return self.encode_tuple(value, frame),
+                (None, _) => {}
             }
         }
         let kind = value.get_type().into_any();
         if !self.hooks_are_immutable_empty && self.hooks.contains(&kind)? {
             return self.encode_hooked(value, &kind, frame);
         }
-        if let Some(done) = self.encode_planned(value, &kind, frame)? {
+        let implied = match (declared, implied) {
+            (Some(_), Some(implied)) => implied,
+            (Some(declared), None) => self.record_implied(&kind, declared)?,
+            (None, _) => false,
+        };
+        if let Some(done) = self.encode_planned(value, &kind, frame, implied)? {
             return Ok(done);
         }
         let encoder = self.encoder_of(&kind)?;
-        self.run(encoder, value, &kind, frame, node, slot)
+        let Some(declared) = declared else {
+            return self.run(encoder, value, &kind, frame, node, slot);
+        };
+        match encoder {
+            Enc::Native(Nat::Object) => self.encode_object(value, &kind, frame, implied),
+            // ``_untagged_leaf`` answers ``None`` for a reduced value that is
+            // neither an enum member nor a path, so it is not asked.
+            Enc::Native(Nat::Reduce)
+                if !value.is_instance(self.b(&self.g.enum_type))?
+                    && !value.is_instance(self.b(&self.g.pure_path))? =>
+            {
+                self.run(Enc::Native(Nat::Reduce), value, &kind, frame, node, slot)
+            }
+            Enc::Native(nat @ (Nat::Path | Nat::Uuid | Nat::Datetime | Nat::Reduce)) => {
+                match self.untagged_leaf(value, &kind, nat, declared)? {
+                    Some(text) => Ok(text),
+                    None => self.run(Enc::Native(nat), value, &kind, frame, node, slot),
+                }
+            }
+            Enc::Native(nat) => match form_index(nat) {
+                Some(index) => self.encode_declared(value, nat, index, frame, declared),
+                None => self.run(Enc::Native(nat), value, &kind, frame, node, slot),
+            },
+            Enc::Foreign(_) => self.foreign_as(value, frame, Some(declared)),
+        }
     }
 
     fn run(
@@ -2440,7 +3554,7 @@ impl<'py, 'g> Encoder<'py, 'g> {
             Nat::Set => self.encode_set(value, frame),
             Nat::FrozenSet => {
                 let items = self.ordered(value, frame)?;
-                self.push_items(&items, frame)?;
+                self.push_items(&items, frame, None)?;
                 self.tagged(intern!(py, "py/frozenset"), items.into_any())
             }
             Nat::Dict => self.encode_dict(value, frame),
@@ -2484,19 +3598,10 @@ impl<'py, 'g> Encoder<'py, 'g> {
             Nat::Path => self.tagged(intern!(py, "py/path"), value.str()?.into_any()),
             Nat::Uuid => self.tagged(intern!(py, "py/uuid"), value.str()?.into_any()),
             Nat::Datetime => {
-                let mut text = value.call_method0(intern!(py, "isoformat"))?;
-                let zone = value.getattr(intern!(py, "tzinfo"))?;
-                if zone.is_instance(self.b(&self.g.zoneinfo))? {
-                    let key = zone.getattr(intern!(py, "key"))?;
-                    text = pystr(
-                        py,
-                        &format!("{}[{}]", text.str()?.to_cow()?, key.str()?.to_cow()?),
-                    );
-                }
+                let text = self.datetime_text(value)?;
                 self.tagged(intern!(py, "py/datetime"), text)
             }
-            Nat::Object => self.encode_object(value, kind, frame),
-            Nat::Implied => self.encode_implied(value, kind, frame),
+            Nat::Object => self.encode_object(value, kind, frame, false),
             Nat::Hooked => self.encode_hooked(value, kind, frame),
             Nat::Unreduced => self.encode_unreduced(value, frame),
         }
@@ -2515,16 +3620,60 @@ impl<'py, 'g> Encoder<'py, 'g> {
         declared: &B<'py>,
     ) -> PyResult<B<'py>> {
         let py = self.py;
+        if let Some(done) = self.plain_generic(value, nat, index, frame, declared)? {
+            return Ok(done);
+        }
+        let size = if matches!(nat, Nat::Tuple) {
+            Some(value.len()?)
+        } else {
+            None
+        };
+        let settled = self.settled_form(index, declared, size)?;
+        // An untagged list or dict whose parts are all declared ``object`` is
+        // written as an undeclared one, by its native encoder.
+        if let Some(form) = &settled
+            && form.untagged
+            && form.undeclared
+            && matches!(nat, Nat::List | Nat::Dict)
+        {
+            return if matches!(nat, Nat::List) {
+                self.encode_list(value, frame)
+            } else {
+                self.encode_dict(value, frame)
+            };
+        }
+        // An untagged dict of plain keys is copied whole, as ``_entries``
+        // copies it, its values declared as the form says.
+        if let Some(form) = &settled
+            && form.untagged
+            && matches!(nat, Nat::Dict)
+            && tp(value) == t_dict()
+            && let Some(node) = self.plain_dict_as(value, frame, Some(&form.parts))?
+        {
+            return Ok(node);
+        }
         if !matches!(nat, Nat::Tuple | Nat::FrozenSet) {
             self.register(value, frame);
         }
-        let kind = self.b(&self.g.form_kinds[index]);
-        let form = self
-            .b(&self.g.form)
-            .call1((value, kind, declared, &self.overrides))?;
-        let untagged = form.get_item(0)?.is_truthy()?;
-        let keys = form.get_item(1)?;
-        let parts = form.get_item(2)?;
+        let (untagged, keys, parts) = match settled {
+            Some(form) => (
+                form.untagged,
+                form.keys.bind(py).clone(),
+                form.parts.clone(),
+            ),
+            None => {
+                let kind = self.b(&self.g.form_kinds[index]);
+                let form = self
+                    .b(&self.g.form)
+                    .call1((value, kind, declared, &self.overrides))?;
+                let parts = Parts::read(&form.get_item(2)?, self.b(&self.g.object_type))?;
+                (
+                    form.get_item(0)?.is_truthy()?,
+                    form.get_item(1)?,
+                    Rc::new(parts),
+                )
+            }
+        };
         if matches!(nat, Nat::Dict | Nat::MappingProxy) {
             // A tagged proxy's entries sit below the dict its tag holds; a
             // dict's sit at its own place either way, as ``from_plain`` reads them.
@@ -2546,13 +3695,12 @@ impl<'py, 'g> Encoder<'py, 'g> {
             };
         }
         let items = if matches!(nat, Nat::Set | Nat::FrozenSet) {
-            let each = parts.getattr(intern!(py, "each"))?;
-            let each = (!each.is(self.b(&self.g.object_type))).then_some(each);
+            let each = parts.each.as_ref().map(|each| each.bind(py).clone());
             self.ordered_as(value, frame, each.as_ref())?
         } else {
             self.snapshot(value)?
         };
-        self.push_items_as(&items, frame, &parts)?;
+        self.push_items(&items, frame, Some(&parts))?;
         if untagged {
             return Ok(items.into_any());
         }
@@ -2565,6 +3713,74 @@ impl<'py, 'g> Encoder<'py, 'g> {
         self.tagged(tag, items.into_any())
     }
 
+    /// ``encode_declared`` for an exact list, tuple or dict every part of
+    /// which is plain, declared a builtin generic of its own class, with no
+    /// ``default_concrete_types``: the class reads untagged data as itself
+    /// (``native_form``), and a plain part is written alike under every
+    /// declared type, so it is written untagged as an undeclared one would
+    /// be. ``None`` for any other, which ``_form`` decides.
+    fn plain_generic(
+        &mut self,
+        value: &B<'py>,
+        nat: Nat,
+        index: usize,
+        frame: u32,
+        declared: &B<'py>,
+    ) -> PyResult<Option<B<'py>>> {
+        let py = self.py;
+        if !self.no_overrides || tp(declared) != self.b(&self.g.generic_alias).as_ptr().cast() {
+            return Ok(None);
+        }
+        let slots = &self.g.hint_slots;
+        let origin = hint_part(declared, slots.origin, intern!(py, "__origin__"))?;
+        if !origin.is(self.b(&self.g.form_kinds[index]))
+            || tp(value).cast::<ffi::PyObject>() != origin.as_ptr()
+        {
+            return Ok(None);
+        }
+        let op = value.as_ptr();
+        match nat {
+            Nat::List => {
+                let plain = (0..unsafe { ffi::PyList_GET_SIZE(op) })
+                    .all(|at| unsafe { self.plain_raw(ffi::PyList_GET_ITEM(op, at)) });
+                if !plain {
+                    return Ok(None);
+                }
+                self.register(value, frame);
+                Ok(Some(self.snapshot(value)?.into_any()))
+            }
+            Nat::Tuple => {
+                let size = unsafe { ffi::PyTuple_GET_SIZE(op) };
+                let plain =
+                    (0..size).all(|at| unsafe { self.plain_raw(ffi::PyTuple_GET_ITEM(op, at)) });
+                if !plain {
+                    return Ok(None);
+                }
+                // A fixed tuple type reads untagged only a tuple of its arity.
+                let args = hint_part(declared, slots.args, intern!(py, "__args__"))?
+                    .cast_into::<PyTuple>()?;
+                let variadic = args.len() == 2 && args.get_item(1)?.is(py.Ellipsis());
+                if !variadic && args.len() != size as usize {
+                    return Ok(None);
+                }
+                Ok(Some(tuple_list(value)?.into_any()))
+            }
+            Nat::Dict => {
+                let (mut position, mut key, mut item) =
+                    (0, std::ptr::null_mut(), std::ptr::null_mut());
+                while unsafe { ffi::PyDict_Next(op, &mut position, &mut key, &mut item) } != 0 {
+                    if !unsafe { plain_key_raw(key) && self.plain_raw(item) } {
+                        return Ok(None);
+                    }
+                }
+                self.register(value, frame);
+                let copy = unsafe { Bound::from_owned_ptr_or_err(py, ffi::PyDict_Copy(op))? };
+                Ok(Some(copy))
+            }
+            _ => Ok(None),
+        }
+    }
+
     /// ``_entries``: a mapping's node at ``at``, each value declared
     /// ``parts.of(key)``; a key that is not plain is escaped, declared
     /// ``keys``, when its entry is reached.
@@ -2573,7 +3789,7 @@ impl<'py, 'g> Encoder<'py, 'g> {
         mapping: &B<'py>,
         at: u32,
         keys: &B<'py>,
-        parts: &B<'py>,
+        parts: &Parts,
     ) -> PyResult<B<'py>> {
         let py = self.py;
         let (plain, entries) = mapping_entries(mapping)?;
@@ -2584,17 +3800,16 @@ impl<'py, 'g> Encoder<'py, 'g> {
         }
         let node = PyDict::new(py).into_any();
         let object = self.b(&self.g.object_type);
-        let named = !parts.getattr(intern!(py, "named"))?.is_none();
-        let each = parts.getattr(intern!(py, "each"))?;
+        let read = parts;
         let key_declared = (!keys.is(object)).then(|| keys.clone());
         for (key, item) in entries.into_iter().rev() {
             let raw = !is_plain_key(&key)?;
             let declared = if !raw {
-                self.declared_of(parts, &key)?
-            } else if named || each.is(object) {
+                read.of(&key, object)?
+            } else if read.named.is_some() {
                 None
             } else {
-                Some(each.clone())
+                read.each.as_ref().map(|each| each.bind(py).clone())
             };
             self.stack.push(Entry::Part {
                 value: item,
@@ -2607,99 +3822,6 @@ impl<'py, 'g> Encoder<'py, 'g> {
             });
         }
         Ok(node)
-    }
-
-    /// ``_encode_object`` for a record whose field types declare its parts.
-    fn encode_implied(&mut self, value: &B<'py>, kind: &B<'py>, frame: u32) -> PyResult<B<'py>> {
-        self.register(value, frame);
-        let path = self.object_path(kind)?;
-        let members = self.object_members(value, kind)?;
-        let types = self.b(&self.g.field_types).call1((kind,))?;
-        let parts = self.record_parts_of(kind, &types)?;
-        self.record_node(Some(path), members, frame, Some(&parts))
-    }
-
-    /// ``_encode_object`` for a record declared ``declared``: untagged where
-    /// ``_implied_record`` says that type reads an untagged mapping as its class.
-    fn encode_record_as(
-        &mut self,
-        value: &B<'py>,
-        kind: &B<'py>,
-        frame: u32,
-        declared: &B<'py>,
-    ) -> PyResult<B<'py>> {
-        // ``classes`` refuses a class it lacks before anything is registered.
-        let short = self.short_name(kind)?;
-        self.register(value, frame);
-        let types = if self.b(&self.g.is_dataclass).call1((kind,))?.is_truthy()? {
-            Some(self.b(&self.g.field_types).call1((kind,))?)
-        } else {
-            None
-        };
-        let members = self.object_members(value, kind)?;
-        let mut implied = false;
-        if let Some(types) = &types {
-            let mut fits = true;
-            for (name, _) in &members {
-                if !types.contains(name)? {
-                    fits = false;
-                    break;
-                }
-            }
-            implied = fits
-                && self
-                    .b(&self.g.implied_record)
-                    .call1((kind, declared, &self.overrides))?
-                    .is_truthy()?;
-        }
-        let parts = match &types {
-            Some(types) => Some(self.record_parts_of(kind, types)?),
-            None => None,
-        };
-        let path = match (implied, short) {
-            (true, _) => None,
-            (false, Some(short)) => Some(short),
-            (false, None) => Some(self.class_path(kind)?),
-        };
-        self.record_node(path, members, frame, parts.as_ref())
-    }
-
-    /// ``_DeclaredParts(named=types)`` for record class ``kind``, kept per walk.
-    fn record_parts_of(&mut self, kind: &B<'py>, types: &B<'py>) -> PyResult<B<'py>> {
-        if let Some(parts) = self.record_parts.get(&(kind.as_ptr() as usize)) {
-            return Ok(parts.clone());
-        }
-        let kwargs = PyDict::new(self.py);
-        kwargs.set_item("named", types)?;
-        let parts = self.b(&self.g.declared_parts).call((), Some(&kwargs))?;
-        self.record_parts
-            .insert(kind.as_ptr() as usize, parts.clone());
-        Ok(parts)
-    }
-
-    /// A record's node: its ``py/object`` tag when ``path`` is given, then
-    /// its members, each declared ``parts.of(name)``.
-    fn record_node(
-        &mut self,
-        path: Option<B<'py>>,
-        members: Vec<(B<'py>, B<'py>)>,
-        frame: u32,
-        parts: Option<&B<'py>>,
-    ) -> PyResult<B<'py>> {
-        let py = self.py;
-        if members.iter().all(|(name, _)| tp(name) == t_str()) {
-            let lead = path.map(|path| (intern!(py, "py/object"), path));
-            return Ok(self.node_from_as(lead, members, frame, parts)?.into_any());
-        }
-        let node = PyDict::new(py);
-        if let Some(path) = path {
-            node.set_item(intern!(py, "py/object"), path)?;
-        }
-        for (name, member) in members {
-            node.set_item(name, member)?;
-        }
-        self.push_values_as(&node, frame, parts)?;
-        Ok(node.into_any())
     }
 
     fn encode_float(&self, value: &B<'py>) -> PyResult<B<'py>> {
@@ -2739,7 +3861,7 @@ impl<'py, 'g> Encoder<'py, 'g> {
         // Every item is read before any is encoded, so a hook that changes
         // the list mid-walk changes no output.
         let items = self.snapshot(value)?;
-        self.push_items(&items, frame)?;
+        self.push_items(&items, frame, None)?;
         Ok(items.into_any())
     }
 
@@ -2747,29 +3869,18 @@ impl<'py, 'g> Encoder<'py, 'g> {
     fn encode_tuple(&mut self, value: &B<'py>, frame: u32) -> PyResult<B<'py>> {
         let py = self.py;
         let items = if tp(value) == t_tuple() {
-            // An exact tuple's items, copied straight into a list of its size.
-            let source = value.as_ptr();
-            let size = unsafe { ffi::PyTuple_GET_SIZE(source) };
-            let list = unsafe { Bound::from_owned_ptr_or_err(py, ffi::PyList_New(size))? };
-            for index in 0..size {
-                unsafe {
-                    let item = ffi::PyTuple_GET_ITEM(source, index);
-                    ffi::Py_INCREF(item);
-                    ffi::PyList_SET_ITEM(list.as_ptr(), index, item);
-                }
-            }
-            unsafe { list.cast_into_unchecked::<PyList>() }
+            tuple_list(value)?
         } else {
             self.snapshot(value)?
         };
-        self.push_items(&items, frame)?;
+        self.push_items(&items, frame, None)?;
         self.tagged(intern!(py, "py/tuple"), items.into_any())
     }
 
     fn encode_set(&mut self, value: &B<'py>, frame: u32) -> PyResult<B<'py>> {
         self.register(value, frame);
         let items = self.ordered(value, frame)?;
-        self.push_items(&items, frame)?;
+        self.push_items(&items, frame, None)?;
         self.tagged(intern!(self.py, "py/set"), items.into_any())
     }
 
@@ -2841,6 +3952,16 @@ impl<'py, 'g> Encoder<'py, 'g> {
     /// not plain encoded into the copy in place. ``None`` when a key is not
     /// plain, which leaves the dict to ``encode_dict``'s general reading.
     fn plain_dict(&mut self, value: &B<'py>, frame: u32) -> PyResult<Option<B<'py>>> {
+        self.plain_dict_as(value, frame, None)
+    }
+
+    /// ``plain_dict`` with each value declared ``parts.of(key)``, given them.
+    fn plain_dict_as(
+        &mut self,
+        value: &B<'py>,
+        frame: u32,
+        parts: Option<&Parts>,
+    ) -> PyResult<Option<B<'py>>> {
         let py = self.py;
         let source = value.as_ptr();
         let mut position: ffi::Py_ssize_t = 0;
@@ -2857,18 +3978,25 @@ impl<'py, 'g> Encoder<'py, 'g> {
             Bound::from_owned_ptr_or_err(py, ffi::PyDict_Copy(source))?
                 .cast_into_unchecked::<PyDict>()
         };
-        self.own_parts(&node, frame)?;
+        self.own_parts(&node, frame, parts)?;
         Ok(Some(node.into_any()))
     }
 
     /// ``_push_values`` for a node this walk alone holds, every key an exact
-    /// str: each value, as ``part`` takes it. The node already holds every
-    /// member, read before any is encoded, so code an encoding runs cannot
-    /// change or free what is still to come.
-    fn own_parts(&mut self, node: &Bound<'py, PyDict>, frame: u32) -> PyResult<()> {
+    /// str: each value, as ``part`` takes it, declared ``parts.of(key)``
+    /// where given. The node already holds every member, read before any is
+    /// encoded, so code an encoding runs cannot change or free what is still
+    /// to come.
+    fn own_parts(
+        &mut self,
+        node: &Bound<'py, PyDict>,
+        frame: u32,
+        parts: Option<&Parts>,
+    ) -> PyResult<()> {
         let py = self.py;
         let base = self.stack.len();
         let shared = node.as_any();
+        let mut memo = None;
         let (mut key, mut item) = (std::ptr::null_mut(), std::ptr::null_mut());
         // No other code sees ``node``, and setting a key it holds never
         // resizes it, so its iteration stays valid.
@@ -2879,7 +4007,15 @@ impl<'py, 'g> Encoder<'py, 'g> {
             }
             let part = unsafe { Bound::from_borrowed_ptr(py, item) };
             let key = unsafe { Bound::from_borrowed_ptr(py, key) };
-            self.part(shared, Slot::Key(key), part, frame)?;
+            let declared = match parts {
+                Some(parts) => self.declared_of(parts, &key)?,
+                None => None,
+            };
+            let implied = match &declared {
+                Some(hint) => Some(self.implied_memo(&part, hint, &mut memo)?),
+                None => None,
+            };
+            self.part_hinted(shared, Slot::Key(key), part, frame, declared, implied)?;
         }
         self.queued(base);
         Ok(())
@@ -2943,10 +4079,21 @@ impl<'py, 'g> Encoder<'py, 'g> {
         intern!(py, "json://").add(text)
     }
 
-    fn encode_object(&mut self, value: &B<'py>, kind: &B<'py>, frame: u32) -> PyResult<B<'py>> {
+    /// ``_encode_object``: untagged where ``implied`` and its field types name
+    /// every member; its parts declared by those types.
+    fn encode_object(
+        &mut self,
+        value: &B<'py>,
+        kind: &B<'py>,
+        frame: u32,
+        implied: bool,
+    ) -> PyResult<B<'py>> {
         let py = self.py;
         self.register(value, frame);
-        let path = self.object_path(kind)?;
+        let mut path = match implied {
+            true => None,
+            false => Some(self.object_path(kind)?),
+        };
         if self.env.names_own {
             let sort = self.sort.get()?;
             if let Some(layout) = self.layout(kind, sort)?
@@ -2958,18 +4105,40 @@ impl<'py, 'g> Encoder<'py, 'g> {
             }
         }
         let members = self.object_members(value, kind)?;
+        if path.is_none() {
+            let mut named = false;
+            if let Some((types, _)) = self.record_fields(kind)? {
+                named = true;
+                for (name, _) in &members {
+                    if !types.contains(name)? {
+                        named = false;
+                        break;
+                    }
+                }
+            }
+            if !named {
+                path = Some(self.object_path(kind)?);
+            }
+        }
+        let parts = match members.iter().all(|(_, member)| self.is_plain(member)) {
+            true => None,
+            false => self.record_parts(kind)?,
+        };
+        let lead = path.map(|path| (intern!(py, "py/object"), path));
         // A member named ``py/object`` overwrites the tag in place, which
         // ``node_from`` cannot tell from a repeat; leave that to the dict.
         if members.iter().all(|(name, _)| tp(name) == t_str()) {
-            let node = self.node_from(Some((intern!(py, "py/object"), path)), members, frame)?;
+            let node = self.node_from_as(lead, members, frame, parts.as_deref())?;
             return Ok(node.into_any());
         }
         let node = PyDict::new(py);
-        node.set_item(intern!(py, "py/object"), path)?;
+        if let Some((tag, path)) = lead {
+            node.set_item(tag, path)?;
+        }
         for (name, member) in members {
             node.set_item(name, member)?;
         }
-        self.push_values(&node, frame)?;
+        self.push_values_as(&node, frame, parts.as_deref())?;
         Ok(node.into_any())
     }
 
@@ -2978,10 +4147,11 @@ impl<'py, 'g> Encoder<'py, 'g> {
     /// every member, then its parts taken as ``own_parts`` takes them.
     fn dict_object(
         &mut self,
-        path: B<'py>,
+        path: Option<B<'py>>,
         keys: &DictKeys,
         found: &[*mut ffi::PyObject; DICT_LIMIT],
         frame: u32,
+        kind: &B<'py>,
     ) -> PyResult<B<'py>> {
         let py = self.py;
         let pending = self.g.pending.as_ptr();
@@ -3001,9 +4171,21 @@ impl<'py, 'g> Encoder<'py, 'g> {
             parts = parts || !unsafe { self.plain_raw(member) };
         }
         if parts {
-            self.own_parts(&node, frame)?;
+            self.record_members(&node, frame, kind)?;
         }
         Ok(node.into_any())
+    }
+
+    /// A record node's parts, each declared by ``kind``'s field types, read
+    /// only now that a part needs them.
+    fn record_members(
+        &mut self,
+        node: &Bound<'py, PyDict>,
+        frame: u32,
+        kind: &B<'py>,
+    ) -> PyResult<()> {
+        let parts = self.record_parts(kind)?;
+        self.own_parts(node, frame, parts.as_deref())
     }
 
     // Perf: rows to_plain, lockstep: flat and frozen ~1.5x (from 78512ab).
@@ -3093,22 +4275,37 @@ impl<'py, 'g> Encoder<'py, 'g> {
     fn direct_object(
         &mut self,
         value: &B<'py>,
-        path: B<'py>,
+        kind: &B<'py>,
+        path: Option<B<'py>>,
         layout: &Layout,
         frame: u32,
     ) -> PyResult<B<'py>> {
-        self.direct_slots(value, path, layout.names.as_ptr(), &layout.offsets, frame)
+        let names = layout.names.as_ptr();
+        self.direct_slots(
+            value,
+            kind,
+            path,
+            names,
+            &layout.offsets,
+            frame,
+            Some(layout),
+        )
     }
 
-    /// ``direct_object`` from the slots' names, a tuple, and their offsets.
+    /// ``direct_object`` from the slots' names, a tuple, and their offsets;
+    /// untagged where ``path`` is ``None``. Its parts are declared by the
+    /// layout's slots where the layout knows them.
+    #[allow(clippy::too_many_arguments)]
     #[inline]
     fn direct_slots(
         &mut self,
         value: &B<'py>,
-        path: B<'py>,
+        kind: &B<'py>,
+        path: Option<B<'py>>,
         names: *mut ffi::PyObject,
         offsets: &[Option<isize>],
         frame: u32,
+        layout: Option<&Layout>,
     ) -> PyResult<B<'py>> {
         let py = self.py;
         let node = object_node(py, path, offsets.len())?;
@@ -3136,10 +4333,234 @@ impl<'py, 'g> Encoder<'py, 'g> {
             }
             parts = parts || !unsafe { self.plain_raw(member) };
         }
-        if parts {
-            self.own_parts(&node, frame)?;
+        if !parts {
+            return Ok(node.into_any());
+        }
+        // A kept layout keeps its plan; a class met once reads one for now.
+        let kept;
+        let once;
+        let plan = match layout {
+            Some(layout) => {
+                kept = match layout.plan.get() {
+                    Some(plan) => Some(plan.clone()),
+                    None => {
+                        let plan = self.plan(kind, layout.names.bind(py), true)?.map(Rc::new);
+                        if let Some(plan) = &plan {
+                            let _ = layout.plan.set(plan.clone());
+                        }
+                        plan
+                    }
+                };
+                kept.as_deref()
+            }
+            None => {
+                let names = unsafe { Bound::from_borrowed_ptr(py, names).cast_into_unchecked() };
+                once = self.plan(kind, &names, false)?;
+                once.as_ref()
+            }
+        };
+        match plan {
+            Some(plan) => self.declared_slots(&node, frame, kind, names, plan)?,
+            None => self.record_members(&node, frame, kind)?,
         }
         Ok(node.into_any())
+    }
+
+    /// What ``kind``'s field types declare of slots ``names``: its own
+    /// annotations, each read as a part needs it, where it has them; else its
+    /// field types, once they are known for good. ``None`` where they may yet
+    /// change. Only a plan to ``keep`` holds a field per slot to remember in;
+    /// one used once allocates none.
+    fn plan(
+        &mut self,
+        kind: &B<'py>,
+        names: &Bound<'py, PyTuple>,
+        keep: bool,
+    ) -> PyResult<Option<Plan>> {
+        let py = self.py;
+        let count = if keep { names.len() } else { 0 };
+        let fields: Box<[Field]> = (0..count).map(|_| Field::default()).collect();
+        let (annotations, parts) = match self.own_annotations(kind)? {
+            Some(annotations) => (Some(annotations.unbind()), None),
+            None => {
+                let parts = self.record_fields(kind)?.map(|(_, parts)| parts);
+                if !self
+                    .decisions
+                    .fields
+                    .contains_key(&(kind.as_ptr() as usize))
+                {
+                    return Ok(None);
+                }
+                (None, Some(parts.unwrap_or_else(|| Rc::new(Parts::none()))))
+            }
+        };
+        Ok(Some(Plan {
+            dispatch: self
+                .decisions
+                .dispatch
+                .as_ref()
+                .map(|held| (held.clone_ref(py), self.decisions.dispatch_size)),
+            annotations,
+            parts,
+            fields,
+        }))
+    }
+
+    /// The type ``kind``'s field types give slot ``name``, ``None`` for
+    /// ``object``: its annotation where that is plain, as ``_field_types``
+    /// gives it, else read from the field types; and whether it is the
+    /// annotation, which lasts.
+    fn slot_hint(
+        &mut self,
+        kind: &B<'py>,
+        annotations: &Bound<'py, PyDict>,
+        name: &B<'py>,
+    ) -> PyResult<(Option<B<'py>>, bool)> {
+        let py = self.py;
+        let object = self.b(&self.g.object_type);
+        let hint = match annotations.get_item(name)? {
+            None => return Ok((None, true)),
+            Some(hint) if hint.is_none() => py.None().into_bound(py).get_type().into_any(),
+            Some(hint) if self.plain_hint(&hint)? => hint,
+            Some(_) => {
+                let parts = self.record_parts(kind)?;
+                let hint = match &parts {
+                    Some(parts) => self.declared_of(parts, name)?,
+                    None => None,
+                };
+                return Ok((hint, false));
+            }
+        };
+        Ok(((!hint.is(object)).then_some(hint), true))
+    }
+
+    /// The annotations of a dataclass straight under ``object``, which
+    /// ``_field_types`` reads each field's type from where it is plain;
+    /// ``None`` for any other class.
+    fn own_annotations(&self, kind: &B<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
+        let py = self.py;
+        let Some(namespace) = own_namespace(kind) else {
+            return Ok(None);
+        };
+        if namespace
+            .get_item(intern!(py, "__no_type_check__"))?
+            .is_some()
+            || namespace
+                .get_item(intern!(py, "__dataclass_fields__"))?
+                .is_none()
+        {
+            return Ok(None);
+        }
+        Ok(kind
+            .getattr(intern!(py, "__annotations__"))?
+            .cast_into_exact::<PyDict>()
+            .ok())
+    }
+
+    /// ``own_parts`` for a node ``direct_slots`` built, each part declared by
+    /// its slot's field. A field's record says whether the part goes
+    /// untagged, while ``from_plain`` dispatches as it did when the plan was
+    /// read and no ``default_concrete_types`` apply; else Python is asked.
+    fn declared_slots(
+        &mut self,
+        node: &Bound<'py, PyDict>,
+        frame: u32,
+        kind: &B<'py>,
+        names: *mut ffi::PyObject,
+        plan: &Plan,
+    ) -> PyResult<()> {
+        let py = self.py;
+        let base = self.stack.len();
+        let shared = node.as_any();
+        let native = self.no_overrides
+            && plan.dispatch.as_ref().is_some_and(|(held, size)| {
+                *size == self.decisions.dispatch_size
+                    && self
+                        .decisions
+                        .dispatch
+                        .as_ref()
+                        .is_some_and(|now| now.is(held))
+            });
+        let object = self.b(&self.g.object_type);
+        let (mut key, mut item) = (std::ptr::null_mut(), std::ptr::null_mut());
+        let mut position: ffi::Py_ssize_t = 0;
+        let mut index = 0;
+        // As in ``own_parts``: no other code sees ``node``, so its iteration
+        // stays valid. Its keys are its tag, then the slots' own names, in
+        // slot order.
+        let tag = intern!(py, "py/object").as_ptr();
+        while unsafe { ffi::PyDict_Next(node.as_ptr(), &mut position, &mut key, &mut item) } != 0 {
+            // ``object_node`` keys its tag by this very str; no slot is named so.
+            if key == tag {
+                continue;
+            }
+            while unsafe { ffi::PyTuple_GET_ITEM(names, index as ffi::Py_ssize_t) } != key {
+                index += 1;
+            }
+            let field = plan.fields.get(index);
+            index += 1;
+            if unsafe { self.plain_raw(item) } {
+                continue;
+            }
+            let part = unsafe { Bound::from_borrowed_ptr(py, item) };
+            let key = unsafe { Bound::from_borrowed_ptr(py, key) };
+            let held = field.and_then(|field| field.hint.get());
+            let hint = match (held, &plan.annotations, &plan.parts) {
+                (Some(hint), _, _) => hint.as_ref().map(|hint| hint.bind(py).clone()),
+                (None, annotations, parts) => {
+                    let (hint, lasting) = match (annotations, parts) {
+                        (Some(annotations), _) => {
+                            self.slot_hint(kind, annotations.bind(py), &key)?
+                        }
+                        (None, Some(parts)) => (parts.of(&key, object)?, true),
+                        (None, None) => (None, true),
+                    };
+                    if let Some(field) = field
+                        && lasting
+                    {
+                        let _ = field
+                            .hint
+                            .set(hint.as_ref().map(|hint| hint.clone().unbind()));
+                    }
+                    hint
+                }
+            };
+            let Some(hint) = hint else {
+                self.part_hinted(shared, Slot::Key(key), part, frame, None, None)?;
+                continue;
+            };
+            // A record is kept with the field only once its hint is.
+            let fresh;
+            let record = match (native, field) {
+                (false, _) => None,
+                (true, Some(field)) if field.hint.get().is_some() => match field.record.get() {
+                    Some(record) => Some(record),
+                    None => {
+                        let record = self.record_of(&hint)?;
+                        Some(field.record.get_or_init(|| record))
+                    }
+                },
+                (true, _) => {
+                    fresh = self.record_of(&hint)?;
+                    Some(&fresh)
+                }
+            };
+            let implied = match record {
+                Some(Record::None) => false,
+                Some(Record::Class(record)) => record.as_ptr() == tp(&part).cast(),
+                _ => self.record_implied(&part.get_type().into_any(), &hint)?,
+            };
+            self.part_hinted(
+                shared,
+                Slot::Key(key),
+                part,
+                frame,
+                Some(hint),
+                Some(implied),
+            )?;
+        }
+        self.queued(base);
+        Ok(())
     }
 
     /// Each ``(name, getattr(value, name))`` for the names
@@ -3279,7 +4700,7 @@ impl<'py, 'g> Encoder<'py, 'g> {
         let path = self.class_path(kind)?;
         let raw = hook_payload(&encode_hook, value, kind, &path)?;
         let node = PyList::new(py, [path, raw])?;
-        self.push_items(&node, frame)?;
+        self.push_items(&node, frame, None)?;
         self.tagged(intern!(py, "py/hook"), node.into_any())
     }
 
@@ -3315,7 +4736,7 @@ impl<'py, 'g> Encoder<'py, 'g> {
             frame,
         });
         let parts = PyList::new(py, parts)?;
-        self.push_items(&parts, frame)?;
+        self.push_items(&parts, frame, None)?;
         self.tagged(intern!(py, "py/reduce"), parts.into_any())
     }
 
@@ -3577,7 +4998,7 @@ impl<'py, 'g> Encoder<'py, 'g> {
                 .getattr(intern!(py, "__dict__"))?
                 .contains(intern!(py, "__slots__"))?
         {
-            return self.encode_object(value, kind.as_any(), frame);
+            return self.encode_object(value, kind.as_any(), frame, false);
         }
         if kind.is_subclass(self.b(&self.g.mapping))? {
             return self.encode_dict(value, frame);
@@ -3836,8 +5257,9 @@ pub fn to_plain<'py>(
             class_names,
             Writer::idle(),
         )?;
-        encoder.overrides = overrides;
+        encoder.adopt(overrides)?;
         let tree = encoder.walk_as(obj, ROOT, declared.as_ref());
+        encoder.release()?;
         // Moved out whole: a default ``Classes`` left in their place would
         // allocate and zero its tables only to drop them.
         let Encoder {
@@ -4195,6 +5617,9 @@ impl<'py> Encoder<'py, '_> {
             return self.text_hooked(value, &kind, frame);
         }
         if let Some((path, known)) = self.cached_object(&kind)? {
+            if self.record_parts(&kind)?.is_some() {
+                return self.text_declared(value, frame);
+            }
             let path = self.short_name(&kind)?.unwrap_or(path);
             self.register(value, frame);
             if let Some((layout, sort)) = known
@@ -4400,11 +5825,6 @@ impl<'py> Encoder<'py, '_> {
                 self.text_tagged("py/datetime", &text)
             }
             Nat::Object => self.text_object(value, kind, frame),
-            Nat::Implied => {
-                let tree = self.walk_node(value, frame)?;
-                self.text_tree(tree);
-                Ok(())
-            }
             Nat::Hooked => self.text_hooked(value, kind, frame),
             Nat::Unreduced => self.text_unreduced(value, frame),
         }
@@ -4658,6 +6078,7 @@ impl<'py> Encoder<'py, '_> {
         self.w.open_tag(b"py/object");
         self.w.str(path);
         let count = layout.len();
+        let key_texts = layout.key_texts(py);
         let mut index = 0;
         while index < count {
             let offset = layout.offsets[index].expect("all slots have offsets");
@@ -4674,7 +6095,7 @@ impl<'py> Encoder<'py, '_> {
             }
             let mark = self.w.buf.len();
             self.w.item_sep();
-            match &layout.key_texts[index] {
+            match &key_texts[index] {
                 Some(text) => self.w.raw(text),
                 None => self.w.str(&layout.name(py, index)),
             }
@@ -4767,7 +6188,18 @@ impl<'py> Encoder<'py, '_> {
         Ok(true)
     }
 
+    /// A record whose field types declare its parts, which only the tree
+    /// walk writes as declared: built, and its tree written.
+    fn text_declared(&mut self, value: &B<'py>, frame: u32) -> Text<()> {
+        let tree = self.walk_node(value, frame)?;
+        self.text_tree(tree);
+        Ok(())
+    }
+
     fn text_object(&mut self, value: &B<'py>, kind: &B<'py>, frame: u32) -> Text<()> {
+        if self.record_parts(kind)?.is_some() {
+            return self.text_declared(value, frame);
+        }
         self.register(value, frame);
         let path = self.object_path(kind)?;
         self.text_object_rest(value, kind, path, frame)
@@ -4950,8 +6382,9 @@ pub fn to_json<'py>(
         class_names,
         Writer::new(style),
     )?;
-    encoder.overrides = overrides;
+    encoder.adopt(overrides)?;
     let done = encoder.text_walk(obj);
+    encoder.release()?;
     let Encoder {
         classes,
         frames,

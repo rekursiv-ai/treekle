@@ -133,6 +133,17 @@ class HintedLaterOptional(TypedDict):
     name: NotRequired[str]
 
 
+# ``Rational`` is imported for type checking only, so this alias's value raises
+# ``NameError`` when evaluated.
+type _LateRationals = list[Rational]
+
+
+@dataclass(kw_only=True, slots=True)
+class HintedLaterAlias:
+    points: _LateRationals
+    count: int
+
+
 @dataclass(kw_only=True, slots=True)
 class HintedLaterLocal:
     Size = int  # Bound only in the class body, so only its locals name it.
@@ -1443,6 +1454,18 @@ class TestReferenceFit:
         with pytest.raises(ReadError):
             from_plain([["a"], {"py/ref": [0]}], tuple[list[str], list[int]])
 
+    def test_a_tuple_judged_whole_fits_by_each_item(self) -> None:
+        assert deserialize._fits((1, "a"), tuple[int, str], whole=True)
+        assert not deserialize._fits((1, 2), tuple[int, str], whole=True)
+
+    def test_a_referenced_tuple_must_fit_a_fixed_arity(self) -> None:
+        with pytest.raises(ReadError):
+            from_plain(
+                [[1], {"py/ref": [0]}],
+                tuple[Sequence[int], tuple[int, str]],
+                default_concrete_types=_FROZEN,
+            )
+
     def test_a_reference_fitting_its_element_types_reads(self) -> None:
         first, second = from_plain(
             [[1], {"py/ref": [0]}],
@@ -2404,6 +2427,13 @@ class TestDispatch:
     ) -> None:
         assert from_plain(data, target) == expected
 
+    # With no class to build, a ``py/object`` reads as data, not by its tag.
+    def test_a_record_fitting_no_member_is_not_read_as_data(self) -> None:
+        record: MutablePlainTree = {"py/object": f"{__name__}.Point", "x": "one"}
+
+        with pytest.raises(ReadError):
+            from_plain([record], list[Point | Square])
+
     def test_an_object_mapping_is_numbered_where_it_sits(self) -> None:
         tree: MutablePlainTree = [
             {"py/tuple": []},
@@ -2976,6 +3006,13 @@ class TestFieldTypes:
             "count": int,
         }
         assert HintedLater not in deserialize._FIELD_TYPES
+
+    def test_an_alias_whose_value_does_not_evaluate_reads_as_object(self) -> None:
+        assert dict(deserialize._field_types(HintedLaterAlias)) == {
+            "points": object,
+            "count": int,
+        }
+        assert HintedLaterAlias not in deserialize._FIELD_TYPES
 
     def test_a_class_with_an_unresolved_hint_retries_only_that_hint(
         self,
