@@ -3003,7 +3003,7 @@ impl<'py, 'g> Encoder<'py, 'g> {
                 stamp,
                 generation: now,
                 encoder: Some(Kept::Native(Nat::Object)),
-                path: Some(KeptPath::new(&path, kind)?),
+                path: Some(KeptPath::new(&path)),
                 layouts,
                 enum_member: None,
                 own_reduce: None,
@@ -3209,7 +3209,7 @@ impl<'py, 'g> Encoder<'py, 'g> {
         let before = Stamp::always(kind);
         let (path, keepable) = self.import_path(kind)?;
         if keepable {
-            let kept = KeptPath::new(&path, kind)?;
+            let kept = KeptPath::new(&path);
             if let Some(info) = self.keep(kind, now, &before) {
                 info.path = Some(kept);
             }
@@ -4529,10 +4529,13 @@ impl<'py, 'g> Encoder<'py, 'g> {
                 self.part_hinted(shared, Slot::Key(key), part, frame, None, None)?;
                 continue;
             };
-            // A record is kept with the field only once its hint is.
-            let fresh;
+            // A builtin class is no record, whatever the hint builds (as
+            // ``record_implied`` says), so its hint is not read for one.
+            let heap = unsafe { ffi::PyType_HasFeature(tp(&part), ffi::Py_TPFLAGS_HEAPTYPE) != 0 };
+            // A record is kept with the field only once its hint is; else
+            // ``record_implied`` reads it, kept by hint among the decisions.
             let record = match (native, field) {
-                (false, _) => None,
+                _ if !heap => Some(&Record::None),
                 (true, Some(field)) if field.hint.get().is_some() => match field.record.get() {
                     Some(record) => Some(record),
                     None => {
@@ -4540,10 +4543,7 @@ impl<'py, 'g> Encoder<'py, 'g> {
                         Some(field.record.get_or_init(|| record))
                     }
                 },
-                (true, _) => {
-                    fresh = self.record_of(&hint)?;
-                    Some(&fresh)
-                }
+                _ => None,
             };
             let implied = match record {
                 Some(Record::None) => false,

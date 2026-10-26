@@ -1007,24 +1007,36 @@ type Through = Vec<(Py<PyAny>, Stamp)>;
 /// A class's path kept with its facts, and how to recheck it.
 pub struct KeptPath {
     pub path: Py<PyAny>,
-    pub check: Option<PathCheck>,
+    // Perf: cold exp000 to_plain: most kept classes are implied records whose
+    // path is never read again, so the check is built on its first use.
+    check: std::cell::OnceCell<Option<PathCheck>>,
 }
 
 impl KeptPath {
-    /// ``path`` for ``kind``, rechecked from ``kind.__module__``.
-    pub fn new(path: &B<'_>, kind: &B<'_>) -> PyResult<Self> {
-        let module = kind.getattr(intern!(path.py(), "__module__"))?;
-        Ok(Self {
+    /// ``path`` for ``kind``, rechecked from ``kind.__module__`` once asked.
+    pub fn new(path: &B<'_>) -> Self {
+        Self {
             path: path.clone().unbind(),
-            check: PathCheck::new(path, &module),
-        })
+            check: std::cell::OnceCell::new(),
+        }
     }
 
     /// The path, while it still names ``kind``.
     #[inline]
     pub fn current<'py>(&self, g: &PathGlobals, kind: &B<'py>) -> PyResult<Option<B<'py>>> {
         let py = kind.py();
-        let Some(check) = &self.check else {
+        let check = match self.check.get() {
+            Some(check) => check,
+            None => {
+                let path = self.path.bind(py);
+                let check = kind
+                    .getattr(intern!(py, "__module__"))
+                    .ok()
+                    .and_then(|module| PathCheck::new(path, &module));
+                self.check.get_or_init(|| check)
+            }
+        };
+        let Some(check) = check else {
             return Ok(None);
         };
         Ok((check.holds(g, kind)? == Some(true)).then(|| self.path.bind(py).clone()))
