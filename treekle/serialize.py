@@ -166,8 +166,10 @@ def to_plain(
       classes: Short names to write in ``py/object`` in place of import paths;
         when given, no other class is written as ``py/object``.
       sort: Order each object's attributes by name; when false, keep slots in
-        MRO order then ``__dict__`` keys in insertion order. A stored form that
-        must stay byte-stable sets this false.
+        MRO order then ``__dict__`` keys in insertion order. A class with no
+        instance dict has no ``__dict__`` keys, whatever its ``__getattr__`` or
+        ``__getattribute__`` answers. A stored form that must stay
+        byte-stable sets this false.
       target: The type ``from_plain`` will read the tree as. A container whose
         declared type there builds its class from untagged data is written
         untagged; ``object`` declares nothing, so the tree reads by tags alone.
@@ -738,13 +740,14 @@ def _encode_key(key: object, state: _Encoding, declared: object = object) -> str
     # those parts under the key's own text, which is not known until the key is
     # written. So the parts get places under ``_IN_KEY``, which ``_reference``
     # never names. A ``py/ref`` to a value written before the key still works.
-    mark, here = len(state.alive), state.here
+    # The caller sets ``state.here`` again before anything reads it: ``_encode``
+    # for the entry's value, or ``_recover`` for a reduce restarted.
+    mark = len(state.alive)
     state.here = _IN_KEY
     try:
         encoded = _encode(key, state, declared)
     finally:
         _rollback(state, mark)
-        state.here = here
     return "json://" + json.dumps(encoded)
 
 

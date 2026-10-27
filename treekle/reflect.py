@@ -19,7 +19,7 @@ import weakref
 
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Callable, Iterable
 
 
 __all__ = [
@@ -133,7 +133,7 @@ def resolves_to(path: str, value: object) -> bool:
     return False
 
 
-def class_tags(classes: Mapping[str, object]) -> dict[type, str]:
+def class_tags[K](classes: Mapping[K, object]) -> dict[type, str]:
     """Return each class in ``classes`` by its short name, checking the mapping.
 
     Args:
@@ -249,12 +249,16 @@ def attribute_names(value: object, *, sort: bool = True) -> tuple[str, ...]:
         ``__dict__`` keys in insertion order.
 
     Returns:
-      names: Each name once; an unset slot is still named.
+      names: Each name once; an unset slot is still named. A class with no
+        instance dict contributes no ``__dict__`` keys.
 
     """
-    slots = slot_names(type(value))
+    kind = type(value)
+    slots = slot_names(kind)
     if sort:
-        slots = _SORTED_SLOT_NAMES.get(type(value)) or _sorted_slots(type(value))
+        slots = _SORTED_SLOT_NAMES.get(kind) or _sorted_slots(kind)
+    if _dictless(kind):
+        return slots
     state = getattr(value, "__dict__", None)
     if not state:
         return slots
@@ -262,6 +266,17 @@ def attribute_names(value: object, *, sort: bool = True) -> tuple[str, ...]:
     if not extra:
         return slots
     return tuple(sorted((*slots, *extra))) if sort else (*slots, *extra)
+
+
+# A class with no dict storage and no ``__dict__`` in its MRO holds no
+# ``__dict__`` state, whatever a ``__getattr__`` would answer for it. Read
+# through ``type``'s own descriptors: a metaclass may answer ``__dictoffset__``
+# or ``__mro__`` as it likes, and the instance dict is there all the same.
+def _dictless(kind: type) -> bool:
+    """Return whether ``kind``'s instances hold no ``__dict__`` state."""
+    return _DICT_OFFSET(kind) == 0 and not any(
+        "__dict__" in _OWN_ATTRIBUTES(base) for base in _MRO(kind)
+    )
 
 
 def _sorted_slots(kind: type) -> tuple[str, ...]:
@@ -315,6 +330,24 @@ def _walk(start: object, parts: Iterable[str]) -> object:
         if resolved is PENDING:
             break
     return resolved
+
+
+_DICT_OFFSET: Final = cast(
+    "Callable[[type], int]",
+    vars(type)["__dictoffset__"].__get__,
+)
+"""``type.__dictoffset__`` of a class, read past its metaclass."""
+
+
+_MRO: Final = cast("Callable[[type], tuple[type, ...]]", vars(type)["__mro__"].__get__)
+"""``type.__mro__`` of a class, read past its metaclass."""
+
+
+_OWN_ATTRIBUTES: Final = cast(
+    "Callable[[type], Mapping[str, object]]",
+    vars(type)["__dict__"].__get__,
+)
+"""``vars(base)`` of a class, read past its metaclass."""
 
 
 _SPLITS: Final[dict[str, tuple[tuple[str, tuple[str, ...]], ...]]] = {}

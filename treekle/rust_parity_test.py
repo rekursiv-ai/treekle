@@ -31,6 +31,7 @@ from typing import (
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
+import abc
 import contextlib
 import datetime as dt
 import gc
@@ -62,6 +63,7 @@ if TYPE_CHECKING:
     from _collections_abc import dict_items
     from abc import ABCMeta
     from collections.abc import Callable
+    from types import FrameType
 
     from treekle.types import Dialect, Hooks, PlainTree
 
@@ -2711,8 +2713,8 @@ class _SlotsDictFromGetattr:
         raise AttributeError(name)
 
 
-# ``attribute_names`` asks ``getattr(value, "__dict__", None)``; with no dict
-# storage that reaches ``__getattr__``, whose answer joins the attributes.
+# With no dict storage there is no ``__dict__`` state, so a ``__getattr__``
+# answering for ``__dict__`` adds nothing, and is never asked.
 @pytest.mark.parametrize("sort", [True, False])
 @pytest.mark.parametrize(
     "kind",
@@ -2724,6 +2726,10 @@ def test_a_dict_from_getattr_writes_as_python_does(
     sort: bool,
 ) -> None:
     _assert_writes_alike_each_time(kind(), sort=sort)
+    for walker in (serialize.to_plain, serialize._python_to_plain):
+        tree = walker(kind())
+        assert isinstance(tree, dict)
+        assert "extra" not in tree
 
 
 class _ReduceBase:
@@ -2880,6 +2886,51 @@ def test_a_bare_name_reduce_reads_the_module_once_as_python_does(
         assert _CountsModuleReads.reads == 1
 
 
+class ReadsItsModuleCounted(metaclass=_CountsModuleReads):
+    __slots__ = ("a",)
+
+    def __init__(self) -> None:
+        self.a = 1
+
+
+# ``_import_path`` answers a class it already resolved from ``_IMPORT_PATHS``,
+# rechecking the path from ``sys.modules`` with no ``__module__`` read.
+@pytest.mark.parametrize(
+    "function",
+    [serialize._python_to_plain, serialize.to_plain, wire.json_dumps],
+    ids=["python", "to_plain", "json_dumps"],
+)
+def test_a_known_class_path_reads_no_module_again_as_python_does(
+    function: Callable[[object], object],
+) -> None:
+    function(ReadsItsModuleCounted())
+    for _ in range(_TIMES):
+        _CountsModuleReads.reads = 0
+        function(ReadsItsModuleCounted())
+        assert _CountsModuleReads.reads == 0
+
+
+class _SwappedFrom:
+    __slots__ = ("a",)
+
+    def __init__(self) -> None:
+        self.a = 1
+
+
+class _SwappedTo(_SwappedFrom):
+    __slots__ = ()
+
+
+# A reassigned ``__class__`` changes ``type(value)``, so the facts kept for
+# the old class never answer for it.
+def test_an_instance_whose_class_is_reassigned_writes_as_python_does() -> None:
+    value = _SwappedFrom()
+    _assert_writes_alike_each_time(value)
+    value.__class__ = _SwappedTo
+
+    _assert_writes_alike_each_time(value)
+
+
 @needs_rust
 @pytest.mark.parametrize("slots", [False, True], ids=["dict-backed", "slotted"])
 def test_a_member_that_drops_a_later_member_writes_as_python_does(
@@ -2968,6 +3019,302 @@ def test_a_resolved_entry_is_rechecked_natively_where_it_can_be(
 
     assert found is _SlottedPair
     assert asked == []
+
+
+class _Count(int):
+    """Reduces through ``copyreg.__newobj__``, a dunder module attribute."""
+
+
+class _AbcOuterMeta(abc.ABCMeta):
+    """``ABCMeta`` as this file's own, so a test may patch it alone."""
+
+
+class _AbcOuter(metaclass=_AbcOuterMeta):
+    @dataclass(frozen=True, kw_only=True, slots=True)
+    class Inner:
+        size: int = 1
+
+
+def _python_import_paths(value: object) -> tuple[PlainTree, list[object]]:
+    """Encode ``value`` warm; return the tree and what ``_import_path`` was asked."""
+    serialize.to_plain(value)
+    asked: list[object] = []
+    code = serialize._import_path.__code__
+
+    def profile(frame: FrameType, event: str, arg: object) -> None:
+        del arg
+        if event == "call" and frame.f_code is code:
+            asked.append(cast("object", frame.f_locals["value"]))
+
+    outer = sys.getprofile()
+    sys.setprofile(profile)
+    try:
+        tree = serialize.to_plain(value)
+    finally:
+        sys.setprofile(outer)
+    return tree, asked
+
+
+@needs_rust
+@pytest.mark.parametrize(
+    "value",
+    [_Count(3), [_AbcOuter.Inner()]],
+    ids=["dunder module attribute", "class under ABCMeta"],
+)
+def test_a_kept_import_path_is_rechecked_natively(value: object) -> None:
+    tree, asked = _python_import_paths(value)
+
+    assert tree == serialize._python_to_plain(value)
+    assert asked == []
+
+
+@needs_rust
+def test_a_class_a_metaclass_attribute_shadows_is_asked_of_python(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def inner(kind: type) -> object:
+        return cast("object", vars(kind)["Inner"])
+
+    # A data descriptor on the metaclass answers ``getattr`` before the class.
+    monkeypatch.setattr(_AbcOuterMeta, "Inner", property(inner), raising=False)
+
+    _, asked = _python_import_paths([_AbcOuter.Inner()])
+
+    assert asked == [_AbcOuter.Inner]
+
+
+def test_an_import_path_check_keeps_the_outer_profiler() -> None:
+    calls: list[str] = []
+
+    def outer(frame: FrameType, event: str, arg: object) -> None:
+        del frame, arg
+        calls.append(event)
+
+    sys.setprofile(outer)
+    try:
+        _python_import_paths(_Count(3))
+        kept = sys.getprofile()
+    finally:
+        sys.setprofile(None)
+    assert kept is outer
+
+
+_PROBE = "_treekle_parity_probe"
+
+
+def _probe_module(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
+    """Return an empty module ``sys.modules`` holds for this test."""
+    module = ModuleType(_PROBE)
+    monkeypatch.setitem(sys.modules, _PROBE, module)
+    return module
+
+
+def _probe_class(module: ModuleType, name: str) -> type:
+    """Return a slotted class ``module``'s own dict holds under ``name``."""
+    kind = type(name, (), {"__module__": _PROBE, "__qualname__": name, "__slots__": ()})
+    vars(module)[name] = kind
+    return kind
+
+
+# ``getattr`` on a module answers a name ``ModuleType`` holds as a data
+# descriptor (``__class__``, ``__dict__``) before the module's own dict.
+@pytest.mark.parametrize("name", ["__class__", "__dict__"])
+def test_a_class_a_module_descriptor_shadows_writes_as_python_does(
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+) -> None:
+    module = _probe_module(monkeypatch)
+    plain = _probe_class(module, "Plain")
+    shadowed = _probe_class(module, name)
+
+    _assert_writes_alike_each_time([plain(), shadowed()])
+    _assert_writes_alike_each_time([plain, shadowed])
+
+
+# A non-data descriptor of ``ModuleType`` (``__dir__``) yields to the module's
+# own dict, so a class kept under that name needs no Python to recheck.
+@needs_rust
+def test_a_class_under_a_module_method_name_is_rechecked_natively(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _probe_module(monkeypatch)
+    kind = _probe_class(module, "__dir__")
+
+    tree, asked = _python_import_paths(kind)
+
+    assert tree == serialize._python_to_plain(kind)
+    assert asked == []
+
+
+class _ReducesToName:
+    """Reduces to a bare name, which names a global of this module."""
+
+    __slots__ = ("name",)
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+    @override
+    def __reduce__(self) -> str:
+        return self.name
+
+
+@pytest.mark.parametrize("name", ["__class__", "__dict__"])
+def test_a_bare_name_a_module_descriptor_shadows_writes_as_python_does(
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+) -> None:
+    value = _ReducesToName(name)
+    monkeypatch.setitem(globals(), name, value)
+
+    _assert_writes_alike_each_time(value)
+
+
+class _Redirects(type):
+    """Its classes answer ``getattr`` as themselves, or as ``to`` once set."""
+
+    to: ClassVar[type | None] = None
+
+    def __get__(cls, instance: object, owner: type | None = None) -> type:
+        del instance, owner
+        return _Redirects.to or cls
+
+
+class _Decoy:
+    class Leaf:
+        __slots__ = ()
+
+
+class _ThroughDescriptor:
+    class Mid(metaclass=_Redirects):
+        class Leaf:
+            __slots__ = ()
+
+
+def _through_leaf() -> object:
+    """Return a ``_ThroughDescriptor.Mid.Leaf``, its class read from the dict."""
+    # The checker reads ``_ThroughDescriptor.Mid`` through ``__get__``.
+    mid = cast("type", vars(_ThroughDescriptor)["Mid"])
+    leaf = cast("type[object]", vars(mid)["Leaf"])
+    return leaf()
+
+
+# A class whose metaclass has ``__get__`` is itself a descriptor: ``getattr``
+# on the class holding it answers whatever ``__get__`` returns.
+def test_a_path_through_a_class_descriptor_writes_as_python_does(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    leaf = _through_leaf()
+    monkeypatch.setattr(_Redirects, "to", _Decoy)
+
+    _assert_writes_alike_each_time(leaf)
+
+
+def test_a_kept_path_through_a_class_descriptor_is_asked_again(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    leaf = _through_leaf()
+    for _ in range(_TIMES):
+        serialize.to_plain(leaf)
+    # ``__get__`` reads state no class stamp covers.
+    monkeypatch.setattr(_Redirects, "to", _Decoy)
+
+    _assert_writes_alike_each_time(leaf)
+
+
+def _no_dict_offset(cls: type) -> int:
+    del cls
+    return 0
+
+
+def _only_object(cls: type) -> tuple[type, ...]:
+    del cls
+    return (object,)
+
+
+# A metaclass can answer ``__dictoffset__`` and ``__mro__`` as it likes; the
+# instance dict is there all the same.
+_HidesInstanceDict = type(
+    "_HidesInstanceDict",
+    (type,),
+    {"__dictoffset__": property(_no_dict_offset), "__mro__": property(_only_object)},
+)
+LiesAboutItsDict = dataclass(
+    cast(
+        "type[object]",
+        _HidesInstanceDict("LiesAboutItsDict", (), {"__module__": __name__}),
+    ),
+)
+
+
+@pytest.mark.parametrize("sort", [True, False])
+def test_an_instance_dict_a_metaclass_hides_writes_as_python_does(sort: bool) -> None:
+    value = LiesAboutItsDict()
+    vars(value)["x"] = 1
+
+    _assert_writes_alike_each_time(value, sort=sort)
+    assert serialize._python_to_plain(value, sort=sort) == {
+        "py/object": f"{__name__}.LiesAboutItsDict",
+        "x": 1,
+    }
+
+
+def _holding(holder: str, name: str) -> type:
+    """Return class ``holder`` whose own dict holds a slotted class under ``name``."""
+    inner = type(
+        name,
+        (),
+        {"__module__": __name__, "__qualname__": f"{holder}.{name}", "__slots__": ()},
+    )
+    return type(holder, (), {"__module__": __name__, name: inner})
+
+
+_HoldsName = _holding("_HoldsName", "__name__")
+_HoldsBases = _holding("_HoldsBases", "__bases__")
+
+
+# ``getattr`` on a class answers a name ``type`` holds as a data descriptor
+# (``__name__``, ``__bases__``) from ``type`` before the class's own dict, so
+# a class kept there under that name has no import path.
+@pytest.mark.parametrize(
+    ("holder", "name"),
+    [(_HoldsName, "__name__"), (_HoldsBases, "__bases__")],
+    ids=["__name__", "__bases__"],
+)
+def test_a_class_a_type_descriptor_shadows_writes_as_python_does(
+    holder: type,
+    name: str,
+) -> None:
+    inner = cast("type[object]", vars(holder)[name])
+
+    _assert_writes_alike_each_time([inner(), inner])
+
+
+class _FieldsGetRaises:
+    """A ``__dataclass_fields__`` entry whose ``__get__`` raises ``AttributeError``."""
+
+    def __get__(self, instance: object, owner: type | None = None) -> object:
+        del instance, owner
+        raise AttributeError("__dataclass_fields__")
+
+
+class LooksLikeADataclass:
+    __dataclass_fields__ = _FieldsGetRaises()
+
+    def __init__(self) -> None:
+        self.a = 1
+
+    @override
+    def __reduce_ex__(self, protocol: object, /) -> tuple[object, ...]:
+        del protocol
+        raise TypeError("no reduce")
+
+
+# With no reduce recipe, ``_encode_unreduced`` asks ``hasattr(kind,
+# "__dataclass_fields__")``, which calls the entry's ``__get__``: one that
+# raises ``AttributeError`` leaves the class no dataclass.
+def test_a_dataclass_marker_whose_get_raises_writes_as_python_does() -> None:
+    _assert_writes_alike_each_time(LooksLikeADataclass())
 
 
 class _GcProbe:

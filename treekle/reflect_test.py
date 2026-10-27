@@ -2,10 +2,16 @@
 
 from __future__ import annotations
 
+from collections.abc import (
+    Mapping,
+    MutableSequence,
+    Sequence,
+    Set as AbstractSet,
+)
 from dataclasses import dataclass
 from email import mime
 from email.mime import text as mime_text
-from typing import Protocol
+from typing import Protocol, cast
 
 import importlib
 import os
@@ -428,6 +434,82 @@ class TestAttributeNames:
     )
     def test_a_value_without_attributes_names_none(self, value: object) -> None:
         assert list(attribute_names(value)) == []
+
+    def test_an_empty_instance_dict_names_only_the_slots(self) -> None:
+        assert list(attribute_names(Slotted())) == ["a"]
+        assert list(attribute_names(types.SimpleNamespace())) == []
+
+    def test_a_class_without_a_dict_never_asks_getattr_for_one(self) -> None:
+        asked: list[str] = []
+
+        class Hooked:
+            __slots__ = ("a",)
+
+            def __init__(self) -> None:
+                self.a = 1
+
+            def __getattr__(self, name: str) -> object:
+                asked.append(name)
+                return {"extra": 2}
+
+        assert list(attribute_names(Hooked())) == ["a"]
+        assert asked == []
+
+
+class TestClassTags:
+    def test_each_class_maps_to_its_name(self) -> None:
+        assert reflect.class_tags({"h": Holder, "s": Slotted}) == {
+            Holder: "h",
+            Slotted: "s",
+        }
+
+    @pytest.mark.parametrize(
+        ("classes", "error", "match"),
+        [
+            ({1: Holder}, TypeError, "keys must be str, not int"),
+            ({"h": Slotted()}, TypeError, r"classes\['h'\] is not a class"),
+            ({"a": Holder, "b": Holder}, ValueError, "one class twice: 'a' and 'b'"),
+        ],
+        ids=["non-str key", "non-class value", "one class twice"],
+    )
+    def test_a_bad_mapping_is_refused(
+        self,
+        classes: Mapping[object, object],
+        error: type[Exception],
+        match: str,
+    ) -> None:
+        with pytest.raises(error, match=match):
+            reflect.class_tags(classes)
+
+
+class TestConcreteOverrides:
+    def test_only_entries_off_the_baseline_are_kept(self) -> None:
+        overrides = reflect.concrete_overrides(
+            {Sequence: list, MutableSequence: list, AbstractSet: set},
+        )
+
+        assert overrides == {AbstractSet: set}
+
+    def test_a_generic_alias_names_its_abc(self) -> None:
+        alias = cast("type", Sequence[int])
+
+        assert reflect.concrete_overrides({alias: tuple}) == {Sequence: tuple}
+
+    @pytest.mark.parametrize(
+        ("concrete", "match"),
+        [
+            ({int: int}, "keys must be one of .* not <class 'int'>"),
+            ({Sequence: str}, r"default_concrete_types\[Sequence\] must be one of"),
+        ],
+        ids=["not a baseline key", "not a buildable subclass"],
+    )
+    def test_a_bad_entry_is_refused(
+        self,
+        concrete: dict[type, type],
+        match: str,
+    ) -> None:
+        with pytest.raises(ValueError, match=match):
+            reflect.concrete_overrides(concrete)
 
 
 @pytest.mark.parametrize(
