@@ -151,8 +151,10 @@ fn setup_encode(module: &Bound<'_, PyDict>) -> PyResult<()> {
 ///   classes: Short names to write in ``py/object`` in place of import paths;
 ///     when given, no other class is written as ``py/object``.
 ///   sort: Order each object's attributes by name; when false, keep slots in
-///     MRO order then ``__dict__`` keys in insertion order. A stored form that
-///     must stay byte-stable sets this false.
+///     MRO order then ``__dict__`` keys in insertion order. A class with no
+///     instance dict has no ``__dict__`` keys, whatever its ``__getattr__`` or
+///     ``__getattribute__`` answers. A stored form that must stay
+///     byte-stable sets this false.
 ///   target: The type ``from_plain`` will read the tree as. A container whose
 ///     declared type there builds its class from untagged data is written
 ///     untagged; ``object`` declares nothing, so the tree reads by tags alone.

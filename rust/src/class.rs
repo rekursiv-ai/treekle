@@ -11,7 +11,7 @@ use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyString, PyTuple};
 
-use crate::encode::{Kept, Parts};
+use crate::encode::{Fields, Kept, Parts};
 use crate::py::*;
 use crate::sync;
 
@@ -201,6 +201,35 @@ pub struct ClassInfo {
     /// Whether its instances' ``__reduce_ex__(2)`` is ``object``'s own calling
     /// a custom ``__reduce__``, so the call can be made without Python's.
     pub own_reduce: Option<bool>,
+    /// Its field types and their parts, ``None`` for a class that is no
+    /// dataclass; with the ``sync::MODULES`` generation they hold at, for
+    /// ones a pending import may yet change, else ``None`` for good.
+    pub fields: Option<(Option<u64>, Option<Fields>)>,
+}
+
+impl ClassInfo {
+    /// No facts yet, for a class stamped ``stamp`` at ``generation``.
+    pub fn new(stamp: Stamp, generation: u64) -> Self {
+        Self {
+            stamp,
+            generation,
+            encoder: None,
+            path: None,
+            layouts: [None, None],
+            enum_member: None,
+            own_reduce: None,
+            fields: None,
+        }
+    }
+
+    /// ``fields`` while it holds: for good, or while ``sys.modules`` stands.
+    pub fn fields(&self) -> Option<&Option<Fields>> {
+        match &self.fields {
+            Some((None, fields)) => Some(fields),
+            Some((Some(at), fields)) if sync::MODULES.generation() == Some(*at) => Some(fields),
+            _ => None,
+        }
+    }
 }
 
 /// A slot name as quoted JSON text, where it needs no escape.
@@ -316,6 +345,64 @@ pub unsafe fn type_lookup(
             }
         }
         _PyType_Lookup(kind, name)
+    }
+}
+
+/// What ``getattr(class, name)`` does, where that is known with no code run.
+pub enum ClassAttr {
+    /// Gives the MRO's own entry, borrowed; with ``class``'s metaclass, which
+    /// a caller keeping the answer must stamp too.
+    Found(*mut ffi::PyObject, *mut ffi::PyTypeObject),
+    /// Raises ``AttributeError``: neither the metaclass nor the MRO holds it.
+    Missing,
+    /// Only Python can say: the metaclass could answer first, or the entry
+    /// could answer for itself (a class whose metaclass has ``__get__``, or
+    /// any descriptor but a plain function, whose ``__get__`` on a class
+    /// gives the function).
+    Ask,
+}
+
+/// ``getattr(class, name)``, read as ``type``'s lookup reads it.
+///
+/// # Safety
+/// ``class`` is live; ``name`` is an exact str.
+pub unsafe fn class_attr(class: *mut ffi::PyObject, name: *mut ffi::PyObject) -> ClassAttr {
+    unsafe {
+        let Some(meta) = type_reads(class, name) else {
+            return ClassAttr::Ask;
+        };
+        let entry = type_lookup(class.cast(), name);
+        if entry.is_null() {
+            return ClassAttr::Missing;
+        }
+        let of = ob_type(entry);
+        if (*of).tp_descr_get.is_some() && of != &raw mut ffi::PyFunction_Type {
+            return ClassAttr::Ask;
+        }
+        ClassAttr::Found(entry, meta)
+    }
+}
+
+/// ``class``'s metaclass where ``getattr(class, name)`` answers from
+/// ``class``'s MRO: ``type``, or a subclass (``ABCMeta``) keeping ``type``'s
+/// lookup, whose own MRO holds no ``name`` to answer first. ``type`` itself
+/// holds some (``__name__``, ``__bases__``), which answer before the class.
+///
+/// # Safety
+/// ``class`` is live; ``name`` is an exact str.
+pub unsafe fn type_reads(
+    class: *mut ffi::PyObject,
+    name: *mut ffi::PyObject,
+) -> Option<*mut ffi::PyTypeObject> {
+    unsafe {
+        let meta = ob_type(class);
+        let base = &raw mut ffi::PyType_Type;
+        let reads = (meta == base
+            || ffi::PyType_IsSubtype(meta, base) != 0
+                && (*meta).tp_getattro.map(|f| f as usize)
+                    == (*base).tp_getattro.map(|f| f as usize))
+            && type_lookup(meta, name).is_null();
+        reads.then_some(meta)
     }
 }
 
@@ -556,14 +643,20 @@ pub fn own_namespace<'py>(kind: &B<'py>) -> Option<Bound<'py, PyDict>> {
     }
 }
 
-/// Whether ``kind``'s instances have no ``__dict__``: no dict slot, and no
-/// ``__dict__`` anywhere in its MRO.
-pub fn dictless(kind: *mut ffi::PyTypeObject, py: Python<'_>) -> bool {
+/// Whether ``kind``'s instances have room for an instance dict: a dict
+/// slot, or one CPython manages.
+#[inline]
+pub fn dict_storage(kind: *mut ffi::PyTypeObject) -> bool {
     unsafe {
-        (*kind).tp_dictoffset == 0
-            && ffi::PyType_HasFeature(kind, ffi::Py_TPFLAGS_MANAGED_DICT) == 0
-            && type_lookup(kind, intern!(py, "__dict__").as_ptr()).is_null()
+        (*kind).tp_dictoffset != 0
+            || ffi::PyType_HasFeature(kind, ffi::Py_TPFLAGS_MANAGED_DICT) != 0
     }
+}
+
+/// Whether ``kind``'s instances have no ``__dict__``: no dict storage, and
+/// no ``__dict__`` anywhere in its MRO, as ``reflect._dictless`` reads it.
+pub fn dictless(kind: *mut ffi::PyTypeObject, py: Python<'_>) -> bool {
+    !dict_storage(kind) && unsafe { type_lookup(kind, intern!(py, "__dict__").as_ptr()).is_null() }
 }
 
 /// ``object.__new__``'s slot, where ``kind.__new__(kind)`` is a call of it:
@@ -659,8 +752,7 @@ pub unsafe fn own_offsets(
             || ob_type(mro) != t_tuple()
             || ffi::PyTuple_GET_SIZE(mro) != 2
             || ffi::PyTuple_GET_ITEM(mro, 1) != (&raw mut ffi::PyBaseObject_Type).cast()
-            || (*class).tp_dictoffset != 0
-            || ffi::PyType_HasFeature(class, ffi::Py_TPFLAGS_MANAGED_DICT) != 0
+            || dict_storage(class)
         {
             return None;
         }
@@ -825,6 +917,53 @@ pub struct PathGlobals {
     pub module_type: Py<PyAny>,
 }
 
+impl PathGlobals {
+    /// ``sys.modules``, where it is an exact dict, read from ``sys``'s own
+    /// dict by an interned key.
+    pub fn modules<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
+        Ok(self
+            .sys_dict
+            .bind(py)
+            .get_item(intern!(py, "modules"))?
+            .and_then(|modules| modules.cast_into_exact::<PyDict>().ok()))
+    }
+
+    /// ``module``'s namespace where it is an exact ``types.ModuleType``,
+    /// whose attributes ``module_entry`` then reads from it.
+    pub fn namespace<'py>(&self, module: &B<'py>) -> Option<Bound<'py, PyDict>> {
+        (module.get_type().as_ptr() == self.module_type.as_ptr()).then(|| unsafe {
+            Bound::from_borrowed_ptr(module.py(), ffi::PyModule_GetDict(module.as_ptr()))
+                .cast_into_unchecked::<PyDict>()
+        })
+    }
+
+    /// ``getattr(module, name)`` read from the exact module's ``namespace``
+    /// with no code run, borrowed: null where the dict lacks ``name``, which
+    /// a module ``__getattr__`` may answer, or where ``ModuleType`` holds a
+    /// data descriptor of that name (``__class__``, ``__dict__``), which
+    /// answers before the dict.
+    ///
+    /// # Safety
+    /// ``namespace`` is an exact module's dict; ``name`` is an exact str.
+    pub unsafe fn module_entry(
+        &self,
+        namespace: *mut ffi::PyObject,
+        name: *mut ffi::PyObject,
+    ) -> *mut ffi::PyObject {
+        unsafe {
+            // Every data descriptor ``ModuleType`` and ``object`` hold is a
+            // dunder, so no other name needs the lookup.
+            if utf8_ptr(name).is_some_and(|text| text.starts_with(b"__")) {
+                let found = type_lookup(self.module_type.as_ptr().cast(), name);
+                if !found.is_null() && (*ob_type(found)).tp_descr_set.is_some() {
+                    return std::ptr::null_mut();
+                }
+            }
+            dict_borrowed(namespace, name)
+        }
+    }
+}
+
 /// ``_import_path(kind)`` for a class whose path reads with no Python code:
 /// ``f"{__module__}.{__qualname__}"``, verified to resolve to the class
 /// itself through plain module and class dicts. ``None`` to ask Python.
@@ -873,19 +1012,6 @@ pub fn native_import_path_in<'py>(
         )
     };
     let top_level = !qual_text.as_bytes().contains(&b'.');
-    // A top-level class whose module the walk last read, while
-    // ``sys.modules`` is unchanged: one namespace read, one str built.
-    if top_level
-        && let Some(generation) = sync::MODULES.generation()
-        && let Some((name, at, namespace)) = &*memo.borrow()
-        && name.is(&module)
-        && *at == generation
-    {
-        return Ok(match namespace.get_item(&qualname)? {
-            Some(walked) if walked.is(kind) => Some(dotted(py, module_text, qual_text)),
-            _ => None,
-        });
-    }
     let mut path = String::with_capacity(module_text.len() + 1 + qual_text.len());
     path.push_str(module_text);
     path.push('.');
@@ -897,9 +1023,7 @@ pub fn native_import_path_in<'py>(
     };
     // ``resolve_import`` walks from the longest dotted prefix loaded in
     // ``sys.modules``; it must be exactly the class's own module here.
-    // ``sys.modules`` read from ``sys``'s own dict, by an interned key.
-    let modules = g.sys_dict.bind(py).get_item(intern!(py, "modules"))?;
-    let Some(modules) = modules.and_then(|modules| modules.cast_into_exact::<PyDict>().ok()) else {
+    let Some(modules) = g.modules(py)? else {
         return Ok(None);
     };
     let module_parts = if top_level {
@@ -917,53 +1041,38 @@ pub fn native_import_path_in<'py>(
     let Some(found) = modules.get_item(&module)? else {
         return Ok(None);
     };
-    // A module's attributes are its ``__dict__`` entries, unless its class
-    // overrides attribute lookup; a class's are its MRO's, read as
-    // ``getattr`` reads them when the metaclass is plain ``type``.
-    if found.get_type().as_ptr() != g.module_type.as_ptr() {
+    let Some(namespace) = g.namespace(&found) else {
         return Ok(None);
-    }
+    };
     // A top-level class: its ``__qualname__`` is the one key to read, and
     // the str already holds its hash.
     if top_level {
         // ``sys.modules[module]``'s namespace, kept once per module per walk
-        // while ``sys.modules`` is unchanged.
-        // The watcher is registered on first use: ``generation`` is ``None``
-        // until ``watch`` has run once.
+        // while ``sys.modules`` is unchanged. The watcher is registered on
+        // first use: ``generation`` is ``None`` until ``watch`` has run once.
         let watched = sync::MODULES.watch(py, &modules);
-        let namespace = module_dict(&found);
         // Read after watching, so a change from here on is seen.
         if watched && let Some(generation) = sync::MODULES.generation() {
             *memo.borrow_mut() = Some((module.clone(), generation, namespace.clone()));
         }
-        return Ok(match namespace.get_item(&qualname)? {
-            Some(walked) if walked.is(kind) => Some(dotted(py, module_text, qual_text)),
-            _ => None,
-        });
+        let holds =
+            unsafe { g.module_entry(namespace.as_ptr(), qualname.as_ptr()) } == kind.as_ptr();
+        return Ok(holds.then(|| dotted(py, module_text, qual_text)));
     }
     let mut walked = found;
     for part in &parts[module_parts..] {
-        let next = if walked.get_type().as_ptr() == g.module_type.as_ptr() {
-            module_dict(&walked).get_item(*part)?
-        } else if ob_type(walked.as_ptr()) == &raw mut ffi::PyType_Type {
-            let name = PyString::new(py, part);
-            let found = unsafe { type_lookup(walked.as_ptr().cast(), name.as_ptr()) };
-            // A descriptor found there could answer ``getattr`` itself.
-            if found.is_null() {
-                return Ok(None);
-            }
-            let found = unsafe { Bound::from_borrowed_ptr(py, found) };
-            if !is_class(&found) {
-                return Ok(None);
-            }
-            Some(found)
-        } else {
-            return Ok(None);
+        let name = PyString::new(py, part);
+        let next = match g.namespace(&walked) {
+            Some(namespace) => unsafe { g.module_entry(namespace.as_ptr(), name.as_ptr()) },
+            None => match unsafe { class_attr(walked.as_ptr(), name.as_ptr()) } {
+                ClassAttr::Found(entry, _) => entry,
+                ClassAttr::Missing | ClassAttr::Ask => std::ptr::null_mut(),
+            },
         };
-        let Some(next) = next else {
+        if next.is_null() {
             return Ok(None);
-        };
-        walked = next;
+        }
+        walked = unsafe { Bound::from_borrowed_ptr(py, next) };
     }
     if !walked.is(kind) {
         return Ok(None);
@@ -978,9 +1087,10 @@ pub fn native_import_path_in<'py>(
 /// names its object, as ``reflect.resolves_to`` would answer.
 ///
 /// The path is its module's name, then attribute names. It names its object
-/// while no longer prefix is a loaded module, and the module's own entry for
-/// the first name, then each class's own MRO entry for the next, leads there.
-/// A dunder name may be a descriptor that runs code, so it is never read.
+/// while no longer prefix is a loaded module, and the module's entry for the
+/// first name (``module_entry``), then each class's entry for the next
+/// (``class_attr``), leads there. A dunder name after the first may be a
+/// class's own descriptor, so it is left to Python.
 ///
 /// Its answer depends on ``sys.modules``, the module's namespace, and each
 /// class walked through to reach the last name. The first two are watched
@@ -1013,7 +1123,7 @@ pub struct KeptPath {
 }
 
 impl KeptPath {
-    /// ``path`` for ``kind``, rechecked from ``kind.__module__`` once asked.
+    /// ``path`` for ``kind``, rechecked once asked.
     pub fn new(path: &B<'_>) -> Self {
         Self {
             path: path.clone().unbind(),
@@ -1028,11 +1138,9 @@ impl KeptPath {
         let check = match self.check.get() {
             Some(check) => check,
             None => {
-                let path = self.path.bind(py);
-                let check = kind
-                    .getattr(intern!(py, "__module__"))
-                    .ok()
-                    .and_then(|module| PathCheck::new(path, &module));
+                // Read from the longest loaded prefix, as ``resolves_to``
+                // reads it: ``kind.__module__`` may run code Python never runs.
+                let check = PathCheck::loaded(g, self.path.bind(py))?;
                 self.check.get_or_init(|| check)
             }
         };
@@ -1054,9 +1162,10 @@ impl PathCheck {
             std::str::from_utf8((tp(module) == t_str()).then(|| utf8(module)).flatten()?).ok()?;
         let rest = text.strip_prefix(module_text)?.strip_prefix('.')?;
         let names: Vec<&str> = rest.split('.').collect();
-        if names
-            .iter()
-            .any(|name| name.is_empty() || name.starts_with("__"))
+        // A dunder module attribute (``copyreg.__newobj__``) is read as
+        // ``module_entry`` reads it; a dunder class attribute is not.
+        if names.iter().any(|name| name.is_empty())
+            || names.iter().skip(1).any(|name| name.starts_with("__"))
         {
             return None;
         }
@@ -1089,12 +1198,7 @@ impl PathCheck {
         let Ok(text) = std::str::from_utf8(text) else {
             return Ok(None);
         };
-        let Some(modules) = g
-            .sys_dict
-            .bind(py)
-            .get_item(intern!(py, "modules"))?
-            .and_then(|modules| modules.cast_into_exact::<PyDict>().ok())
-        else {
+        let Some(modules) = g.modules(py)? else {
             return Ok(None);
         };
         for (at, _) in text.rmatch_indices('.') {
@@ -1161,33 +1265,28 @@ impl PathCheck {
             None => return Ok(None),
         };
         let (first, rest) = self.attrs.split_first().expect("a path names an attribute");
-        // An absent entry may come from a module ``__getattr__``. An exact str
-        // key's lookup in an exact dict runs no code and cannot fail.
-        let entry = unsafe { dict_borrowed(namespace.as_ptr(), first.as_ptr()) };
+        let entry = unsafe { g.module_entry(namespace.as_ptr(), first.as_ptr()) };
         if entry.is_null() {
             return Ok(None);
         }
-        if rest.is_empty() {
-            return Ok(Some(entry == value.as_ptr()));
-        }
         let mut found = unsafe { Bound::from_borrowed_ptr(py, entry) };
         for name in rest {
-            if ob_type(found.as_ptr()) != &raw mut ffi::PyType_Type {
-                return Ok(None);
-            }
-            // A tag of 0 never holds, so a class out of tags is read each time.
+            // A tag of 0 never holds, so a class out of tags is read each
+            // time; stamped before its entry is read.
             let stamp = Stamp::always(&found);
+            let ClassAttr::Found(entry, meta) =
+                (unsafe { class_attr(found.as_ptr(), name.as_ptr()) })
+            else {
+                return Ok(None);
+            };
             through.push((found.clone().unbind(), stamp));
-            let entry = unsafe { type_lookup(found.as_ptr().cast(), name.as_ptr()) };
-            if entry.is_null() {
-                return Ok(None);
+            // A metaclass that gains ``name`` would answer before the class.
+            if meta != &raw mut ffi::PyType_Type {
+                let meta = unsafe { Bound::from_borrowed_ptr(py, meta.cast()) };
+                let stamp = Stamp::always(&meta);
+                through.push((meta.unbind(), stamp));
             }
-            let entry = unsafe { Bound::from_borrowed_ptr(py, entry) };
-            // A descriptor found there could answer ``getattr`` itself.
-            if !is_class(&entry) && !entry.is(value) {
-                return Ok(None);
-            }
-            found = entry;
+            found = unsafe { Bound::from_borrowed_ptr(py, entry) };
         }
         Ok(Some(found.is(value)))
     }
@@ -1205,9 +1304,7 @@ impl PathCheck {
         {
             return Ok(Some(namespace.bind(py).clone()));
         }
-        let modules = g.sys_dict.bind(py).get_item(intern!(py, "modules"))?;
-        let Some(modules) = modules.and_then(|modules| modules.cast_into_exact::<PyDict>().ok())
-        else {
+        let Some(modules) = g.modules(py)? else {
             return Ok(None);
         };
         // Watched before it is read, so a change from here on is seen.
@@ -1220,10 +1317,9 @@ impl PathCheck {
         let Some(module) = modules.get_item(self.module.bind(py))? else {
             return Ok(None);
         };
-        if module.get_type().as_ptr() != g.module_type.as_ptr() {
+        let Some(namespace) = g.namespace(&module) else {
             return Ok(None);
-        }
-        let namespace = module_dict(&module);
+        };
         if watched && let Some(generation) = sync::MODULES.generation() {
             let stale = self
                 .found
@@ -1231,14 +1327,6 @@ impl PathCheck {
             drop(stale);
         }
         Ok(Some(namespace))
-    }
-}
-
-/// An exact ``types.ModuleType``'s namespace, which is always its own dict.
-fn module_dict<'py>(module: &B<'py>) -> Bound<'py, PyDict> {
-    unsafe {
-        Bound::from_borrowed_ptr(module.py(), ffi::PyModule_GetDict(module.as_ptr()))
-            .cast_into_unchecked::<PyDict>()
     }
 }
 
@@ -1290,8 +1378,9 @@ fn memo_path<'py>(py: Python<'py>, memo: &ModuleMemo<'py>, kind: &B<'py>) -> Opt
             return None;
         }
         let qual_text = ascii_bytes(qualname);
-        // Top level: no ``.``, and so no ``<locals>`` either.
-        if qual_text.contains(&b'.') {
+        // Top level: no ``.``, and so no ``<locals>`` either. A dunder name
+        // may be one ``ModuleType`` answers for, which ``module_entry`` reads.
+        if qual_text.contains(&b'.') || qual_text.starts_with(b"__") {
             return None;
         }
         // An exact str key's lookup in an exact dict cannot fail.

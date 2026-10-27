@@ -401,12 +401,12 @@ time as a multiple of msgspec-struct's under ×.
 
 | library                    | warm encode (ms) |    × | warm decode (ms) |    × | cold encode (ms) |    × | cold decode (ms) |   × |
 |----------------------------|-----------------:|-----:|-----------------:|-----:|-----------------:|-----:|-----------------:|----:|
-| msgspec-struct (reference) |             1.16 |  1.0 |             0.35 |  1.0 |             1.50 |  1.0 |            12.65 | 1.0 |
-| msgspec-dataclass          |             1.17 |  1.0 |                ❌ |      |             1.50 |  1.0 |                ❌ |     |
-| treekle-rust               |             1.26 |  1.1 |             0.32 |  0.9 |             2.51 |  1.7 |            13.92 | 1.1 |
-| pickle                     |             5.01 |  4.3 |             1.97 |  5.6 |             5.73 |  3.8 |             3.15 | 0.2 |
-| treekle-python             |            18.43 | 15.9 |            26.81 | 76.4 |            40.93 | 27.2 |            31.47 | 2.5 |
-| jsonpickle                 |            44.46 | 38.4 |            23.86 | 68.0 |            28.90 | 19.2 |            27.16 | 2.1 |
+| msgspec-struct (reference) |             1.25 |  1.0 |             0.38 |  1.0 |             1.58 |  1.0 |            13.51 | 1.0 |
+| msgspec-dataclass          |             1.26 |  1.0 |                ❌ |      |             1.56 |  1.0 |                ❌ |     |
+| treekle-rust               |             1.29 |  1.0 |             0.34 |  0.9 |             2.67 |  1.7 |            14.64 | 1.1 |
+| pickle                     |             6.84 |  5.5 |             2.12 |  5.6 |             6.18 |  3.9 |             3.36 | 0.2 |
+| treekle-python             |            21.72 | 17.4 |            28.79 | 75.9 |            45.00 | 28.5 |            33.31 | 2.5 |
+| jsonpickle                 |            51.54 | 41.4 |            25.60 | 67.5 |            30.87 | 19.5 |            29.01 | 2.1 |
 
 - **encode:** each library on the config itself. msgspec is given
   `enc_hook=repr`, its only way past the callables a config holds, and writes
@@ -416,7 +416,7 @@ time as a multiple of msgspec-struct's under ×.
   with anything but `None`. So decode times the closest thing every library
   reads: each config rebuilt as dataclasses holding only plain values.
   msgspec-struct reads it into tagged `msgspec.Struct` twins; msgspec-dataclass
-  into the dataclasses themselves, which fails (❌) on 19 configs whose unions
+  into the dataclasses themselves, which fails (❌) on 20 configs whose unions
   hold two dataclasses it cannot tell apart.
 - **treekle-rust**, **treekle-python:** the compiled core, built
   profile-guided as the release wheels are, and the Python fallback a platform

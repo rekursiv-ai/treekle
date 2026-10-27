@@ -12,7 +12,7 @@ use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::PyString;
 
-use crate::class::{member_of, type_lookup, version_tag};
+use crate::class::{dict_storage, member_of, type_lookup, version_tag};
 use crate::py::*;
 
 /// ``PyMemberDef.flags`` bit that makes a read raise an audit event.
@@ -195,10 +195,8 @@ impl HasTable {
             let found = type_lookup(kind, name);
             // A ``__getattr__`` turns a failed or raising lookup into anything.
             let fallback = !type_lookup(kind, getattr).is_null();
-            let has_dict = (*kind).tp_dictoffset != 0
-                || ffi::PyType_HasFeature(kind, ffi::Py_TPFLAGS_MANAGED_DICT) != 0;
             if found.is_null() {
-                return if has_dict || fallback {
+                return if dict_storage(kind) || fallback {
                     Has::Ask
                 } else {
                     Has::No

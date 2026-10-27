@@ -23,8 +23,8 @@ use pyo3::types::{
 
 use crate::attrs::{FieldSlots, HasTable, SetTable};
 use crate::class::{
-    PathCheck, PathGlobals, Stamp, member_of, object_new, own_namespace, store_offsets,
-    type_lookup, version_tag,
+    PathCheck, PathGlobals, Stamp, dict_storage, member_of, object_new, own_namespace,
+    store_offsets, type_lookup, type_reads, version_tag,
 };
 use crate::classes::ClassNames;
 use crate::errors::*;
@@ -188,9 +188,9 @@ pub struct DecGlobals {
     /// ``_field_types``, ``_plain_hints`` and ``slot_names`` as the module
     /// defines them, so a class's field types may be read natively.
     field_types_own: [Py<PyAny>; 3],
-    /// ``types.UnionType``, ``types.GenericAlias``, ``types.ModuleType``,
-    /// ``weakref.WeakKeyDictionary`` and ``sys.modules``, held from setup.
-    native_types: [Py<PyAny>; 5],
+    /// ``types.UnionType``, ``types.GenericAlias`` and
+    /// ``weakref.WeakKeyDictionary``, held from setup.
+    native_types: [Py<PyAny>; 3],
     /// The module's own ``_resolve_alias``, ``get_origin``, ``_decoder_for``,
     /// ``get_args``, ``_import_name``, ``is_dataclass``, ``_is_any``,
     /// ``is_typeddict``, ``_is_protocol`` and ``_DECODERS``: while each is
@@ -409,9 +409,7 @@ pub fn setup(module: &Bound<'_, PyDict>) -> PyResult<()> {
             [
                 types.getattr("UnionType")?.unbind(),
                 types.getattr("GenericAlias")?.unbind(),
-                types.getattr("ModuleType")?.unbind(),
                 py.import("weakref")?.getattr("WeakKeyDictionary")?.unbind(),
-                py.import("sys")?.getattr("modules")?.unbind(),
             ]
         },
         read_error: read_error.unbind(),
@@ -4397,10 +4395,7 @@ impl<'py, 'g> Decoder<'py, 'g> {
         if width > QUICK_WIDTH {
             return None;
         }
-        let has_dict = unsafe {
-            (*kind).tp_dictoffset != 0
-                || ffi::PyType_HasFeature(kind, ffi::Py_TPFLAGS_MANAGED_DICT) != 0
-        };
+        let has_dict = dict_storage(kind);
         let mut setters = Vec::with_capacity(width);
         let mut plans = Vec::with_capacity(width);
         let mut texts = Vec::with_capacity(width);
@@ -5577,11 +5572,7 @@ impl<'py, 'g> Decoder<'py, 'g> {
         let name = pyo3::intern!(py, "__dataclass_fields__").as_ptr();
         unsafe {
             let class = target.as_ptr().cast::<ffi::PyTypeObject>();
-            let meta = ob_type(target.as_ptr());
-            let type_getattro = ffi::PyType_Type.tp_getattro.map(|f| f as usize);
-            if (*meta).tp_getattro.map(|f| f as usize) != type_getattro
-                || !type_lookup(meta, name).is_null()
-            {
+            if type_reads(target.as_ptr(), name).is_none() {
                 return false;
             }
             let declared = type_lookup(class, name);
@@ -6929,7 +6920,7 @@ impl<'py> Decoder<'py, '_> {
         let cache = self.g.field_types_cache.bind(py);
         let class = target.as_ptr().cast::<ffi::PyTypeObject>();
         if is_class(target)
-            && cache.get_type().is(self.g.native_types[3].bind(py))
+            && cache.get_type().is(self.g.native_types[2].bind(py))
             && unsafe { ffi::PyType_HasFeature(class, ffi::Py_TPFLAGS_HEAPTYPE) } != 0
         {
             let ours = ON_DEATH
@@ -6976,7 +6967,7 @@ impl<'py> Decoder<'py, '_> {
             return Ok(None);
         };
         let cache = g.field_types_cache.bind(py);
-        let [union_type, alias_type, module_type, weak_dict, modules] = &g.native_types;
+        let [union_type, alias_type, weak_dict] = &g.native_types;
         if !cache.get_type().is(weak_dict.bind(py)) {
             return Ok(None);
         }
@@ -7049,28 +7040,26 @@ impl<'py> Decoder<'py, '_> {
             };
             result.set_item(name, hint)?;
         }
-        // ``_module_reaches``: the module's own entry for the qualname.
+        // ``_module_reaches``: ``vars(module)``'s own entry for the qualname,
+        // ``sys.modules`` read live as Python reads it.
         let module_name = namespace.get_item(pyo3::intern!(py, "__module__"))?;
         let qualname = unsafe { (*class.cast::<ffi::PyHeapTypeObject>()).ht_qualname };
         let reached = match module_name {
             Some(module_name) if !qualname.is_null() && tp(&module_name) == t_str() => {
                 let qualname = unsafe { Bound::from_borrowed_ptr(py, qualname) };
-                let modules = modules.bind(py).clone();
-                match modules
-                    .cast_into_exact::<PyDict>()
-                    .ok()
-                    .and_then(|m| m.get_item(&module_name).ok().flatten())
-                {
-                    Some(found) if found.get_type().is(module_type.bind(py)) => {
-                        let names = found.getattr("__dict__")?;
+                let names = g
+                    .paths
+                    .modules(py)?
+                    .and_then(|modules| modules.get_item(&module_name).ok().flatten())
+                    .and_then(|found| g.paths.namespace(&found));
+                match names {
+                    Some(names) => {
                         utf8(&qualname).is_some_and(|text| !text.contains(&b'.'))
                             && names
-                                .cast_into_exact::<PyDict>()
-                                .ok()
-                                .and_then(|n| n.get_item(&qualname).ok().flatten())
+                                .get_item(&qualname)?
                                 .is_some_and(|found| found.is(target))
                     }
-                    _ => false,
+                    None => false,
                 }
             }
             _ => false,
