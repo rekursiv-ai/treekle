@@ -25,15 +25,11 @@ compile_error!(
     "treekle's Rust core requires a GIL; use the pure-Python wheel on free-threaded Python"
 );
 
-mod attrs;
 mod class;
-mod classes;
+mod class_names;
 mod decode;
 mod encode;
-mod errors;
-mod freeze;
 mod json;
-mod places;
 mod py;
 mod sync;
 
@@ -344,22 +340,20 @@ fn json_dumps<'py>(
         && fixed
         && untargeted
         && json::current_dumps(py)?.1
-        && let Some(text) = encode::to_json(
+    {
+        return encode::to_json(
             py,
             obj,
-            dialect.0.clone(),
-            hooks.0.clone(),
-            classes.0.clone(),
-            sort.0.clone(),
-            default_concrete_types.0.clone(),
+            dialect.0,
+            hooks.0,
+            classes.0,
+            sort.0,
+            default_concrete_types.0,
             style,
             options,
-        )?
-    {
-        return Ok(text);
+        );
     }
-    // The text walk declined before running any user code; the tree walk's
-    // answer goes through ``json.dumps`` as it is once that code has run.
+    // The tree goes through ``json.dumps`` as it is once the walk has run.
     let tree = encode::to_plain(
         py,
         obj,

@@ -1,27 +1,16 @@
-//! ``from_plain(json.loads(text), target)`` read straight from the text, for
-//! documents the quick loops read whole: each container is read as the quick
-//! loops would read the dict or list ``json.loads`` makes for it, without
-//! making that dict or list, and record keys match field names by their bytes.
+//! ``json_loads(text, target)`` read straight from the text by the target's
+//! compiled program: each array, object and record the program reads is read
+//! from its bytes, without first making the list or dict ``json.loads`` makes
+//! for it. Any other node (a leaf, a union, a tuple, an ``object`` part) is
+//! parsed and read as the tree program reads it.
 //!
-//! A read either finishes, giving what the quick loops give on the tree, or
-//! gives up, and the tree is then built and read as before; so a document
-//! reads the same either way, and every error comes from the tree path.
+//! A read either finishes, giving what the program gives on the parsed
+//! tree, or gives up, and the text is then parsed and read by ``from_plain``;
+//! so a document reads the same either way, and every error comes from the
+//! tree path.
 
 use super::*;
 use crate::json::{self, Reader};
-
-/// Why a fused read stopped. ``Retry``: the quick loops might still read
-/// this value from its tree, which is built and read in its place. ``Stop``:
-/// they cannot, or the text is not JSON; the whole document goes back to
-/// the tree path.
-enum Miss {
-    Retry,
-    Stop,
-}
-
-type FR<T> = Result<T, Miss>;
-
-const TAG: &[u8] = b"py/object";
 
 // Perf: rows json_loads, lockstep: with json.rs exact_float, 1.63-1.77x; exp000 1.00x (its records
 // have their own __new__, so this bails).
@@ -43,34 +32,18 @@ pub fn from_json<'py>(
         && let Ok(bytes) = json::document(text)
         && let Some(&(b'{' | b'[')) = bytes.iter().find(|byte| !byte.is_ascii_whitespace())
     {
-        let g = &*globals;
-        let caches = CACHES.take(py).unwrap_or_else(|| new_caches(py));
         let mut decoder = Decoder::new(
             py,
-            g,
+            &globals,
             hooks.clone(),
             Flag::new(allow_imports.clone(), false),
             Flag::new(strict.clone(), true),
-            false,
             class_names,
-            caches,
         );
-        let mut reader = Reader::open(py, bytes)?;
-        let value = decoder.fused_root(&mut reader, target);
-        reader.close();
-        let kept = std::mem::replace(
-            &mut decoder.caches,
-            Caches::around(decoder.object_plan.clone()),
-        );
-        if DEC
-            .cloned(py)
-            .is_some_and(|current| Rc::ptr_eq(&current, &globals))
-        {
-            let stale = CACHES.replace(py, Some(kept));
-            drop(stale);
-        }
+        let value = decoder.json_root(bytes, target);
+        decoder.keep_caches(&globals);
         drop(decoder);
-        if let Some(value) = value {
+        if let Some(value) = value? {
             return Ok(value);
         }
     }
@@ -87,6 +60,32 @@ pub fn from_json<'py>(
     )
 }
 
+impl<'py> Decoder<'py, '_> {
+    /// ``quick_root`` on ``json.loads(text)``, read from the text: ``None``
+    /// where the program would not read the whole tree, or the text is not
+    /// one JSON document.
+    fn json_root(&mut self, bytes: &[u8], target: &B<'py>) -> PyResult<Option<B<'py>>> {
+        let persistent = self.persistent_root(target);
+        let Some(plan) = self.plan_cached(target, persistent) else {
+            return Ok(None);
+        };
+        if !matches!(&*plan.program.borrow(), Compiled::Yes(_)) {
+            return Ok(None);
+        }
+        let Some(program) = self.program(target, &plan) else {
+            return Ok(None);
+        };
+        let mut reader = Reader::open(self.py, bytes)?;
+        let mut exec = Exec::new(self.py, &program, self.class_names.as_ref(), None);
+        reader.space();
+        let read = exec.json(&mut reader, &program.root, 0);
+        reader.space();
+        let whole = reader.at == bytes.len();
+        reader.close();
+        Ok(Self::ended(&plan, read).filter(|_| whole))
+    }
+}
+
 /// Release the items a list read left on the reader's stack past ``base``.
 fn release(reader: &mut Reader<'_, '_>, base: usize) {
     for left in reader.stack.drain(base..) {
@@ -94,154 +93,78 @@ fn release(reader: &mut Reader<'_, '_>, base: usize) {
     }
 }
 
-impl<'py> Decoder<'py, '_> {
-    /// ``quick_root`` on ``json.loads(text)``, read from the text: ``None``
-    /// where the quick loops would not read the whole tree, or the text is
-    /// not one JSON document.
-    fn fused_root(&mut self, reader: &mut Reader<'_, 'py>, target: &B<'py>) -> Option<B<'py>> {
-        let persistent = self.persistent_root(target);
-        let plan = self.plan_cached(target, persistent)?;
-        if !matches!(plan.kind, Kind::List | Kind::Object) {
-            return None;
-        }
-        self.epoch += 1;
-        self.untagged = false;
-        self.quick_place = false;
-        reader.space();
-        let value = self.fused_value(reader, target, &plan, 0).ok()?;
-        reader.space();
-        (reader.at == reader.text.len()).then_some(value)
+/// Step past ``byte`` and the space after it, or stop.
+#[inline(always)]
+fn expect(reader: &mut Reader<'_, '_>, byte: u8) -> Result<(), Stop> {
+    if reader.peek() != byte {
+        return Err(Stop::Abort);
     }
+    reader.at += 1;
+    reader.space();
+    Ok(())
+}
 
-    /// ``quick_node`` on the next JSON value, as ``target``.
-    fn fused_value(
-        &mut self,
-        reader: &mut Reader<'_, 'py>,
-        target: &B<'py>,
-        plan: &Rc<Plan>,
-        depth: u32,
-    ) -> FR<B<'py>> {
-        let start = reader.at;
-        if !matches!(reader.peek(), b'{' | b'[') {
-            let leaf = reader.value(depth).map_err(|_| Miss::Stop)?;
-            // ``quick_part``'s leaf rules, ahead of the call: every JSON leaf
-            // is a plain leaf.
-            let wanted = target.as_ptr();
-            if wanted == tp(&leaf).cast() || wanted == self.g.object.as_ptr() {
-                return Ok(leaf);
-            }
-            return self.quick_tree(&leaf, target, plan, depth);
-        }
-        let mark = self.mark();
-        match self.fused_inner(reader, target, plan, depth) {
-            Err(Miss::Retry) => {
-                self.rollback(mark).map_err(|_| Miss::Stop)?;
-                reader.at = start;
-                let tree = reader.value(depth).map_err(|_| Miss::Stop)?;
-                self.quick_tree(&tree, target, plan, depth)
-            }
-            done => done,
-        }
+/// Step past a string's opening quote, or stop.
+#[inline(always)]
+fn open_string(reader: &mut Reader<'_, '_>) -> Result<(), Stop> {
+    if reader.peek() != b'"' {
+        return Err(Stop::Abort);
     }
+    reader.at += 1;
+    Ok(())
+}
 
-    #[inline]
-    fn quick_tree(
-        &mut self,
-        data: &B<'py>,
-        target: &B<'py>,
-        plan: &Rc<Plan>,
-        depth: u32,
-    ) -> FR<B<'py>> {
-        match self.quick_node(data, target, plan, Loc::At(ROOT), depth) {
-            Ok(Some(value)) => Ok(value),
-            _ => Err(Miss::Stop),
+/// After a member: past its ``,``, ``false``, or past the closing ``end``,
+/// ``true``.
+#[inline(always)]
+fn next_member(reader: &mut Reader<'_, '_>, end: u8) -> Result<bool, Stop> {
+    reader.space();
+    let byte = reader.peek();
+    reader.at += 1;
+    if byte == end {
+        return Ok(true);
+    }
+    if byte != b',' {
+        return Err(Stop::Abort);
+    }
+    reader.space();
+    Ok(false)
+}
+
+impl<'py> Exec<'_, 'py, false> {
+    /// ``read`` on the next JSON value, at a value's first byte.
+    fn json(&mut self, reader: &mut Reader<'_, 'py>, node: &Node, depth: usize) -> FR<'py> {
+        if depth >= FAST_DEPTH {
+            return Err(Stop::Abort);
+        }
+        match (reader.peek(), node) {
+            (b'[', Node::List(item)) => self.json_list(reader, item, depth + 1),
+            (b'{', Node::Dict(keys, value)) => self.json_dict(reader, *keys, value, depth + 1),
+            (b'{', Node::Record(index)) => self.json_record(reader, *index, depth + 1),
+            _ => {
+                let raw = reader.value(depth as u32).map_err(|_| Stop::Abort)?;
+                self.read(&raw, node, Loc::At(ROOT))
+            }
         }
     }
 
-    /// ``quick_node``'s container cases, at a ``{`` or ``[``.
-    fn fused_inner(
-        &mut self,
-        reader: &mut Reader<'_, 'py>,
-        target: &B<'py>,
-        plan: &Rc<Plan>,
-        depth: u32,
-    ) -> FR<B<'py>> {
-        if depth >= 100 {
-            return Err(Miss::Stop);
-        }
-        match (reader.peek(), plan.kind) {
-            (b'[', Kind::List) => {
-                let args = plan.args.bind(self.py);
-                let (item, item_plan) = match args.len() {
-                    1 => {
-                        let item = args.get_item(0).map_err(|_| Miss::Stop)?;
-                        let item_plan =
-                            self.plan_cached(&item, plan.persistent).ok_or(Miss::Stop)?;
-                        (item, item_plan)
-                    }
-                    _ => (self.b(&self.g.object).clone(), self.object_plan.clone()),
-                };
-                self.fused_items(reader, &item, &item_plan, depth + 1)
-            }
-            (b'{', Kind::Dict) => {
-                let args = plan.args.bind(self.py);
-                let object = self.b(&self.g.object).clone();
-                let (key, value) = match args.len() {
-                    2 => (
-                        args.get_item(0).map_err(|_| Miss::Stop)?,
-                        args.get_item(1).map_err(|_| Miss::Stop)?,
-                    ),
-                    _ => (object.clone(), object),
-                };
-                if !(key.is(self.b(&self.g.object)) || key.is(self.b(&self.g.str_type))) {
-                    return Err(Miss::Stop);
-                }
-                let value_plan = self
-                    .plan_cached(&value, plan.persistent)
-                    .ok_or(Miss::Stop)?;
-                self.fused_entries(reader, &value, &value_plan, depth + 1)
-            }
-            (b'{', Kind::Object) => self.fused_object(reader, target, plan, depth + 1),
-            (b'{', Kind::Union) => self.fused_union(reader, plan, depth),
-            _ => Err(Miss::Stop),
-        }
-    }
-
-    /// ``quick_items`` on a JSON array.
-    fn fused_items(
-        &mut self,
-        reader: &mut Reader<'_, 'py>,
-        item: &B<'py>,
-        item_plan: &Rc<Plan>,
-        depth: u32,
-    ) -> FR<B<'py>> {
-        reader.at += 1;
-        reader.space();
+    fn json_list(&mut self, reader: &mut Reader<'_, 'py>, item: &Node, depth: usize) -> FR<'py> {
+        expect(reader, b'[')?;
         let base = reader.stack.len();
         if reader.peek() == b']' {
             reader.at += 1;
         } else {
             loop {
-                match self.fused_value(reader, item, item_plan, depth) {
-                    Ok(value) => reader.stack.push(value.into_ptr()),
-                    Err(miss) => {
+                let value = self.json(reader, item, depth).and_then(|value| {
+                    reader.stack.push(value.into_ptr());
+                    next_member(reader, b']')
+                });
+                match value {
+                    Ok(true) => break,
+                    Ok(false) => {}
+                    Err(stop) => {
                         release(reader, base);
-                        return Err(miss);
-                    }
-                }
-                reader.space();
-                match reader.peek() {
-                    b',' => {
-                        reader.at += 1;
-                        reader.space();
-                    }
-                    b']' => {
-                        reader.at += 1;
-                        break;
-                    }
-                    _ => {
-                        release(reader, base);
-                        return Err(Miss::Stop);
+                        return Err(stop);
                     }
                 }
             }
@@ -251,7 +174,7 @@ impl<'py> Decoder<'py, '_> {
             if list.is_null() {
                 ffi::PyErr_Clear();
                 release(reader, base);
-                return Err(Miss::Stop);
+                return Err(Stop::Abort);
             }
             for (index, item) in reader.stack.drain(base..).enumerate() {
                 ffi::PyList_SET_ITEM(list, index as ffi::Py_ssize_t, item);
@@ -260,251 +183,119 @@ impl<'py> Decoder<'py, '_> {
         }
     }
 
-    /// ``quick_entries`` on a JSON object. A repeated key keeps its first
-    /// place and takes its last value, as in ``json.loads``'s dict.
-    fn fused_entries(
+    /// A JSON object as ``dict``. A repeated key keeps its first place and
+    /// takes its last value, as in ``json.loads``'s dict.
+    fn json_dict(
         &mut self,
         reader: &mut Reader<'_, 'py>,
-        value: &B<'py>,
-        value_plan: &Rc<Plan>,
-        depth: u32,
-    ) -> FR<B<'py>> {
-        let result = PyDict::new(self.py);
-        reader.at += 1;
-        reader.space();
+        keys: Keys,
+        value: &Node,
+        depth: usize,
+    ) -> FR<'py> {
+        let py = self.py;
+        let out = PyDict::new(py);
+        expect(reader, b'{')?;
         if reader.peek() == b'}' {
             reader.at += 1;
-            return Ok(result.into_any());
+            return Ok(out.into_any());
         }
         loop {
-            if reader.peek() != b'"' {
-                return Err(Miss::Stop);
-            }
-            reader.at += 1;
-            let name = reader.string(true).map_err(|_| Miss::Stop)?;
-            // A ``py/`` key makes the object a tag (``py/id``, or an unknown
-            // tag's error), which only the walk reads.
-            match utf8(&name) {
-                Some(text) if !text.starts_with(b"json://") && !text.starts_with(b"py/") => {}
-                _ => return Err(Miss::Stop),
-            }
-            reader.space();
-            if reader.peek() != b':' {
-                return Err(Miss::Stop);
-            }
-            reader.at += 1;
-            reader.space();
-            let member = self.fused_value(reader, value, value_plan, depth)?;
-            result.set_item(name, member).map_err(|_| Miss::Stop)?;
-            reader.space();
-            match reader.peek() {
-                b',' => {
-                    reader.at += 1;
-                    reader.space();
+            open_string(reader)?;
+            let name = reader.string(true).map_err(|_| Stop::Abort)?;
+            let Some(text) = utf8(&name) else {
+                return Err(Stop::Abort);
+            };
+            let key = match keys {
+                Keys::Str if text.starts_with(b"py/") || text.starts_with(b"json://") => {
+                    return Err(Stop::Abort);
                 }
-                b'}' => {
-                    reader.at += 1;
-                    return Ok(result.into_any());
-                }
-                _ => return Err(Miss::Stop),
+                Keys::Str => name.clone(),
+                Keys::Int => int_key(py, text).ok_or(Stop::Abort)?,
+            };
+            reader.space();
+            expect(reader, b':')?;
+            let member = self.json(reader, value, depth)?;
+            out.set_item(key, member).map_err(|_| Stop::Abort)?;
+            if next_member(reader, b'}')? {
+                return Ok(out.into_any());
             }
         }
     }
 
-    /// ``quick_union_record`` on a JSON object whose first key is its
-    /// ``py/object`` tag; a tag further in is left to the tree.
-    fn fused_union(
-        &mut self,
-        reader: &mut Reader<'_, 'py>,
-        plan: &Rc<Plan>,
-        depth: u32,
-    ) -> FR<B<'py>> {
+    /// A JSON object as a record of ``index``, its keys matched to fields by
+    /// their bytes, each field stored in its slot as ``fill`` stores it.
+    fn json_record(&mut self, reader: &mut Reader<'_, 'py>, index: usize, depth: usize) -> FR<'py> {
         let py = self.py;
-        if !self.unread.is_empty() {
-            return Err(Miss::Retry);
+        let prog = self.prog;
+        let rec = &prog.recs[index];
+        let class = unsafe { Borrowed::from_ptr(py, rec.class) };
+        if !rec.stamp.holds(&class) {
+            return Err(Stop::Stale);
         }
-        let Some(info) = plan.union.as_ref() else {
-            return Err(Miss::Stop);
+        let made = unsafe {
+            (rec.new)(
+                class.as_ptr().cast(),
+                PyTuple::empty(py).as_ptr(),
+                std::ptr::null_mut(),
+            )
         };
-        let start = reader.at;
-        reader.at += 1;
-        reader.space();
-        if reader.peek() != b'"' {
-            return Err(Miss::Retry);
-        }
-        reader.at += 1;
-        if reader.plain_ascii() != Some(TAG) {
-            return Err(Miss::Retry);
-        }
-        reader.space();
-        if reader.peek() != b':' {
-            return Err(Miss::Stop);
-        }
-        reader.at += 1;
-        reader.space();
-        // A later repeat of the tag would decide the tree's reading; the
-        // record read below stops at one.
-        if reader.peek() != b'"' {
-            return Err(Miss::Stop);
-        }
-        reader.at += 1;
-        let tag = reader.string(false).map_err(|_| Miss::Stop)?;
-        let names = self.member_tags(plan, info).map_err(|_| Miss::Stop)?;
-        let first = names
-            .iter()
-            .position(|name| {
-                name.as_ref().is_some_and(|name| {
-                    ob_type(name.as_ptr()) == t_str()
-                        && unsafe { same_text(name.as_ptr(), tag.as_ptr()) }
-                })
-            })
-            .ok_or(Miss::Stop)?;
-        let member = plan.args.bind(py).get_item(first).map_err(|_| Miss::Stop)?;
-        let member_plan = self
-            .plan_cached(&member, plan.persistent)
-            .ok_or(Miss::Stop)?;
-        reader.at = start;
-        self.fused_inner(reader, &member, &member_plan, depth)
-    }
-
-    /// The slot a plain ASCII record key names, as ``quick_slot`` finds it.
-    #[inline]
-    fn fused_slot(&self, facts: &RowFacts, position: usize, key: &[u8]) -> Option<u32> {
-        let text = |slot: usize| {
-            let (data, len) = facts.texts[slot];
-            if len == usize::MAX {
-                None
-            } else {
-                Some(unsafe { std::slice::from_raw_parts(data, len) })
-            }
+        let Some(value) = (unsafe { Bound::from_owned_ptr_or_opt(py, made) }) else {
+            drop(PyErr::fetch(py));
+            return Err(Stop::Abort);
         };
-        let guess = facts.order[position].get();
-        if guess == TAG_SLOT {
-            if key == TAG {
-                return Some(TAG_SLOT);
-            }
-        } else if guess != NO_GUESS && text(guess as usize) == Some(key) {
-            return Some(guess);
-        }
-        let found = (0..facts.texts.len())
-            .position(|slot| text(slot) == Some(key))
-            .map(|slot| slot as u32)
-            .or_else(|| (key == TAG).then_some(TAG_SLOT))?;
-        facts.order[position].set(found);
-        Some(found)
-    }
-
-    /// ``quick_object`` on a JSON object.
-    fn fused_object(
-        &mut self,
-        reader: &mut Reader<'_, 'py>,
-        target: &B<'py>,
-        plan: &Rc<Plan>,
-        depth: u32,
-    ) -> FR<B<'py>> {
-        let py = self.py;
-        let Flag::Known(imports) = self.allow_imports else {
-            return Err(Miss::Stop);
-        };
-        let named = imports || self.class_names.is_some();
-        if !plan.is_dataclass
-            || !is_class(target)
-            || !matches!(plan.fits, Fits::IsInstance(None))
-            || !plan.args.bind(py).is_empty()
-        {
-            return Err(Miss::Stop);
-        }
-        let facts = self.row_facts(target, plan).ok_or(Miss::Stop)?;
-        let width = facts.info.targets.len();
-        let kind = target.as_ptr().cast::<ffi::PyTypeObject>();
-        let value = unsafe {
-            let alloc = (*kind).tp_alloc.expect("checked by row_facts");
-            Bound::from_owned_ptr_or_err(py, alloc(kind, 0)).map_err(|_| Miss::Stop)?
-        };
-        let object = self.b(&self.g.object).as_ptr();
-        let mut seen: u64 = 0;
         let mut tagged = false;
         let mut count = 0;
-        reader.at += 1;
-        reader.space();
+        let mut cursor = 0;
+        let mut seen: u64 = 0;
+        expect(reader, b'{')?;
         if reader.peek() == b'}' {
             reader.at += 1;
         } else {
             loop {
-                if reader.peek() != b'"' || count == QUICK_WIDTH {
-                    return Err(Miss::Stop);
-                }
-                reader.at += 1;
-                let slot = match reader.plain_ascii() {
-                    Some(key) => self.fused_slot(&facts, count, key),
+                open_string(reader)?;
+                let spelled;
+                let key = match reader.plain_ascii() {
+                    Some(key) => key,
                     None => {
-                        let key = reader.string(true).map_err(|_| Miss::Stop)?;
-                        self.quick_slot(&facts, count, key.as_ptr())
+                        spelled = reader.string(true).map_err(|_| Stop::Abort)?;
+                        utf8(&spelled).ok_or(Stop::Abort)?
                     }
-                }
-                .ok_or(Miss::Stop)?;
-                count += 1;
+                };
                 reader.space();
-                if reader.peek() != b':' {
-                    return Err(Miss::Stop);
-                }
-                reader.at += 1;
-                reader.space();
-                if slot == TAG_SLOT {
+                expect(reader, b':')?;
+                if key == b"py/object" {
                     if tagged {
-                        return Err(Miss::Stop);
+                        return Err(Stop::Abort);
                     }
-                    let raw = reader.value(depth).map_err(|_| Miss::Stop)?;
-                    if named {
-                        let own = self.own_tag(target, plan).ok_or(Miss::Stop)?;
-                        if tp(&raw) != t_str() || !unsafe { same_text(raw.as_ptr(), own.as_ptr()) }
-                        {
-                            return Err(Miss::Stop);
-                        }
+                    open_string(reader)?;
+                    let path = reader.string(false).map_err(|_| Stop::Abort)?;
+                    if !self.names_rec(&path, rec) {
+                        return Err(Stop::Abort);
                     }
                     tagged = true;
                 } else {
-                    if seen & (1 << slot) != 0 {
-                        return Err(Miss::Stop);
+                    let slot = rec.info.slot_of(key, &mut cursor).ok_or(Stop::Abort)?;
+                    // A field named twice: the record is not one the program
+                    // reads, as ``json.loads`` would keep the last value.
+                    let bit = 1u64.checked_shl(slot as u32).ok_or(Stop::Abort)?;
+                    if seen & bit != 0 {
+                        return Err(Stop::Abort);
                     }
-                    seen |= 1 << slot;
-                    let slot = slot as usize;
-                    let field = facts.info.targets[slot].bind(py);
-                    let member =
-                        if field.as_ptr() == object && !matches!(reader.peek(), b'{' | b'[') {
-                            reader.value(depth).map_err(|_| Miss::Stop)?
-                        } else {
-                            let field_plan = facts.plans[slot].as_ref().ok_or(Miss::Stop)?;
-                            self.fused_value(reader, field, field_plan, depth)?
-                        };
-                    let field_name = facts.info.names[slot].as_ptr();
-                    if !self.quick_set(&value, field_name, &member, facts.setters[slot]) {
-                        return Err(Miss::Stop);
+                    seen |= bit;
+                    let field = &rec.fields[slot];
+                    let member = self.json(reader, &field.node, depth)?;
+                    if !field.set(&value, member) {
+                        return Err(Stop::Abort);
                     }
+                    count += 1;
                 }
-                reader.space();
-                match reader.peek() {
-                    b',' => {
-                        reader.at += 1;
-                        reader.space();
-                    }
-                    b'}' => {
-                        reader.at += 1;
-                        break;
-                    }
-                    _ => return Err(Miss::Stop),
+                if next_member(reader, b'}')? {
+                    break;
                 }
             }
         }
-        if !tagged {
-            return Err(Miss::Stop);
-        }
-        if seen.count_ones() as usize != width
-            && !self
-                .quick_defaults(&value, target, &facts, seen)
-                .map_err(|_| Miss::Stop)?
-        {
-            return Err(Miss::Stop);
+        if count != rec.fields.len() {
+            return Err(Stop::Abort);
         }
         Ok(value)
     }

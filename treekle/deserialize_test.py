@@ -3000,6 +3000,22 @@ class TestFieldTypes:
         assert deserialize._field_types(Local) == {"x": int}
         assert Local not in deserialize._FIELD_TYPES
 
+    @pytest.mark.parametrize(
+        ("kind", "resolved"),
+        [(Point, True), (HintedLater, False)],
+        ids=["resolved", "unresolved"],
+    )
+    def test_a_read_says_whether_every_hint_resolved(
+        self,
+        kind: type,
+        resolved: bool,
+    ) -> None:
+        types, every = deserialize._read_field_types(kind)
+
+        assert every is resolved
+        assert dict(types) == dict(deserialize._field_types(kind))
+        assert (kind in deserialize._FIELD_TYPES) is resolved
+
     def test_a_class_with_an_unresolved_hint_is_not_cached(self) -> None:
         assert dict(deserialize._field_types(HintedLater)) == {
             "point": object,

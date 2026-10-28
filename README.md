@@ -401,12 +401,12 @@ time as a multiple of msgspec-struct's under ×.
 
 | library                    | warm encode (ms) |    × | warm decode (ms) |    × | cold encode (ms) |    × | cold decode (ms) |   × |
 |----------------------------|-----------------:|-----:|-----------------:|-----:|-----------------:|-----:|-----------------:|----:|
-| msgspec-struct (reference) |             1.25 |  1.0 |             0.38 |  1.0 |             1.58 |  1.0 |            13.51 | 1.0 |
-| msgspec-dataclass          |             1.26 |  1.0 |                ❌ |      |             1.56 |  1.0 |                ❌ |     |
-| treekle-rust               |             1.29 |  1.0 |             0.34 |  0.9 |             2.67 |  1.7 |            14.64 | 1.1 |
-| pickle                     |             6.84 |  5.5 |             2.12 |  5.6 |             6.18 |  3.9 |             3.36 | 0.2 |
-| treekle-python             |            21.72 | 17.4 |            28.79 | 75.9 |            45.00 | 28.5 |            33.31 | 2.5 |
-| jsonpickle                 |            51.54 | 41.4 |            25.60 | 67.5 |            30.87 | 19.5 |            29.01 | 2.1 |
+| msgspec-struct (reference) |             1.20 |  1.0 |             0.36 |  1.0 |             1.61 |  1.0 |            13.19 | 1.0 |
+| msgspec-dataclass          |             1.22 |  1.0 |                ❌ |      |             1.59 |  1.0 |                ❌ |     |
+| treekle-rust               |             1.15 |  1.0 |             0.33 |  0.9 |             2.85 |  1.8 |            14.36 | 1.1 |
+| pickle                     |             6.51 |  5.4 |             2.05 |  5.7 |             5.97 |  3.7 |             3.30 | 0.2 |
+| treekle-python             |            21.44 | 17.8 |            27.84 | 77.0 |            43.82 | 27.2 |            32.37 | 2.5 |
+| jsonpickle                 |            49.66 | 41.3 |            24.60 | 68.1 |            29.97 | 18.6 |            28.16 | 2.1 |
 
 - **encode:** each library on the config itself. msgspec is given
   `enc_hook=repr`, its only way past the callables a config holds, and writes

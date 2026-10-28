@@ -2328,8 +2328,20 @@ def _field_types(kind: type) -> Mapping[str, object]:
     cached = _FIELD_TYPES.get(kind)
     if cached is not None:
         return cached
-    owner: type = kind
-    reached = _module_reaches(kind)
+    result, resolved = _read_field_types(kind)
+    if (
+        resolved
+        and _module_reaches(kind)
+        and not any(_names(hint, kind) for hint in result.values())
+    ):
+        _FIELD_TYPES[kind] = result
+    return result
+
+
+# The Rust core keeps what this reads per class: for good where every hint
+# resolved, else only while the modules the hints read gain no name.
+def _read_field_types(kind: type) -> tuple[Mapping[str, object], bool]:
+    """Return ``_field_types``' answer uncached, and whether every hint resolved."""
     plain = _plain_hints(kind)
     hints, resolved = (
         (plain, True)
@@ -2350,14 +2362,7 @@ def _field_types(kind: type) -> Mapping[str, object]:
         except NameError:
             found[name] = object
             resolved = False
-    result = MappingProxyType(found)
-    if (
-        resolved
-        and reached
-        and not any(_names(hint, owner) for hint in result.values())
-    ):
-        _FIELD_TYPES[kind] = result
-    return result
+    return MappingProxyType(found), resolved
 
 
 def _names(hint: object, kind: object) -> bool:

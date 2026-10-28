@@ -75,14 +75,6 @@ impl<'py> Flag<'py> {
             Self::Object(value) => value.is_truthy(),
         }
     }
-
-    /// The option as Python holds it.
-    pub fn object(&self, py: Python<'py>) -> B<'py> {
-        match self {
-            Self::Known(value) => pyo3::types::PyBool::new(py, *value).to_owned().into_any(),
-            Self::Object(value) => value.clone(),
-        }
-    }
 }
 
 // Before 3.14, `Py_EnterRecursiveCall` only counts calls against a fixed limit
@@ -398,44 +390,6 @@ pub fn is_unhashable(obj: &B<'_>) -> PyResult<bool> {
         .get_type()
         .getattr(pyo3::intern!(py, "__hash__"))?
         .is_none())
-}
-
-/// ``PyUnicode_IS_COMPACT_ASCII``, which pyo3 does not expose on 3.14.
-///
-/// With the GIL (the only build this module compiles for), 3.12 to 3.14 lay
-/// out ``PyASCIIObject.state`` as one ``unsigned int`` after ``length`` and
-/// ``hash``: ``interned:2, kind:3, compact:1, ascii:1``, low bit first.
-#[inline(always)]
-unsafe fn compact_ascii(raw: *mut ffi::PyObject) -> bool {
-    const COMPACT: u32 = 1 << 5;
-    const ASCII: u32 = 1 << 6;
-    let header = raw
-        .cast::<u8>()
-        .wrapping_add(std::mem::size_of::<ffi::PyObject>())
-        .cast::<ffi::Py_ssize_t>();
-    let state = unsafe { *header.add(2).cast::<u32>() };
-    state & (COMPACT | ASCII) == COMPACT | ASCII
-}
-
-/// Whether the exact str at ``raw`` is compact ASCII.
-///
-/// # Safety
-/// ``raw`` is a live exact ``str``.
-#[inline]
-pub unsafe fn compact_ascii_str(raw: *mut ffi::PyObject) -> bool {
-    unsafe { compact_ascii(raw) }
-}
-
-/// The bytes of a compact ASCII str.
-///
-/// # Safety
-/// ``raw`` is a live compact ASCII ``str``, held while the bytes are used.
-#[inline]
-pub unsafe fn ascii_bytes<'a>(raw: *mut ffi::PyObject) -> &'a [u8] {
-    unsafe {
-        let ascii = raw.cast::<ffi::PyASCIIObject>();
-        std::slice::from_raw_parts(ascii.add(1).cast::<u8>(), (*ascii).length as usize)
-    }
 }
 
 /// The UTF-8 bytes of a str, or ``None`` when it holds lone surrogates.
@@ -794,5 +748,111 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Maybe<'py> {
 
     fn extract(obj: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
         Ok(Self(Some(obj.to_owned())))
+    }
+}
+
+/// ``type(value) in _PLAIN_LEAVES``: an exact str, int, float, bool or
+/// ``None``, which every declared type reads and writes as itself.
+#[inline(always)]
+pub fn is_leaf_kind(kind: *mut ffi::PyTypeObject) -> bool {
+    kind == t_str() || kind == t_int() || kind == t_float() || kind == t_bool() || kind == t_none()
+}
+
+/// A map of at most ``limit`` entries. Past it, each new key takes the
+/// oldest key's place, so leaving costs one entry at a time and no call pays
+/// for emptying the whole map.
+pub struct Bounded<K, V> {
+    /// Each value with the number of its insertion.
+    map: hashbrown::HashMap<K, (u64, V)>,
+    /// Keys oldest first, each with the insertion it records; one whose
+    /// number its entry no longer carries was replaced or removed since.
+    order: std::collections::VecDeque<(K, u64)>,
+    inserted: u64,
+    limit: usize,
+}
+
+impl<K: Clone + Eq + std::hash::Hash, V> Bounded<K, V> {
+    pub fn new(limit: usize) -> Self {
+        Self {
+            map: hashbrown::HashMap::new(),
+            order: std::collections::VecDeque::new(),
+            inserted: 0,
+            limit,
+        }
+    }
+
+    #[inline]
+    pub fn get(&self, key: &K) -> Option<&V> {
+        self.map.get(key).map(|(_, value)| value)
+    }
+
+    #[inline]
+    pub fn get_mut(&mut self, key: &K) -> Option<&mut V> {
+        self.map.get_mut(key).map(|(_, value)| value)
+    }
+
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    /// ``map[key] = value``, the oldest entry pushed out where the map is
+    /// full. What leaves is handed back, to drop once the map is whole
+    /// again: dropping an entry may run Python code.
+    pub fn insert(&mut self, key: K, value: V) -> Option<V> {
+        let stale = match self.map.contains_key(&key) {
+            true => None,
+            false if self.map.len() >= self.limit => self.pop_oldest(),
+            false => None,
+        };
+        self.inserted += 1;
+        self.order.push_back((key.clone(), self.inserted));
+        let replaced = self.map.insert(key, (self.inserted, value));
+        if self.order.len() > 2 * self.limit {
+            let map = &self.map;
+            self.order
+                .retain(|(key, at)| map.get(key).is_some_and(|(held, _)| held == at));
+        }
+        replaced.map(|(_, value)| value).or(stale)
+    }
+
+    /// Remove the oldest entry.
+    fn pop_oldest(&mut self) -> Option<V> {
+        while let Some((key, at)) = self.order.pop_front() {
+            if self.map.get(&key).is_some_and(|(held, _)| *held == at) {
+                return self.map.remove(&key).map(|(_, value)| value);
+            }
+        }
+        None
+    }
+
+    /// Remove every entry ``dead`` picks, handing each back.
+    pub fn extract_if<'m>(
+        &'m mut self,
+        mut dead: impl FnMut(&K, &mut V) -> bool + 'm,
+    ) -> impl Iterator<Item = V> + 'm {
+        self.map
+            .extract_if(move |key, (_, value)| dead(key, value))
+            .map(|(_, (_, value))| value)
+    }
+}
+
+/// ``getattr(obj, name, None)`` without making the ``AttributeError`` a
+/// miss would raise: ``None`` where ``obj`` has no such attribute.
+pub fn optional_attr<'py>(obj: &B<'py>, name: &Bound<'py, PyString>) -> PyResult<Option<B<'py>>> {
+    #[cfg(Py_3_13)]
+    {
+        obj.getattr_opt(name)
+    }
+    #[cfg(not(Py_3_13))]
+    {
+        // PyO3 0.27's fallback catches only exact AttributeError, but
+        // getattr with a default also ignores its subclasses.
+        match obj.getattr(name) {
+            Ok(value) => Ok(Some(value)),
+            Err(error) if error.is_instance_of::<pyo3::exceptions::PyAttributeError>(obj.py()) => {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
     }
 }

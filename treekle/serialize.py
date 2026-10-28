@@ -17,7 +17,7 @@ declared type implies. Under the default ``object`` target, the tree reads back
 with no target at all.
 
 The tag rules and their example are in ``treekle``'s package docstring;
-``_implied`` is rule 1.
+``_implied_by`` is rule 1.
 """
 
 from __future__ import annotations
@@ -569,8 +569,20 @@ def _untagged_leaf(value: object, declared: object) -> str | int | float | None:
     else:
         return None
     plain = cast("str | int | float", text)
-    implied, _ = _implied(value, plain, type(value), declared, {})
-    return plain if implied else None
+    return plain if _settled_leaf(type(value), type(plain), declared) else None
+
+
+# A leaf's verdict never reads the value: its first union member decides, and a
+# member that builds the leaf's class is a class, whose fit the class settles.
+# The Rust core asks this once per leaf class, text class and declared type.
+def _settled_leaf(
+    kind: type,
+    text: type[str | int | float],
+    declared: object,
+) -> bool:
+    """Return whether ``declared`` reads every ``kind`` leaf written as ``text`` back."""
+    implied, _ = _implied_by(text(), kind, declared, {}, _KindFit(kind=kind))
+    return bool(implied)
 
 
 def _leaf_class(decoder: _Decoder, member: object) -> object:
@@ -956,28 +968,6 @@ def _verified_path(path: str, value: object) -> str:
     return path
 
 
-# Rule 1 of the contract in ``treekle``'s package docstring. It asks
-# ``from_plain``'s own dispatch what untagged data builds, rather than restating
-# it: a union reads untagged data by the first member its kind selects, a leaf's
-# text passing over ``None``.
-def _implied(
-    value: object,
-    plain: PlainTree,
-    kind: type,
-    declared: object,
-    default_concrete_types: Mapping[object, type],
-) -> tuple[bool, object]:
-    """Return whether ``value``, written as a ``kind``, goes untagged under ``declared``."""
-    implied, member = _implied_by(
-        plain,
-        kind,
-        declared,
-        default_concrete_types,
-        _ValueFit(value=value),
-    )
-    return bool(implied), member
-
-
 type _Fit = Callable[[object, bool], bool | None]
 """Whether the value fits a member, judged whole or not; ``None`` where it depends
 on more than the value's class."""
@@ -1027,8 +1017,12 @@ class _KindFit:
         return True
 
 
-# A union reads untagged data by the first member its kind selects, a leaf's
+# Rule 1 of the contract in ``treekle``'s package docstring. It asks
+# ``from_plain``'s own dispatch what untagged data builds, rather than restating
+# it: a union reads untagged data by the first member its kind selects, a leaf's
 # text passing over ``None``.
+# ``fit`` judges whether the value fits the member that reads it; ``None`` where only
+# the value can tell. Also returns that member.
 def _implied_by(
     plain: PlainTree,
     kind: type,
@@ -1036,7 +1030,7 @@ def _implied_by(
     default_concrete_types: Mapping[object, type],
     fit: _Fit,
 ) -> tuple[bool | None, object]:
-    """Return ``_implied``'s answer, judging the fit by ``fit``."""
+    """Return whether ``plain``, written from a ``kind``, goes untagged under ``declared``."""
     if isinstance(plain, Mapping):
         builds = _MAPPING_BUILDS
     elif isinstance(plain, (str, int, float)):

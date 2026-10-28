@@ -1053,147 +1053,6 @@ class _SlottedPair:
 
 
 @needs_rust
-@pytest.mark.parametrize("sort", [True, False])
-@pytest.mark.parametrize("planted", ["import path", "stale import path", "slots"])
-def test_planted_cache_entries_encode_as_python_does(
-    monkeypatch: pytest.MonkeyPatch,
-    planted: str,
-    sort: bool,
-) -> None:
-    value = _SlottedPair(1, 2)
-    serialize._python_to_plain(value, sort=sort)
-    # The native walk keeps what it read from these caches across calls.
-    assert serialize.to_plain(value, sort=sort) == serialize._python_to_plain(
-        value,
-        sort=sort,
-    )
-    # A planted path wins only while it still names the class, so it is an
-    # alias the module really binds.
-    alias = f"{__name__}._SlottedPairAlias"
-    monkeypatch.setitem(globals(), "_SlottedPairAlias", _SlottedPair)
-    if planted == "import path":
-        monkeypatch.setitem(
-            serialize._IMPORT_PATHS,
-            id(_SlottedPair),
-            (_SlottedPair, alias),
-        )
-    elif planted == "stale import path":
-        monkeypatch.setitem(
-            serialize._IMPORT_PATHS,
-            id(_SlottedPair),
-            (object(), "a.b"),
-        )
-    else:
-        monkeypatch.setitem(reflect._SLOT_NAMES, _SlottedPair, ("b",))
-        monkeypatch.setitem(reflect._SORTED_SLOT_NAMES, _SlottedPair, ("b",))
-
-    expected = serialize._python_to_plain(value, sort=sort)
-
-    assert serialize.to_plain(value, sort=sort) == expected
-    assert isinstance(expected, dict)
-    assert (expected["py/object"] == alias) == (planted == "import path")
-    assert ("a" in expected) == (planted != "slots")
-
-
-@needs_rust
-def test_a_planted_path_that_names_another_object_is_verified_again(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    value = _SlottedPair(1, 2)
-    serialize._python_to_plain(value)
-    serialize.to_plain(value)
-    monkeypatch.setitem(
-        serialize._IMPORT_PATHS,
-        id(_SlottedPair),
-        (_SlottedPair, "a.b"),
-    )
-
-    expected = serialize._python_to_plain(value)
-
-    assert serialize.to_plain(value) == expected
-    assert isinstance(expected, dict)
-    assert expected["py/object"] == f"{__name__}._SlottedPair"
-
-
-@pytest.mark.parametrize("sort", [True, False])
-@pytest.mark.parametrize("planted", ["import path", "slots", "sorted slots"])
-def test_cache_entries_planted_before_a_first_encode_win(
-    monkeypatch: pytest.MonkeyPatch,
-    planted: str,
-    sort: bool,
-) -> None:
-    # A class the core never met, so nothing native was kept for it.
-    module = ModuleType(f"treekle_parity_planted_{planted[0]}{sort:d}")
-    monkeypatch.setitem(sys.modules, module.__name__, module)
-    pair = dataclass(slots=True)(_class(module.__name__, "Pair", a=int, b=int))
-    vars(module)["Pair"] = vars(module)["Alias"] = pair
-    alias = f"{module.__name__}.Alias"
-    if planted == "import path":
-        monkeypatch.setitem(serialize._IMPORT_PATHS, id(pair), (pair, alias))
-    if planted == "slots":
-        monkeypatch.setitem(reflect._SLOT_NAMES, pair, ("b",))
-    if planted != "import path":
-        # Read alone when sorting: ``attribute_names`` asks it first.
-        monkeypatch.setitem(reflect._SORTED_SLOT_NAMES, pair, ("b",))
-    value = cast("Callable[..., object]", pair)(a=1, b=2)
-
-    # Native first: Python's walk would fill the other caches for ``pair``.
-    actual = serialize.to_plain(value, sort=sort)
-    expected = serialize._python_to_plain(value, sort=sort)
-
-    assert actual == expected
-    assert isinstance(expected, dict)
-    assert (expected["py/object"] == alias) == (planted == "import path")
-    dropped = planted == "slots" or (planted == "sorted slots" and sort)
-    assert ("a" in expected) != dropped
-
-
-@needs_rust
-@pytest.mark.parametrize("source", ["cache", "mapping"])
-def test_encoder_changes_during_walk_match_python(
-    monkeypatch: pytest.MonkeyPatch,
-    source: str,
-) -> None:
-    original = serialize._ENCODERS
-
-    def replaced(obj: object, state: serialize._Encoding) -> str:
-        del obj, state
-        return "replaced"
-
-    def decoded(value: str) -> str:
-        return value
-
-    def run(function: Callable[..., object]) -> object:
-        monkeypatch.setattr(serialize, "_ENCODERS", original)
-        monkeypatch.setattr(
-            serialize,
-            "_ENCODER_CACHE",
-            weakref.WeakKeyDictionary[type, serialize._Encoder](),
-        )
-
-        def replace(value: Tensor) -> str:
-            del value
-            if source == "cache":
-                serialize._ENCODER_CACHE[Point] = replaced
-            else:
-                monkeypatch.setattr(
-                    serialize,
-                    "_ENCODERS",
-                    {**original, Point: replaced},
-                )
-            return "triggered"
-
-        return function(
-            [Point(1), Tensor([]), Point(2)],
-            hooks={Tensor: (replace, decoded)},
-        )
-
-    expected = run(serialize._python_to_plain)
-    assert run(serialize.to_plain) == expected
-    assert cast("list[object]", expected)[2] == "replaced"
-
-
-@needs_rust
 @pytest.mark.parametrize("proxy", [False, True])
 def test_hook_added_to_empty_mapping_during_walk_matches_python(
     proxy: bool,
@@ -1874,6 +1733,64 @@ def test_references_deep_in_the_tree_match_python(mutable: bool) -> None:
     )
 
 
+@dataclass(kw_only=True, slots=True)
+class _Shared:
+    rows: list[Point]
+    by_id: dict[int, Point]
+    again: list[Point]
+    row: Point
+    entry: Point
+
+
+@pytest.mark.parametrize("mutable", [True, False], ids=["mutable", "frozen"])
+def test_a_reference_to_a_part_read_whole_finds_it(mutable: bool) -> None:
+    # The reference stops the read of the whole document, so the walk reads
+    # it, and each list, dict and record it reads at once must be placed
+    # where a later reference finds it.
+    rows = [Point(1, 2.0), Point(3, 4.0)]
+    by_id = {7: Point(5, 6.0)}
+    value = _Shared(rows=rows, by_id=by_id, again=rows, row=rows[1], entry=by_id[7])
+    tree = serialize._python_to_plain(value, mutable=mutable)
+
+    actual = deserialize.from_plain(tree, _Shared)
+
+    expected = deserialize._python_from_plain(tree, _Shared)
+    assert _shape(serialize._python_to_plain(actual)) == _shape(
+        serialize._python_to_plain(expected),
+    )
+    assert actual.again is actual.rows
+    assert actual.row is actual.rows[1]
+    assert actual.entry is actual.by_id[7]
+
+
+@dataclass(frozen=True, kw_only=True, slots=True)
+class _Base:
+    a: int
+
+
+@dataclass(frozen=True, kw_only=True, slots=True)
+class _Derived(_Base):
+    b: list[int]
+
+
+@pytest.mark.parametrize(
+    "rows",
+    [
+        [_Derived(a=index, b=[index]) for index in range(3)],
+        [{"py/object": f"{__name__}._Derived", "a": 1, "b": [1], "a ": 2}],
+    ],
+    ids=["frozen subclass", "frozen subclass with an unknown field"],
+)
+def test_a_frozen_dataclass_subclass_reads_as_python_reads_it(
+    rows: list[object],
+) -> None:
+    # ``object.__setattr__`` passes over a frozen subclass's own
+    # ``__setattr__``, so its fields are stored as any record's are.
+    tree = serialize._python_to_plain(rows)
+
+    _assert_reads_alike_each_time(tree, list[_Derived], allow_imports=True)
+
+
 @pytest.mark.parametrize("mutable", [True, False], ids=["mutable", "frozen"])
 def test_many_deep_subtrees_match_python(mutable: bool) -> None:
     shared = [0]
@@ -1985,36 +1902,6 @@ def test_records_whose_fields_imply_containers_encode_natively_as_python_does(
     assert _call_outcome(wire.json_dumps, value, options) == expected_text
 
 
-@needs_rust
-def test_each_python_encoder_shares_one_reference_map(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # A fresh map per Python encoder would copy every registration so far each
-    # time, which is quadratic in how many values one encodes.
-    received: list[object] = []
-
-    class Holder:
-        def __init__(self, held: object) -> None:
-            self.held = held
-
-    def encode_holder(value: object, state: serialize._Encoding) -> object:
-        received.append(state.seen)
-        serialize._register(value, state)
-        node: dict[str, object] = {"held": cast("Holder", value).held}
-        serialize._push_values(node, state, serialize._DeclaredParts())
-        return node
-
-    monkeypatch.setitem(serialize._ENCODER_CACHE, Holder, encode_holder)
-    shared = [0]
-    value = [[Holder(index), shared, Holder(shared)] for index in range(50)]
-    expected = serialize._python_to_plain(value)
-    received.clear()
-
-    assert serialize.to_plain(value) == expected
-    assert len(received) == 100
-    assert all(seen is received[0] for seen in received)
-
-
 @pytest.mark.parametrize("mutable", [True, False], ids=["mutable", "frozen"])
 def test_rolled_back_registrations_deep_in_the_tree_match_python(
     mutable: bool,
@@ -2059,29 +1946,6 @@ def test_repeats_inside_an_escaped_key_match_python(case: str) -> None:
     assert _outcome(lambda: serialize.to_plain(value)) == expected
 
 
-@needs_rust
-def test_a_python_encoder_inside_a_key_sees_it_is_inside_one(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # A Python walk the Rust one calls is placed under the same sentinel, so
-    # a repeat on either side of the boundary is written in full.
-    def encode_box(value: object, state: serialize._Encoding) -> object:
-        serialize._register(value, state)
-        node: dict[str, object] = {"held": cast("KeyBox", value).held}
-        serialize._push_values(node, state, serialize._DeclaredParts())
-        return node
-
-    monkeypatch.setitem(serialize._ENCODER_CACHE, KeyBox, encode_box)
-    point = Frozen(1)
-    box = KeyBox(held=point)
-    value = {(point, box, box): 1}
-
-    expected = serialize._python_to_plain(value)
-    assert serialize.to_plain(value) == expected
-    assert isinstance(expected, dict)
-    assert "py/ref" not in next(iter(expected))
-
-
 @dataclass(kw_only=True, slots=True)
 class RegisteredUnhashable:
     """Unhashable, as an ``eq`` dataclass is, yet registered as ``Hashable``."""
@@ -2107,13 +1971,11 @@ def test_an_unhashable_escaped_key_matches_python(key: str) -> None:
 
 
 @needs_rust
-@pytest.mark.parametrize("change", ["class", "module"])
 def test_enum_reduce_changed_between_calls_matches_python(
     monkeypatch: pytest.MonkeyPatch,
-    change: str,
 ) -> None:
-    # What a walk learns about a class is kept for the next call; changing
-    # the class or the module function it stands in for must be seen.
+    # What a walk learns about a class is kept for the next call; a change to
+    # the class must be seen.
     value = [Color.RED, Color.BLUE]
     before = serialize._python_to_plain(value)
     assert serialize.to_plain(value) == before
@@ -2122,17 +1984,7 @@ def test_enum_reduce_changed_between_calls_matches_python(
         del protocol
         return (Color, (self.value,), {"note": "custom"})
 
-    if change == "class":
-        monkeypatch.setattr(Color, "__reduce_ex__", custom, raising=False)
-    else:
-        original = serialize._canonical_reduce
-
-        def canonical(value: object) -> object:
-            if value is Color.RED:
-                return (Color, ("red",), {"note": "module"})
-            return original(value)
-
-        monkeypatch.setattr(serialize, "_canonical_reduce", canonical)
+    monkeypatch.setattr(Color, "__reduce_ex__", custom, raising=False)
     expected = serialize._python_to_plain(value)
     assert expected != before
     assert serialize.to_plain(value) == expected
@@ -2351,22 +2203,24 @@ def test_repeated_top_level_union_reuses_its_plan(
     try:
         _rust.setup_decode(deserialize.__dict__)
         target = int | None
-        # Before 3.14, ``X | Y`` cannot be weakly referenced, so its plan
-        # lasts one call rather than across calls.
-        per_call = 1 if sys.version_info >= (3, 14) else 3
+        # A union's plan asks its member order once for each of the seven
+        # kinds of untagged datum (None, bool, int, float, str, mapping,
+        # sequence), when it compiles. Before 3.14, ``X | Y`` cannot be weakly
+        # referenced, so its plan lasts one call rather than across calls.
+        kinds = 7
+        lasting = sys.version_info >= (3, 14)
         for _ in range(3):
             assert deserialize.from_plain(3, target) == 3
-        # Each kind of data asks for its member order once, on first arrival.
-        assert calls == per_call
+        assert calls == kinds * (1 if lasting else 3)
         for _ in range(3):
             assert deserialize.from_plain(None, target) is None
-        assert calls == 2 * per_call
+        assert calls == kinds * (1 if lasting else 6)
 
         # Within one call, every container sharing a union shares its plan.
         calls = 0
         nested = [["a", None] for _ in range(50)]
         assert deserialize.from_plain(nested, list[list[str | None]]) == nested
-        assert calls == 2
+        assert calls == kinds
     finally:
         monkeypatch.setattr(deserialize, "_union_candidates", original)
         _rust.setup_decode(deserialize.__dict__)
@@ -2400,6 +2254,19 @@ def test_a_dead_targets_plan_leaves_the_cache() -> None:
     finally:
         tracemalloc.stop()
     assert kept < 4_096
+
+
+@needs_rust
+def test_setup_takes_a_read_error_that_is_no_class() -> None:
+    # Setup read the class's slots from whatever the name held; an object
+    # smaller than a class was read past its end. Only ASAN sees the read.
+    core = _core()
+    try:
+        core.setup_decode({**vars(deserialize), "ReadError": object()})
+    finally:
+        core.setup_decode(vars(deserialize))
+
+    assert deserialize.from_plain([1], list[int]) == [1]
 
 
 @needs_rust
@@ -2514,6 +2381,30 @@ def test_a_kept_nested_dataclass_can_still_be_collected(
     assert vars(deserialize.from_plain({"x": 1}, inner)) == {"x": 1}
     del vars(module)["Outer"]
     del inner
+    gc.collect()
+    assert weak() is None
+
+
+@pytest.mark.parametrize("slots", [True, False], ids=["slotted", "dict-backed"])
+def test_a_dataclass_read_again_and_again_can_still_be_collected(
+    monkeypatch: pytest.MonkeyPatch,
+    slots: bool,
+) -> None:
+    # A class read often enough to be read by its compiled program is still
+    # let go once nothing else holds it.
+    module = ModuleType("treekle_parity_short_lived_read")
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    kind = dataclass(slots=slots)(_class(module.__name__, "Owner", x=int))
+    vars(module)["Owner"] = kind
+    weak = weakref.ref(kind)
+
+    for _ in range(3):
+        assert deserialize.from_plain({"x": 1}, kind) == deserialize._python_from_plain(
+            {"x": 1},
+            kind,
+        )
+    del vars(module)["Owner"]
+    del kind
     gc.collect()
     assert weak() is None
 
@@ -3068,19 +2959,24 @@ def test_a_kept_import_path_is_rechecked_natively(value: object) -> None:
     assert asked == []
 
 
-@needs_rust
-def test_a_class_a_metaclass_attribute_shadows_is_asked_of_python(
+def test_a_class_a_metaclass_attribute_shadows_encodes_as_python_does(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def inner(kind: type) -> object:
-        return cast("object", vars(kind)["Inner"])
+        del kind
+        return Point
 
-    # A data descriptor on the metaclass answers ``getattr`` before the class.
+    value = [_AbcOuter.Inner()]
+    serialize.to_plain(value)
+    # A data descriptor on the metaclass answers ``getattr`` before the class,
+    # so the kept path no longer names the class.
     monkeypatch.setattr(_AbcOuterMeta, "Inner", property(inner), raising=False)
 
-    _, asked = _python_import_paths([_AbcOuter.Inner()])
-
-    assert asked == [_AbcOuter.Inner]
+    with pytest.raises(TypeError) as python:
+        serialize._python_to_plain(value)
+    with pytest.raises(TypeError) as core:
+        serialize.to_plain(value)
+    assert str(core.value) == str(python.value)
 
 
 def test_an_import_path_check_keeps_the_outer_profiler() -> None:
@@ -3951,20 +3847,6 @@ class _Unreducible:
         raise TypeError("cannot reduce")
 
 
-class _Foreign:
-    """A class whose encoder is a Python function, as one outside the core is."""
-
-    def __init__(self, held: object = None) -> None:
-        self.held = held
-
-
-def _encode_foreign(value: object, state: serialize._Encoding) -> object:
-    # An int key and a tuple: a tree ``json`` writes and the core's writer
-    # leaves to it.
-    del state
-    return {1: "\u00e9", "held": cast("_Foreign", value).held, "pair": (1, 2)}
-
-
 class _LateFailingReduce:
     """Reduces to ``first``, then a part that cannot be encoded at all.
 
@@ -3979,22 +3861,6 @@ class _LateFailingReduce:
     @override
     def __reduce__(self) -> str | tuple[object, ...]:
         return (_LateFailingReduce, (self.first, _Unreducible()))
-
-
-class _Itemized(dict[str, object]):
-    """A dict that writes how often its items were read into itself."""
-
-    @override
-    def items(self) -> dict_items[str, object]:
-        self["asked"] = cast("int", self.get("asked", 0)) + 1
-        return super().items()
-
-
-def _shared_itemized() -> object:
-    # Its two encoders' trees are left to ``json``, which reads its items
-    # once for each.
-    held = _Itemized(a=1)
-    return [_Counted(), _Foreign(held), _Foreign(held)]
 
 
 def _wrapped(depth: int, leaf: object, wrap: Callable[[object], object]) -> object:
@@ -4063,18 +3929,11 @@ _HOLE_CASES: dict[str, Callable[[], object]] = {
         _Counted(),
         {float("nan"): "\u00e9", float("nan"): _Counted()},
     ],
-    "python encoder": lambda: [_Counted(), _Foreign(), _Foreign([_Counted()])],
-    "python encoder, big": lambda: [_Counted(), _Foreign(_BIG)],
-    "python encoders sharing a dict subclass": _shared_itemized,
     "reduce failing late": lambda: [
         _Counted(),
-        _LateFailingReduce(_Foreign()),
+        _LateFailingReduce([_Counted()]),
         _LateFailingReduce(_BIG),
         _Counted(),
-    ],
-    "reduce failing late, after a python encoder": lambda: [
-        _Foreign(),
-        _LateFailingReduce(_Foreign()),
     ],
     "reduce failing late, after big": lambda: [_BIG, _LateFailingReduce(1)],
 }
@@ -4174,11 +4033,9 @@ def _assert_dumps_with_hooks_alike(
 @pytest.mark.parametrize("layout", list(_HOLE_LAYOUTS))
 @pytest.mark.parametrize("case", list(_HOLE_CASES))
 def test_json_dumps_runs_hooks_as_often_as_python_where_text_falls_short(
-    monkeypatch: pytest.MonkeyPatch,
     case: str,
     layout: str,
 ) -> None:
-    monkeypatch.setitem(serialize._ENCODER_CACHE, _Foreign, _encode_foreign)
     for _ in range(_TIMES):
         _assert_dumps_with_hooks_alike(_HOLE_CASES[case], _HOLE_LAYOUTS[layout])
 
@@ -4240,14 +4097,12 @@ class _ReplacedLoads:
 @pytest.mark.parametrize("layout", ["default", "compact", "python dialect"])
 @pytest.mark.parametrize("case", [*_HOLE_CASES, "no part left to json"])
 def test_json_dumps_calls_a_replaced_json_dumps_as_python_does(
-    monkeypatch: pytest.MonkeyPatch,
     case: str,
     layout: str,
 ) -> None:
     # Python calls ``json.dumps`` once, on the whole tree, and ``to_plain``
     # calls it for set orders and escaped keys; the core must call one
     # replaced since import just so, not on parts of the tree or twice.
-    monkeypatch.setitem(serialize._ENCODER_CACHE, _Foreign, _encode_foreign)
     make = _HOLE_CASES.get(case, lambda: [_Counted(), {"\u00e9": [1.5, None]}])
     written, python = _hole_writers(_HOLE_LAYOUTS[layout])
 
@@ -4315,13 +4170,11 @@ def test_json_dumps_runs_a_hook_once_whose_payload_json_cannot_write() -> None:
 @pytest.mark.usefixtures("digit_limit")
 @pytest.mark.parametrize("limit", [4300, 0], ids=["digit limit", "no digit limit"])
 def test_json_dumps_writes_big_ints_as_json_does_under_the_digit_limit(
-    monkeypatch: pytest.MonkeyPatch,
     limit: int,
 ) -> None:
-    monkeypatch.setitem(serialize._ENCODER_CACHE, _Foreign, _encode_foreign)
     sys.set_int_max_str_digits(limit)
     _assert_dumps_with_hooks_alike(
-        lambda: {"a": [_Counted(), _Foreign(_BIG)], "b": _BIG, "c": {_BIG: 1}},
+        lambda: {"a": [_Counted(), [_BIG]], "b": _BIG, "c": {_BIG: 1}},
         _HoleLayout(separators=(";", "=")),
     )
 

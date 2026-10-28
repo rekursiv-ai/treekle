@@ -3,20 +3,20 @@
 
 Run as ``python -P scripts/train_pgo.py`` in an environment with an
 instrumented core installed. Each round builds a fresh config: nested slotted
-dataclasses holding plain leaves, lists, tuples, dicts and a function, as a
-model config does. It is encoded and decoded once while its classes are new,
+dataclasses holding plain leaves, lists, tuples, dicts and a plain object, as
+a model config does. It is encoded and decoded once while its classes are new,
 then again while they are known, so both cold and warm paths are taken.
 """
 
 from __future__ import annotations
 
 from dataclasses import field, make_dataclass
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from typing import cast
 
 import sys
 
-from treekle import deserialize, serialize
+from treekle import deserialize, serialize, wire
 
 
 def main() -> int:
@@ -32,6 +32,9 @@ def main() -> int:
             tree = serialize.to_plain(config)
             if deserialize.from_plain(tree, type(config), allow_imports=True) != config:
                 raise SystemExit("a config does not round-trip")
+            text = wire.json_dumps(config)
+            if wire.json_loads(text, type(config), allow_imports=True) != config:
+                raise SystemExit("a config does not round-trip through JSON")
     return 0
 
 
@@ -52,6 +55,7 @@ def _config(index: int, *, depth_count: int = 12) -> object:
                 ("shape", tuple[int, int]),
                 ("sizes", list[int], field(default_factory=list[int])),
                 ("extra", dict[str, float], field(default_factory=dict[str, float])),
+                ("options", object, None),
                 ("child", parent, None),
             ],
             module=module.__name__,
@@ -73,6 +77,9 @@ def _config(index: int, *, depth_count: int = 12) -> object:
                 shape=(depth, depth + 1),
                 sizes=[depth, depth * 2],
                 extra={"scale": 1.5},
+                # A plain object, read by the walk's ``py/reduce`` path, which
+                # no compiled reader takes.
+                options=SimpleNamespace(depth=depth),
                 child=child,
             ),
         )

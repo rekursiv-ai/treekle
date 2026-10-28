@@ -71,15 +71,6 @@ impl ClassNames {
             .map(|name| name.bind(py).clone())
     }
 
-    /// Each class to its name, as Python's ``_Encoding.tags`` holds them.
-    pub fn tags_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let tags = PyDict::new(py);
-        for (name, kind) in self.names.bind(py).iter() {
-            tags.set_item(kind, name)?;
-        }
-        Ok(tags)
-    }
-
     /// The class ``name`` names, if any.
     pub fn class<'py>(&self, py: Python<'py>, name: &B<'py>) -> PyResult<Option<B<'py>>> {
         self.names.bind(py).get_item(name)

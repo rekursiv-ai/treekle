@@ -439,21 +439,6 @@ impl Writer {
         }
     }
 
-    /// An unsigned number.
-    #[inline]
-    pub fn uint(&mut self, value: u64) {
-        push_u64(&mut self.buf, value);
-    }
-
-    /// ``{"tag": ``, the start of a tagged node.
-    #[inline]
-    pub fn open_tag(&mut self, tag: &[u8]) {
-        self.buf.extend_from_slice(b"{\"");
-        self.buf.extend_from_slice(tag);
-        self.buf.push(b'"');
-        self.key_sep();
-    }
-
     #[inline(always)]
     pub fn raw(&mut self, bytes: &[u8]) {
         self.buf.extend_from_slice(bytes);

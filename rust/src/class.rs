@@ -1,17 +1,11 @@
-//! What is read from a class, natively and with no Python code run: its
-//! stamp, its slot layout and its import path; and the table that keeps
-//! these facts across calls while the class and the Python state they were
-//! read from stand still.
+//! What is read from a class natively, with no Python code run: its stamp,
+//! its attribute lookups and slots, and whether an import path still names it.
 
-use std::rc::Rc;
-
-use hashbrown::HashMap;
 use pyo3::ffi;
 use pyo3::intern;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyString, PyTuple};
+use pyo3::types::{PyDict, PyString};
 
-use crate::encode::{Fields, Kept, Parts};
 use crate::py::*;
 use crate::sync;
 
@@ -71,22 +65,6 @@ impl Stamp {
         }
     }
 
-    /// A stamp no class holds: for a fact used at once and never kept.
-    pub fn none() -> Self {
-        Self {
-            tag: 0,
-            qualname: None,
-        }
-    }
-
-    /// The same stamp, for a second holder.
-    pub fn clone_in(&self, py: Python<'_>) -> Self {
-        Self {
-            tag: self.tag,
-            qualname: self.qualname.as_ref().map(|name| name.clone_ref(py)),
-        }
-    }
-
     /// Whether ``class`` is unchanged since this stamp was taken of it.
     #[inline]
     pub fn holds(&self, class: &B<'_>) -> bool {
@@ -110,215 +88,6 @@ unsafe fn heap_qualname(kind: *mut ffi::PyTypeObject) -> *mut ffi::PyObject {
     }
 }
 
-// ------------------------------------------------------------------- table --
-
-/// How many classes' facts are kept; past it each new class takes the
-/// oldest one's slot.
-pub const CLASS_LIMIT: usize = 1 << 12;
-
-/// At most ``CLASS_LIMIT`` classes' facts, each slot reused in turn once the
-/// table is full, so no class is kept forever and none is dropped in bulk.
-pub struct Classes {
-    pub index: HashMap<usize, u32>,
-    pub slots: Vec<(usize, ClassInfo)>,
-    pub next: usize,
-    /// The classes met and not kept, by address, one per slot: a class
-    /// pushed out by another is only read again unkept.
-    pub met: Box<[usize]>,
-}
-
-impl Default for Classes {
-    fn default() -> Self {
-        Self {
-            index: HashMap::new(),
-            slots: Vec::new(),
-            next: 0,
-            met: vec![0; MET_SLOTS].into_boxed_slice(),
-        }
-    }
-}
-
-/// How many classes met once are remembered, so a second sighting is known.
-const MET_SLOTS: usize = 1 << 10;
-
-impl Classes {
-    /// Whether the class at ``key`` was met before; it is marked met now.
-    #[inline]
-    pub fn met_before(&mut self, key: usize) -> bool {
-        let slot = (key >> 4).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (usize::BITS - 10);
-        let held = &mut self.met[slot];
-        if *held == key {
-            return true;
-        }
-        *held = key;
-        false
-    }
-
-    #[inline]
-    pub fn get(&self, key: &usize) -> Option<&ClassInfo> {
-        let slot = *self.index.get(key)?;
-        Some(&self.slots[slot as usize].1)
-    }
-
-    #[inline]
-    pub fn get_mut(&mut self, key: &usize) -> Option<&mut ClassInfo> {
-        let slot = *self.index.get(key)?;
-        Some(&mut self.slots[slot as usize].1)
-    }
-
-    /// Put ``info`` under ``key``, replacing its old facts or the oldest
-    /// class's; what was replaced is returned, to drop after the write.
-    pub fn insert(&mut self, key: usize, info: ClassInfo) -> Option<ClassInfo> {
-        if let Some(&slot) = self.index.get(&key) {
-            return Some(std::mem::replace(&mut self.slots[slot as usize].1, info));
-        }
-        if self.slots.len() < CLASS_LIMIT {
-            self.index.insert(key, self.slots.len() as u32);
-            self.slots.push((key, info));
-            return None;
-        }
-        let slot = self.next;
-        self.next = (slot + 1) % CLASS_LIMIT;
-        let (old, stale) = std::mem::replace(&mut self.slots[slot], (key, info));
-        self.index.remove(&old);
-        self.index.insert(key, slot as u32);
-        Some(stale)
-    }
-}
-
-/// What walks learned about one class, each fact read at ``generation``.
-pub struct ClassInfo {
-    pub stamp: Stamp,
-    pub generation: u64,
-    pub encoder: Option<Kept>,
-    /// The class's own verified import path, trusted while it still names
-    /// the class: a module can rebind the name without changing the class.
-    pub path: Option<KeptPath>,
-    /// How its instances' attributes are named and read, unsorted then sorted.
-    pub layouts: [Option<Rc<Layout>>; 2],
-    /// Whether it reduces as ``Enum.__reduce_ex__`` does, read natively.
-    pub enum_member: Option<bool>,
-    /// Whether its instances' ``__reduce_ex__(2)`` is ``object``'s own calling
-    /// a custom ``__reduce__``, so the call can be made without Python's.
-    pub own_reduce: Option<bool>,
-    /// Its field types and their parts, ``None`` for a class that is no
-    /// dataclass; with the ``sync::MODULES`` generation they hold at, for
-    /// ones a pending import may yet change, else ``None`` for good.
-    pub fields: Option<(Option<u64>, Option<Fields>)>,
-}
-
-impl ClassInfo {
-    /// No facts yet, for a class stamped ``stamp`` at ``generation``.
-    pub fn new(stamp: Stamp, generation: u64) -> Self {
-        Self {
-            stamp,
-            generation,
-            encoder: None,
-            path: None,
-            layouts: [None, None],
-            enum_member: None,
-            own_reduce: None,
-            fields: None,
-        }
-    }
-
-    /// ``fields`` while it holds: for good, or while ``sys.modules`` stands.
-    pub fn fields(&self) -> Option<&Option<Fields>> {
-        match &self.fields {
-            Some((None, fields)) => Some(fields),
-            Some((Some(at), fields)) if sync::MODULES.generation() == Some(*at) => Some(fields),
-            _ => None,
-        }
-    }
-}
-
-/// A slot name as quoted JSON text, where it needs no escape.
-pub type KeyText = Option<Box<[u8]>>;
-
-/// A class's slots, as ``attribute_names`` names them, and where each lives.
-pub struct Layout {
-    /// Taken when the offsets were read, so a class changed while an
-    /// instance is being read stops them being used mid-object.
-    pub stamp: Stamp,
-    /// Each slot's name, in output order: the class's own ``ht_slots`` where
-    /// that is the order, so no name is copied.
-    pub names: Py<PyTuple>,
-    /// Each slot's offset in the instance where ``getattr`` would only read
-    /// it, in ``names`` order.
-    pub offsets: Box<[Option<isize>]>,
-    /// How ``getattr`` finds an instance's members.
-    pub reading: Reading,
-    /// Under ``Reading::Slots``, each slot name as JSON text, quoted, where
-    /// it is ASCII that needs no escape and so reads the same under every
-    /// ``Style``; written when a JSON walk first reads the layout.
-    pub key_texts: std::cell::OnceCell<Box<[KeyText]>>,
-    /// Under ``Reading::Dict``, how the last instance dict read was named.
-    pub dict_keys: std::cell::RefCell<Option<Rc<DictKeys>>>,
-    /// What the class's field types declare of its slots, read once.
-    pub plan: std::cell::OnceCell<Rc<Plan>>,
-}
-
-/// What a record class's field types declare of its slots, each slot's
-/// read when a part there first needs it: only those slots' annotations are
-/// touched, which a class met once has never brought into cache.
-pub struct Plan {
-    /// The decoder table the records were read under, and its size then.
-    pub dispatch: Option<(Py<PyAny>, usize)>,
-    /// The class's own annotations, where its field types are read from.
-    pub annotations: Option<Py<PyDict>>,
-    /// The class's field types, where it has no annotations to read.
-    pub parts: Option<Rc<Parts>>,
-    /// Each slot's field, in layout order; empty for a plan used once.
-    pub fields: Box<[Field]>,
-}
-
-/// A slot's declared type, and the record an untagged mapping reads as there.
-#[derive(Default)]
-pub struct Field {
-    /// The declared type, ``None`` inside where it is ``object``.
-    pub hint: std::cell::OnceCell<Option<Py<PyAny>>>,
-    pub record: std::cell::OnceCell<Record>,
-}
-
-/// The class ``_record_built`` gives for a declared type.
-pub enum Record {
-    /// No record class: no record goes untagged there.
-    None,
-    /// This record class, which goes untagged there.
-    Class(Py<PyAny>),
-    /// Only Python can say.
-    Ask,
-}
-
-/// How ``getattr`` finds the members of a class's instances.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Reading {
-    /// Generic lookup and no instance dict, every slot an object member
-    /// named by an exact str other than ``py/object``: the members are
-    /// exactly the slots, each read at its offset, with no code run.
-    Slots,
-    /// Generic lookup, no slots, and the plain ``__dict__`` descriptor: the
-    /// members are the instance dict's entries (``dict_read``).
-    Dict,
-    /// ``object.__getattribute__`` behind a ``__getattr__``: a set slot is
-    /// read at its offset, an unset one by ``getattr``, which calls the hook.
-    Hooked,
-    /// Each member by ``getattr``, a slot with an offset read there.
-    Generic,
-}
-
-/// What an instance dict's key sequence implies for its members, checked
-/// once per sequence while the class's stamp holds: every key is an exact
-/// str other than ``py/object`` that no data descriptor on the class shadows,
-/// so ``getattr(instance, key)`` is the dict's own value and runs no code.
-pub struct DictKeys {
-    /// The keys in insertion order, matched by identity.
-    pub keys: Vec<Py<PyAny>>,
-    /// Each member in ``attribute_names`` order: its key's index in ``keys``,
-    /// and its name as JSON text where ``plain_key_text`` gives one.
-    pub members: Vec<(u8, Option<Box<[u8]>>)>,
-}
-
 /// ``_PyType_Lookup``: the first of the MRO's dicts holding ``name``. Read
 /// here dict by dict, as it reads them, without filling the type cache a
 /// class seen once never reuses. Borrowed, as the class's dicts hold it.
@@ -327,25 +96,9 @@ pub unsafe fn type_lookup(
     kind: *mut ffi::PyTypeObject,
     name: *mut ffi::PyObject,
 ) -> *mut ffi::PyObject {
-    // A ready class's MRO is a tuple of classes, and an exact str's hash
-    // and ``==`` cannot fail. A static builtin type keeps its dict per
-    // interpreter rather than in ``tp_dict``, and every MRO ends in one,
-    // ``object``: from there ``_PyType_Lookup`` reads on.
-    unsafe {
-        let mro = (*kind).tp_mro;
-        for index in 0..ffi::PyTuple_GET_SIZE(mro) {
-            let base = ffi::PyTuple_GET_ITEM(mro, index).cast::<ffi::PyTypeObject>();
-            let namespace = (*base).tp_dict;
-            if namespace.is_null() {
-                break;
-            }
-            let found = dict_borrowed(namespace, name);
-            if !found.is_null() {
-                return found;
-            }
-        }
-        _PyType_Lookup(kind, name)
-    }
+    // An exact str's hash and ``==`` cannot fail, so the lookup runs no code;
+    // CPython's type cache answers a repeated one.
+    unsafe { _PyType_Lookup(kind, name) }
 }
 
 /// What ``getattr(class, name)`` does, where that is known with no code run.
@@ -406,14 +159,6 @@ pub unsafe fn type_reads(
     }
 }
 
-/// Whether ``kind``'s MRO holds ``name``, read through the type cache: a
-/// class asked about again and again (each record's) finds its answer there,
-/// a miss included, without walking its MRO each time.
-#[inline]
-pub unsafe fn type_has(kind: *mut ffi::PyTypeObject, name: *mut ffi::PyObject) -> bool {
-    unsafe { !_PyType_Lookup(kind, name).is_null() }
-}
-
 /// ``namespace[key]`` as a borrowed reference, or null where it is absent.
 /// Callers pass an exact dict and an exact str key, whose lookup cannot fail.
 #[cfg(Py_3_13)]
@@ -441,90 +186,7 @@ unsafe fn dict_borrowed(
     unsafe { ffi::PyDict_GetItem(namespace, key) }
 }
 
-impl Layout {
-    pub fn len(&self) -> usize {
-        self.offsets.len()
-    }
-
-    /// ``key_texts``, written on first use.
-    pub fn key_texts(&self, py: Python<'_>) -> &[KeyText] {
-        self.key_texts.get_or_init(|| {
-            self.names
-                .bind(py)
-                .iter()
-                .map(|name| crate::json::plain_key_text(&name))
-                .collect()
-        })
-    }
-
-    /// The name of slot ``index``, borrowed from ``names``.
-    #[inline]
-    pub fn name<'py>(&self, py: Python<'py>, index: usize) -> B<'py> {
-        unsafe { self.names.bind(py).get_borrowed_item_unchecked(index) }.to_owned()
-    }
-
-    /// Each slot's name with its offset.
-    pub fn slots<'a, 'py>(
-        &'a self,
-        py: Python<'py>,
-    ) -> impl ExactSizeIterator<Item = (B<'py>, Option<isize>)> + 'a
-    where
-        'py: 'a,
-    {
-        let names = self.names.bind(py);
-        self.offsets.iter().enumerate().map(move |(index, offset)| {
-            (
-                unsafe { names.get_borrowed_item_unchecked(index) }.to_owned(),
-                *offset,
-            )
-        })
-    }
-
-    /// The layout of slots ``names`` at ``offsets``, read as ``reading``
-    /// says. ``Reading::Slots`` asks only for generic lookup and no instance
-    /// dict; it is kept where every slot has an offset and a plain key for a
-    /// name, else the slots are read generically.
-    pub fn new(
-        stamp: Stamp,
-        names: Bound<'_, PyTuple>,
-        offsets: Box<[Option<isize>]>,
-        reading: Reading,
-    ) -> Self {
-        let exact = || {
-            offsets.iter().all(Option::is_some)
-                && names
-                    .iter()
-                    .all(|name| unsafe { crate::encode::plain_key_raw(name.as_ptr()) })
-        };
-        let reading = match reading {
-            Reading::Slots if !exact() => Reading::Generic,
-            reading => reading,
-        };
-        Self {
-            stamp,
-            names: names.unbind(),
-            offsets,
-            reading,
-            key_texts: std::cell::OnceCell::new(),
-            dict_keys: std::cell::RefCell::new(None),
-            plan: std::cell::OnceCell::new(),
-        }
-    }
-}
-
-/// Whether an object node can take ``name`` as a key built at the end: an
-/// exact str, whose hash and equality run no code, other than ``py/object``.
-#[inline]
-pub fn is_clean_name(name: &B<'_>) -> bool {
-    tp(name) == t_str() && utf8(name).is_some_and(|text| text != b"py/object")
-}
-
 pub const PY_AUDIT_READ: std::ffi::c_int = 2;
-
-#[inline]
-pub fn generic_getattr(kind: *mut ffi::PyTypeObject) -> bool {
-    unsafe { (*kind).tp_getattro }.map(|f| f as usize) == generic_getattr_slot()
-}
 
 /// The slot ``found`` describes for instances of ``kind``, if it is a member
 /// descriptor that applies to them. A class can install another class's
@@ -572,53 +234,61 @@ fn member_offset(
     }
 }
 
-/// Where ``kind``'s instances hold slot ``name``, if generic attribute lookup
-/// would read it straight from there: a plain object member, nothing audited.
-pub fn slot_offset(kind: *mut ffi::PyTypeObject, name: &B<'_>) -> Option<isize> {
-    member_offset(kind, name, PY_AUDIT_READ)
-}
-
 /// Where ``object.__setattr__`` stores ``name`` in ``kind``'s instances: a
 /// writable plain object member.
 pub fn store_offset(kind: *mut ffi::PyTypeObject, name: &B<'_>) -> Option<isize> {
     member_offset(kind, name, ffi::Py_READONLY)
 }
 
-/// Each of ``names``' store offset in ``kind``, where storing through it is
-/// what ``object.__setattr__`` would do; stamped before it is read. Empty
-/// where ``kind``'s ``__setattr__`` is not ``object``'s.
-pub fn store_offsets(kind: &B<'_>, names: &[Box<[u8]>]) -> (Stamp, Vec<Option<isize>>) {
+/// Where ``object.__setattr__`` stores one attribute of an instance.
+#[derive(Clone, Copy)]
+pub enum Store {
+    /// A writable plain object member at this offset.
+    Slot(isize),
+    /// The instance dict: no data descriptor on the class takes the name.
+    Dict,
+}
+
+/// Where ``object.__setattr__`` stores each of ``names`` in ``kind``'s
+/// instances, ``None`` for a name only the call itself can store; stamped
+/// before it is read. Empty where the call is not
+/// ``PyObject_GenericSetAttr``: it is wherever the first class in ``kind``'s
+/// base chain that Python did not make sets attributes as ``object`` does.
+pub fn stores(kind: &B<'_>, names: &[Box<[u8]>]) -> (Stamp, Vec<Option<Store>>) {
     let py = kind.py();
     let stamp = Stamp::always(kind);
     let class = kind.as_ptr().cast::<ffi::PyTypeObject>();
     let generic = unsafe {
+        // ``object.__setattr__`` passes over Python classes' own
+        // ``__setattr__``; the first static class it meets must set as
+        // ``object`` does.
+        let mut base = class;
+        while !base.is_null() && ffi::PyType_HasFeature(base, ffi::Py_TPFLAGS_HEAPTYPE) != 0 {
+            base = (*base).tp_base;
+        }
         ob_type(kind.as_ptr()) == &raw mut ffi::PyType_Type
-            && (*class).tp_setattro.map(|f| f as usize)
+            && !base.is_null()
+            && (*base).tp_setattro.map(|f| f as usize)
                 == ffi::PyBaseObject_Type.tp_setattro.map(|f| f as usize)
     };
     if !generic {
         return (stamp, Vec::new());
     }
-    let offsets = names
+    let dict = dict_storage(class);
+    let stores = names
         .iter()
         .map(|name| {
             let text = std::str::from_utf8(name).ok()?;
-            store_offset(class, PyString::intern(py, text).as_any())
+            let name = PyString::intern(py, text);
+            if let Some(offset) = store_offset(class, name.as_any()) {
+                return Some(Store::Slot(offset));
+            }
+            let found = unsafe { type_lookup(class, name.as_ptr()) };
+            let plain = found.is_null() || unsafe { (*ob_type(found)).tp_descr_set.is_none() };
+            (dict && plain).then_some(Store::Dict)
         })
         .collect();
-    (stamp, offsets)
-}
-
-/// Whether ``kind`` is a heap class under a plain ``type`` metaclass, and
-/// not itself a metaclass: one whose reads here answer as ``getattr`` would.
-#[inline]
-pub fn plain_heap_class(kind: &B<'_>) -> bool {
-    let class = kind.as_ptr().cast::<ffi::PyTypeObject>();
-    unsafe {
-        ob_type(kind.as_ptr()) == &raw mut ffi::PyType_Type
-            && ffi::PyType_HasFeature(class, ffi::Py_TPFLAGS_HEAPTYPE) != 0
-            && ffi::PyType_HasFeature(class, ffi::Py_TPFLAGS_TYPE_SUBCLASS) == 0
-    }
+    (stamp, stores)
 }
 
 /// ``kind``'s own namespace, for a heap class straight under ``object``
@@ -653,12 +323,6 @@ pub fn dict_storage(kind: *mut ffi::PyTypeObject) -> bool {
     }
 }
 
-/// Whether ``kind``'s instances have no ``__dict__``: no dict storage, and
-/// no ``__dict__`` anywhere in its MRO, as ``reflect._dictless`` reads it.
-pub fn dictless(kind: *mut ffi::PyTypeObject, py: Python<'_>) -> bool {
-    !dict_storage(kind) && unsafe { type_lookup(kind, intern!(py, "__dict__").as_ptr()).is_null() }
-}
-
 /// ``object.__new__``'s slot, where ``kind.__new__(kind)`` is a call of it:
 /// a plain ``type`` metaclass finds ``object``'s own ``__new__``, and
 /// ``kind`` inherits its slot.
@@ -677,245 +341,22 @@ pub fn object_new(kind: &B<'_>) -> Option<ffi::newfunc> {
     }
 }
 
-/// The layout of a class ``type`` built from its own ``__slots__`` tuple,
-/// straight under ``object``, read in one pass over the end of its dict.
-///
-/// ``type`` keeps the slot names sorted in ``ht_slots`` (``sorted``'s order)
-/// and lays out ``tp_members`` in that order; it adds ``__slots__`` to the
-/// namespace, then one member descriptor per name, then ``__weakref__`` when
-/// that is a slot. The pass proves each entry is still there, so each member
-/// is what ``getattr`` reads, and that no ``__dict__`` slot was made
-/// (``ht_slots`` would then hold one name fewer than ``__slots__``). Unsorted,
-/// the names keep ``__slots__``' order. ``None`` for any other class, which
-/// ``slot_names`` then reads in Python.
-/// Whether the dict key ``key`` is the exact str ``name``: the same object,
-/// as an interned key is, or the same characters.
-///
-/// # Safety
-/// Both are live; ``name`` is an exact str.
-#[inline]
-unsafe fn is_name(key: *mut ffi::PyObject, name: *mut ffi::PyObject) -> bool {
-    unsafe {
-        key == name
-            || (ob_type(key) == t_str()
-                && utf8_ptr(key).is_some_and(|text| Some(text) == utf8_ptr(name)))
-    }
-}
-
-pub fn own_layout(
-    class: *mut ffi::PyTypeObject,
-    before: &Stamp,
-    sort: bool,
-    py: Python<'_>,
-) -> Option<Layout> {
-    unsafe {
-        if ffi::PyType_HasFeature(class, ffi::Py_TPFLAGS_HEAPTYPE) == 0 {
-            return None;
-        }
-        let names = (*class.cast::<ffi::PyHeapTypeObject>()).ht_slots;
-        if names.is_null() {
-            return None;
-        }
-        let mut offsets = vec![None; ffi::PyTuple_GET_SIZE(names) as usize];
-        let read = own_offsets(class, sort, py, &mut offsets)?;
-        layout_from(py, before.clone_in(py), sort, &read, &offsets[..read.count])
-    }
-}
-
-/// Up to this many slots are read into buffers on the stack.
-pub const STACK_SLOTS: usize = 32;
-
-/// What ``own_offsets`` proved of a class: its ``ht_slots`` names, its
-/// ``__slots__`` entry, and how many slots it has.
-pub struct OwnSlots {
-    pub names: *mut ffi::PyObject,
-    declared: *mut ffi::PyObject,
-    pub count: usize,
-}
-
-/// ``own_layout``'s reading, each slot's offset written to ``offsets`` in
-/// ``ht_slots`` order. ``count`` past ``offsets``' length writes nothing and
-/// proves nothing; the caller reads the class with room for it.
-///
-/// # Safety
-/// ``class`` is a live class.
-pub unsafe fn own_offsets(
-    class: *mut ffi::PyTypeObject,
-    sort: bool,
-    py: Python<'_>,
-    offsets: &mut [Option<isize>],
-) -> Option<OwnSlots> {
-    unsafe {
-        let mro = (*class).tp_mro;
-        if ffi::PyType_HasFeature(class, ffi::Py_TPFLAGS_HEAPTYPE) == 0
-            || mro.is_null()
-            || ob_type(mro) != t_tuple()
-            || ffi::PyTuple_GET_SIZE(mro) != 2
-            || ffi::PyTuple_GET_ITEM(mro, 1) != (&raw mut ffi::PyBaseObject_Type).cast()
-            || dict_storage(class)
-        {
-            return None;
-        }
-        let own = (*class).tp_dict;
-        let names = (*class.cast::<ffi::PyHeapTypeObject>()).ht_slots;
-        let members = (*class).tp_members;
-        if names.is_null() || members.is_null() {
-            return None;
-        }
-        let count = ffi::PyTuple_GET_SIZE(names);
-        if count as usize > offsets.len() {
-            return Some(OwnSlots {
-                names,
-                declared: std::ptr::null_mut(),
-                count: count as usize,
-            });
-        }
-        let used = ffi::PyDict_Size(own);
-        let weakref = (*class).tp_weaklistoffset != 0;
-        // ``__slots__``, the members, and ``__weakref__`` when it is a slot.
-        let tail = count + 1 + ffi::Py_ssize_t::from(weakref);
-        // A dict that lost an entry (``dataclass(slots=True)`` rebuilds its
-        // namespace) holds its live entries past ``used`` positions, so the
-        // tail is found by its first key, ``__slots__``, searched from where
-        // a dict with no holes would hold it.
-        let slots_key = intern!(py, "__slots__").as_ptr();
-        // ``PyDict_Next`` finds nothing from a negative position.
-        let mut position = used - tail;
-        let mut key = std::ptr::null_mut();
-        let mut entry = std::ptr::null_mut();
-        loop {
-            if ffi::PyDict_Next(own, &mut position, &mut key, &mut entry) == 0 {
-                return None;
-            }
-            if is_name(key, slots_key) {
-                break;
-            }
-        }
-        // Sorted, ``__slots__`` itself is never read: a ``__dict__`` slot
-        // would have set the dict offset refused above, and the pass below
-        // proves every name ``ht_slots`` holds, in order. Unsorted, its order
-        // is the output's.
-        let declared = entry;
-        if !sort
-            && (ob_type(declared) != t_tuple()
-                || ffi::PyTuple_GET_SIZE(declared) != count + ffi::Py_ssize_t::from(weakref))
-        {
-            return None;
-        }
-        // The entries first, then each checked: every descriptor is an
-        // object a new class has never brought in, and gathering them before
-        // reading any lets those loads overlap rather than wait in turn. On
-        // the stack: a heap buffer is memory a cold walk last touched long
-        // ago, and the allocator misses on it.
-        let mut held = [(std::ptr::null_mut(), std::ptr::null_mut()); STACK_SLOTS];
-        let mut spilled = Vec::new();
-        let entries = if count as usize <= STACK_SLOTS {
-            &mut held[..count as usize]
-        } else {
-            spilled.resize(count as usize, (std::ptr::null_mut(), std::ptr::null_mut()));
-            &mut spilled[..]
-        };
-        for each in entries.iter_mut() {
-            if ffi::PyDict_Next(own, &mut position, &mut key, &mut entry) == 0 {
-                return None;
-            }
-            *each = (key, entry);
-        }
-        for (index, (&(key, entry), offset)) in entries.iter().zip(offsets.iter_mut()).enumerate() {
-            let index = index as ffi::Py_ssize_t;
-            let member = members.offset(index);
-            let name = ffi::PyTuple_GET_ITEM(names, index);
-            if !is_name(key, name) || ob_type(entry) != &raw mut ffi::PyMemberDescr_Type {
-                return None;
-            }
-            let descriptor = entry.cast::<ffi::PyMemberDescrObject>();
-            if (*descriptor).d_common.d_type != class
-                || (*descriptor).d_member.cast::<ffi::PyMemberDef>() != member
-                || (*member).type_code != ffi::Py_T_OBJECT_EX
-                || (*member).flags & PY_AUDIT_READ != 0
-            {
-                return None;
-            }
-            // ``ht_slots`` holds a private slot mangled while ``__slots__``
-            // keeps it as written, so the unsorted order cannot be read from
-            // the two; such a class is left to ``slot_names``.
-            let text = utf8_ptr(name)?;
-            if text.starts_with(b"__") || text.starts_with(b"py/") || text.starts_with(b"json://") {
-                return None;
-            }
-            *offset = Some((*member).offset);
-        }
-        if weakref
-            && (ffi::PyDict_Next(own, &mut position, &mut key, &mut entry) == 0
-                || !is_name(key, intern!(py, "__weakref__").as_ptr()))
-        {
-            return None;
-        }
-        // Nothing after: an entry added since would shadow no slot, but a
-        // dict read this way is one ``type`` left as it built it.
-        if ffi::PyDict_Next(own, &mut position, &mut key, &mut entry) != 0 {
-            return None;
-        }
-        Some(OwnSlots {
-            names,
-            declared,
-            count: count as usize,
-        })
-    }
-}
-
-/// The ``Layout`` of what ``own_offsets`` read, in ``__slots__``' order
-/// unless ``sort``.
-///
-/// # Safety
-/// ``read`` came from ``own_offsets`` with ``offsets`` written, its class
-/// alive and unchanged since.
-pub unsafe fn layout_from(
-    py: Python<'_>,
-    stamp: Stamp,
-    sort: bool,
-    read: &OwnSlots,
-    offsets: &[Option<isize>],
-) -> Option<Layout> {
-    unsafe {
-        let names = Bound::from_borrowed_ptr(py, read.names).cast_into_unchecked::<PyTuple>();
-        if sort {
-            return Some(Layout::new(stamp, names, offsets.into(), Reading::Slots));
-        }
-        // ``__slots__``' order: each name is one ``ht_slots`` holds, or the
-        // ``__weakref__`` slot, which carries no state.
-        let declared = Bound::from_borrowed_ptr(py, read.declared).cast_into_unchecked::<PyTuple>();
-        let mut order = Vec::with_capacity(read.count);
-        let mut kept = Vec::with_capacity(read.count);
-        for name in declared.iter() {
-            if name.as_ptr() == intern!(py, "__weakref__").as_ptr() {
-                continue;
-            }
-            let at = names.iter().position(|each| each.is(&name))?;
-            order.push(name);
-            kept.push(offsets[at]);
-        }
-        Some(Layout::new(
-            stamp,
-            PyTuple::new(py, order).ok()?,
-            kept.into_boxed_slice(),
-            Reading::Slots,
-        ))
-    }
-}
-
 // ----------------------------------------------------------- import paths --
-
-/// The last module an import path was read from: its name, the
-/// ``sys.modules`` generation then, and its namespace.
-pub type ModuleMemo<'py> = std::cell::RefCell<Option<(B<'py>, u64, Bound<'py, PyDict>)>>;
 
 /// What the path reader reads besides the class: ``sys.__dict__``, where
 /// ``sys.modules`` is bound, and ``types.ModuleType``.
 pub struct PathGlobals {
     pub sys_dict: Py<PyDict>,
     pub module_type: Py<PyAny>,
+    /// The module a path was last read from: its name, the ``MODULES``
+    /// generation then, and its watched namespace. Paths of one module come
+    /// in runs, and each reads that module again.
+    pub last: std::cell::RefCell<Option<ModuleRead>>,
 }
+
+/// A module's name, the ``MODULES`` generation it was read at, and its
+/// namespace.
+pub type ModuleRead = (Py<PyString>, u64, Py<PyDict>);
 
 impl PathGlobals {
     /// ``sys.modules``, where it is an exact dict, read from ``sys``'s own
@@ -926,6 +367,46 @@ impl PathGlobals {
             .bind(py)
             .get_item(intern!(py, "modules"))?
             .and_then(|modules| modules.cast_into_exact::<PyDict>().ok()))
+    }
+
+    /// The namespace of the module ``sys.modules`` holds under ``name``,
+    /// kept for the next path of the same module while ``sys.modules`` and
+    /// the namespaces watched stand; ``None`` where Python must say.
+    pub fn module_namespace<'py>(
+        &self,
+        name: &Bound<'py, PyString>,
+    ) -> PyResult<Option<Bound<'py, PyDict>>> {
+        let py = name.py();
+        if let Some(generation) = sync::MODULES.generation()
+            && let Some((module, at, namespace)) = &*self.last.borrow()
+            && *at == generation
+            && module.as_ptr() == name.as_ptr()
+        {
+            return Ok(Some(namespace.bind(py).clone()));
+        }
+        let Some(modules) = self.modules(py)? else {
+            return Ok(None);
+        };
+        // Watched before it is read, so a change from here on is seen.
+        let watched = sync::MODULES.watch(&modules);
+        let Some(module) = modules.get_item(name)? else {
+            return Ok(None);
+        };
+        let Some(namespace) = self.namespace(&module) else {
+            return Ok(None);
+        };
+        if watched
+            && sync::watch_namespace(&namespace)
+            && let Some(generation) = sync::MODULES.generation()
+        {
+            let stale = self.last.replace(Some((
+                name.clone().unbind(),
+                generation,
+                namespace.clone().unbind(),
+            )));
+            drop(stale);
+        }
+        Ok(Some(namespace))
     }
 
     /// ``module``'s namespace where it is an exact ``types.ModuleType``,
@@ -964,122 +445,6 @@ impl PathGlobals {
     }
 }
 
-/// ``_import_path(kind)`` for a class whose path reads with no Python code:
-/// ``f"{__module__}.{__qualname__}"``, verified to resolve to the class
-/// itself through plain module and class dicts. ``None`` to ask Python.
-pub fn native_import_path_in<'py>(
-    py: Python<'py>,
-    g: &PathGlobals,
-    memo: &ModuleMemo<'py>,
-    kind: &B<'py>,
-) -> PyResult<Option<B<'py>>> {
-    if let Some(path) = memo_path(py, memo, kind) {
-        return Ok(Some(path));
-    }
-    let class = kind.as_ptr().cast::<ffi::PyTypeObject>();
-    unsafe {
-        if ob_type(kind.as_ptr()) != &raw mut ffi::PyType_Type
-            || ffi::PyType_HasFeature(class, ffi::Py_TPFLAGS_HEAPTYPE) == 0
-        {
-            return Ok(None);
-        }
-    }
-    // A heap class's namespace is always an exact dict.
-    let own =
-        unsafe { Bound::from_borrowed_ptr(py, (*class).tp_dict).cast_into_unchecked::<PyDict>() };
-    let Some(module) = own.get_item(intern!(py, "__module__"))? else {
-        return Ok(None);
-    };
-    let qualname = unsafe {
-        Bound::from_borrowed_ptr(py, (*class.cast::<ffi::PyHeapTypeObject>()).ht_qualname)
-    };
-    let (Some(module_text), Some(qual_text)) = (
-        (tp(&module) == t_str()).then(|| utf8(&module)).flatten(),
-        (tp(&qualname) == t_str())
-            .then(|| utf8(&qualname))
-            .flatten(),
-    ) else {
-        return Ok(None);
-    };
-    if qual_text.contains(&b'<') && qual_text.windows(8).any(|window| window == b"<locals>") {
-        return Ok(None);
-    }
-    // ``utf8`` gives a str's own UTF-8 bytes, valid by construction.
-    let (module_text, qual_text) = unsafe {
-        (
-            std::str::from_utf8_unchecked(module_text),
-            std::str::from_utf8_unchecked(qual_text),
-        )
-    };
-    let top_level = !qual_text.as_bytes().contains(&b'.');
-    let mut path = String::with_capacity(module_text.len() + 1 + qual_text.len());
-    path.push_str(module_text);
-    path.push('.');
-    path.push_str(qual_text);
-    let parts: Vec<&str> = if top_level {
-        Vec::new()
-    } else {
-        path.split('.').collect()
-    };
-    // ``resolve_import`` walks from the longest dotted prefix loaded in
-    // ``sys.modules``; it must be exactly the class's own module here.
-    let Some(modules) = g.modules(py)? else {
-        return Ok(None);
-    };
-    let module_parts = if top_level {
-        0
-    } else {
-        module_text.split('.').count()
-    };
-    if !top_level {
-        for split in (module_parts + 1..parts.len()).rev() {
-            if modules.contains(parts[..split].join("."))? {
-                return Ok(None);
-            }
-        }
-    }
-    let Some(found) = modules.get_item(&module)? else {
-        return Ok(None);
-    };
-    let Some(namespace) = g.namespace(&found) else {
-        return Ok(None);
-    };
-    // A top-level class: its ``__qualname__`` is the one key to read, and
-    // the str already holds its hash.
-    if top_level {
-        // ``sys.modules[module]``'s namespace, kept once per module per walk
-        // while ``sys.modules`` is unchanged. The watcher is registered on
-        // first use: ``generation`` is ``None`` until ``watch`` has run once.
-        let watched = sync::MODULES.watch(py, &modules);
-        // Read after watching, so a change from here on is seen.
-        if watched && let Some(generation) = sync::MODULES.generation() {
-            *memo.borrow_mut() = Some((module.clone(), generation, namespace.clone()));
-        }
-        let holds =
-            unsafe { g.module_entry(namespace.as_ptr(), qualname.as_ptr()) } == kind.as_ptr();
-        return Ok(holds.then(|| dotted(py, module_text, qual_text)));
-    }
-    let mut walked = found;
-    for part in &parts[module_parts..] {
-        let name = PyString::new(py, part);
-        let next = match g.namespace(&walked) {
-            Some(namespace) => unsafe { g.module_entry(namespace.as_ptr(), name.as_ptr()) },
-            None => match unsafe { class_attr(walked.as_ptr(), name.as_ptr()) } {
-                ClassAttr::Found(entry, _) => entry,
-                ClassAttr::Missing | ClassAttr::Ask => std::ptr::null_mut(),
-            },
-        };
-        if next.is_null() {
-            return Ok(None);
-        }
-        walked = unsafe { Bound::from_borrowed_ptr(py, next) };
-    }
-    if !walked.is(kind) {
-        return Ok(None);
-    }
-    Ok(Some(PyString::new(py, &path).into_any()))
-}
-
 // Perf: rows to_plain, perf stat instructions: +0.5% over checking the
 // ``MODULES`` generation alone. A recheck is one atomic load and one stamp compare per class the
 // path passes through; see ``holds``.
@@ -1113,43 +478,6 @@ pub struct PathCheck {
 
 /// Each class a path's walk passed through, with its stamp at the time.
 type Through = Vec<(Py<PyAny>, Stamp)>;
-
-/// A class's path kept with its facts, and how to recheck it.
-pub struct KeptPath {
-    pub path: Py<PyAny>,
-    // Perf: cold exp000 to_plain: most kept classes are implied records whose
-    // path is never read again, so the check is built on its first use.
-    check: std::cell::OnceCell<Option<PathCheck>>,
-}
-
-impl KeptPath {
-    /// ``path`` for ``kind``, rechecked once asked.
-    pub fn new(path: &B<'_>) -> Self {
-        Self {
-            path: path.clone().unbind(),
-            check: std::cell::OnceCell::new(),
-        }
-    }
-
-    /// The path, while it still names ``kind``.
-    #[inline]
-    pub fn current<'py>(&self, g: &PathGlobals, kind: &B<'py>) -> PyResult<Option<B<'py>>> {
-        let py = kind.py();
-        let check = match self.check.get() {
-            Some(check) => check,
-            None => {
-                // Read from the longest loaded prefix, as ``resolves_to``
-                // reads it: ``kind.__module__`` may run code Python never runs.
-                let check = PathCheck::loaded(g, self.path.bind(py))?;
-                self.check.get_or_init(|| check)
-            }
-        };
-        let Some(check) = check else {
-            return Ok(None);
-        };
-        Ok((check.holds(g, kind)? == Some(true)).then(|| self.path.bind(py).clone()))
-    }
-}
 
 impl PathCheck {
     /// The check for ``path`` read in module ``module``, or ``None`` where
@@ -1229,17 +557,13 @@ impl PathCheck {
 
     #[cold]
     fn held_now(&self, g: &PathGlobals, value: &B<'_>) -> PyResult<Option<bool>> {
-        let py = value.py();
         let mut through = Vec::with_capacity(self.attrs.len().saturating_sub(1));
         let verdict = self.walk(g, value, &mut through)?;
         // Kept only once each dict the walk read is watched (``sys.modules``
         // by ``namespace``, the module's namespace here) and each class it
         // passed through is stamped, its stamp taken before it was read.
-        let watched = self
-            .found
-            .borrow()
-            .as_ref()
-            .is_some_and(|(_, namespace)| sync::watch_namespace(py, namespace.bind(py)));
+        // A namespace is kept in ``found`` only once it is watched.
+        let watched = self.found.borrow().is_some();
         let kept = if verdict == Some(true) && watched {
             sync::MODULES.generation().map(|now| (now, through))
         } else {
@@ -1308,7 +632,7 @@ impl PathCheck {
             return Ok(None);
         };
         // Watched before it is read, so a change from here on is seen.
-        let watched = sync::MODULES.watch(py, &modules);
+        let watched = sync::MODULES.watch(&modules);
         for prefix in &self.longer {
             if modules.contains(prefix.bind(py))? {
                 return Ok(None);
@@ -1320,109 +644,15 @@ impl PathCheck {
         let Some(namespace) = g.namespace(&module) else {
             return Ok(None);
         };
-        if watched && let Some(generation) = sync::MODULES.generation() {
+        if watched
+            && sync::watch_namespace(&namespace)
+            && let Some(generation) = sync::MODULES.generation()
+        {
             let stale = self
                 .found
                 .replace(Some((generation, namespace.clone().unbind())));
             drop(stale);
         }
         Ok(Some(namespace))
-    }
-}
-
-/// ``native_import_path_in`` for the common case, on raw pointers: a
-/// top-level class of the module the walk last read, while ``sys.modules``
-/// is unchanged, with ASCII names. ``None`` leaves every other case, and
-/// any doubt, to the full lookup.
-fn memo_path<'py>(py: Python<'py>, memo: &ModuleMemo<'py>, kind: &B<'py>) -> Option<B<'py>> {
-    let generation = sync::MODULES.generation()?;
-    let memo = memo.borrow();
-    let (name, at, namespace) = memo.as_ref()?;
-    if *at != generation {
-        return None;
-    }
-    let class = kind.as_ptr().cast::<ffi::PyTypeObject>();
-    unsafe {
-        if ob_type(kind.as_ptr()) != &raw mut ffi::PyType_Type
-            || ffi::PyType_HasFeature(class, ffi::Py_TPFLAGS_HEAPTYPE) == 0
-        {
-            return None;
-        }
-        // The class dict, its qualname and their headers are each a line a
-        // new class has never brought in; ask for all of them at once.
-        #[cfg(target_arch = "x86_64")]
-        {
-            use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
-            let qualname = (*class.cast::<ffi::PyHeapTypeObject>()).ht_qualname;
-            _mm_prefetch::<_MM_HINT_T0>(qualname.cast());
-            let own = (*class).tp_dict.cast::<ffi::PyDictObject>();
-            _mm_prefetch::<_MM_HINT_T0>(own.cast());
-        }
-        let own = (*class).tp_dict;
-        // A class statement stores ``__module__`` first; the key is the
-        // interned str, so a pointer compare finds it.
-        let mut position: ffi::Py_ssize_t = 0;
-        let mut key = std::ptr::null_mut();
-        let mut module = std::ptr::null_mut();
-        if ffi::PyDict_Next(own, &mut position, &mut key, &mut module) == 0
-            || key != intern!(py, "__module__").as_ptr()
-            || module != name.as_ptr()
-        {
-            return None;
-        }
-        let qualname = (*class.cast::<ffi::PyHeapTypeObject>()).ht_qualname;
-        if ob_type(qualname) != t_str()
-            || !compact_ascii_str(qualname)
-            || !compact_ascii_str(module)
-        {
-            return None;
-        }
-        let qual_text = ascii_bytes(qualname);
-        // Top level: no ``.``, and so no ``<locals>`` either. A dunder name
-        // may be one ``ModuleType`` answers for, which ``module_entry`` reads.
-        if qual_text.contains(&b'.') || qual_text.starts_with(b"__") {
-            return None;
-        }
-        // An exact str key's lookup in an exact dict cannot fail.
-        let found = dict_borrowed(namespace.as_ptr(), qualname);
-        if found != kind.as_ptr() {
-            return None;
-        }
-        ascii_dotted(py, ascii_bytes(module), qual_text)
-    }
-}
-
-/// ``f"{module}.{qualname}"``: written straight into a compact str when both
-/// are ASCII, else formatted.
-fn dotted<'py>(py: Python<'py>, module: &str, qualname: &str) -> B<'py> {
-    if module.is_ascii()
-        && qualname.is_ascii()
-        && let Some(made) = ascii_dotted(py, module.as_bytes(), qualname.as_bytes())
-    {
-        return made;
-    }
-    PyString::new(py, &format!("{module}.{qualname}")).into_any()
-}
-
-/// ``f"{module}.{qualname}"`` from two ASCII names, written straight into
-/// one new compact ASCII str; ``None`` if it cannot be allocated.
-fn ascii_dotted<'py>(py: Python<'py>, module: &[u8], qualname: &[u8]) -> Option<B<'py>> {
-    let size = module.len() + 1 + qualname.len();
-    unsafe {
-        let raw = ffi::PyUnicode_New(size as ffi::Py_ssize_t, 127);
-        let Some(made) = Bound::from_owned_ptr_or_opt(py, raw) else {
-            drop(PyErr::fetch(py));
-            return None;
-        };
-        // A new compact ASCII str's bytes follow its header, NUL-terminated.
-        let data = raw.cast::<ffi::PyASCIIObject>().add(1).cast::<u8>();
-        std::ptr::copy_nonoverlapping(module.as_ptr(), data, module.len());
-        *data.add(module.len()) = b'.';
-        std::ptr::copy_nonoverlapping(
-            qualname.as_ptr(),
-            data.add(module.len() + 1),
-            qualname.len(),
-        );
-        Some(made)
     }
 }
