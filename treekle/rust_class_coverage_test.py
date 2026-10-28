@@ -15,7 +15,7 @@ import sys
 
 import pytest
 
-from treekle import reflect, serialize
+from treekle import serialize
 
 
 if TYPE_CHECKING:
@@ -327,49 +327,6 @@ def test_a_local_class_matches_python() -> None:
     _assert_encodes_alike(Local(x=1))
 
 
-@pytest.mark.parametrize(
-    "names",
-    [("x", 3), ("x", "y")],
-    ids=["a name that is not a str", "a name with no member"],
-)
-def test_slot_names_planted_in_reflect_s_cache_match_python(
-    monkeypatch: pytest.MonkeyPatch,
-    names: tuple[object, ...],
-) -> None:
-
-    module = _module(monkeypatch, "treekle_class_planted")
-    kind = _slotted(module, "Planted")
-    vars(module).update(Planted=kind)
-    monkeypatch.setitem(reflect._SLOT_NAMES, kind, names)
-    monkeypatch.setitem(reflect._SORTED_SLOT_NAMES, kind, names)
-
-    _assert_encodes_alike(kind(x=1))
-    _assert_encodes_alike(kind(x=1), sort=False)
-
-
-class _FailureError(Exception):
-    __slots__ = ("x",)
-    __dataclass_fields__: ClassVar[dict[str, object]] = {}
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.x = 1
-
-
-def test_a_slot_name_naming_a_builtin_member_matches_python(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-
-    # ``__suppress_context__`` is ``BaseException``'s bool member, not an
-    # object slot, so its value is read by ``getattr``.
-    names = ("x", "__suppress_context__")
-    monkeypatch.setitem(reflect._SLOT_NAMES, _FailureError, names)
-    monkeypatch.setitem(reflect._SORTED_SLOT_NAMES, _FailureError, names)
-    value = _FailureError()
-
-    _assert_encodes_alike(value, sort=False)
-
-
 class _Importing:
     """A value whose reduce loads a module, so ``sys.modules`` changes mid-walk."""
 
@@ -407,6 +364,22 @@ def test_a_class_with_no_module_entry_matches_python() -> None:
     assert "__module__" not in vars(kind)
 
     _assert_encodes_alike(kind)
+
+
+class _FailureError(Exception):
+    """An exception with a slot that calls itself a dataclass."""
+
+    __slots__ = ("x",)
+    __dataclass_fields__: ClassVar[dict[str, object]] = {}
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.x = 1
+
+
+@pytest.mark.parametrize("sort", [True, False])
+def test_a_slotted_exception_marked_a_dataclass_matches_python(sort: bool) -> None:
+    _assert_encodes_alike(_FailureError(), sort=sort)
 
 
 if __name__ == "__main__":

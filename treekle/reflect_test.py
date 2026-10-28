@@ -455,6 +455,24 @@ class TestAttributeNames:
         assert list(attribute_names(Hooked())) == ["a"]
         assert asked == []
 
+    def test_a_class_with_no_slots_sorts_them_once(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        sorted_slots = reflect._sorted_slots
+        sorted_for: list[type] = []
+
+        def counted(kind: type) -> tuple[str, ...]:
+            sorted_for.append(kind)
+            return sorted_slots(kind)
+
+        monkeypatch.setattr(reflect, "_sorted_slots", counted)
+        kind = type("NoSlots", (), {})
+
+        assert list(attribute_names(kind())) == []
+        assert list(attribute_names(kind())) == []
+        assert sorted_for == [kind]
+
 
 class TestClassTags:
     def test_each_class_maps_to_its_name(self) -> None:

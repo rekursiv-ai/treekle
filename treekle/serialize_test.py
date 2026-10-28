@@ -731,9 +731,10 @@ class TestToPlain:
         assert list(declared_tree) == ["py/object", "name", "children"]
 
     def test_a_cached_encoder_is_reused(self) -> None:
+        # The Python walk's own cache; the Rust core keeps its own.
         serialize._ENCODER_CACHE[Bare] = _fake_encoder
 
-        assert to_plain([Bare(1)]) == ["fake Bare"]
+        assert serialize._python_to_plain([Bare(1)]) == ["fake Bare"]
 
     def test_a_shared_mutable_reduced_value_becomes_a_reference(self) -> None:
         shared = bytearray(b"abc")
@@ -2365,6 +2366,103 @@ class TestDeepTrees:
             restored = cast("list[object]", _round_trip([value, value]))
 
         assert restored[0] is restored[1]
+
+
+type _ColorAlias = Color
+
+
+_ANY_LEAF_DECLARED: tuple[object, ...] = (
+    _ColorAlias,
+    Path,
+    Literal["red"],
+    Literal[1],
+    Literal["a/b"],
+    str | None,
+)
+
+_LEAF_CASES: list[tuple[object, str | int, object]] = [
+    *(
+        (Color.RED, "red", declared)
+        for declared in (
+            Color,
+            Color | None,
+            None | Color,
+            str | Color,
+            Color | str,
+            int | Color,
+            Literal[Color.RED],
+            Annotated[Color, "note"],
+            PurePosixPath | Color,
+            dict[str, Color],
+            *_ANY_LEAF_DECLARED,
+        )
+    ),
+    *(
+        (Level.LOW, 1, declared)
+        for declared in (
+            Level,
+            Level | None,
+            str | Level,
+            int | Level,
+            Level | int,
+            Literal[Level.LOW],
+            Annotated[Level, "note"],
+            *_ANY_LEAF_DECLARED,
+        )
+    ),
+    *(
+        (PurePosixPath("a/b"), "a/b", declared)
+        for declared in (
+            PurePosixPath,
+            PurePosixPath | None,
+            str | PurePosixPath,
+            PurePosixPath | str,
+            Annotated[PurePosixPath, "note"],
+            dict[str, PurePosixPath],
+            *_ANY_LEAF_DECLARED,
+        )
+    ),
+    *(
+        (UUID(int=1), str(UUID(int=1)), declared)
+        for declared in (
+            UUID,
+            UUID | None,
+            str | UUID,
+            UUID | str,
+            int | UUID,
+            Annotated[UUID, "note"],
+            *_ANY_LEAF_DECLARED,
+        )
+    ),
+    *(
+        (dt.datetime(2024, 1, 2, tzinfo=dt.UTC), "2024-01-02T00:00:00+00:00", declared)
+        for declared in (
+            dt.datetime,
+            dt.datetime | None,
+            str | dt.datetime,
+            dt.datetime | str,
+            dt.date | dt.datetime,
+            Annotated[dt.datetime, "note"],
+            *_ANY_LEAF_DECLARED,
+        )
+    ),
+]
+
+
+@pytest.mark.parametrize(("value", "text", "declared"), _LEAF_CASES)
+def test_a_leaf_s_verdict_is_its_class_s(
+    value: object,
+    text: str | int,
+    declared: object,
+) -> None:
+    # The Rust core asks ``_settled_leaf`` once per leaf class and keeps the
+    # answer, so the value itself must never change it.
+    kind = type(value)
+    fit = serialize._ValueFit(value=value)
+
+    by_value, _ = serialize._implied_by(text, kind, declared, {}, fit)
+
+    assert serialize._settled_leaf(kind, type(text), declared) is bool(by_value)
 
 
 if __name__ == "__main__":

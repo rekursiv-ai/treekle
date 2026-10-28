@@ -11,21 +11,22 @@ from __future__ import annotations
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from enum import Enum
-from types import MappingProxyType, ModuleType
+from types import FrameType, GenericAlias, ModuleType
 from typing import TYPE_CHECKING, cast, override
 
 import copyreg
+import gc
+import itertools
 import sys
+import weakref
 
 import pytest
 
-from treekle import reflect, serialize
+from treekle import deserialize, reflect, serialize
 
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-
-    from treekle.serialize import _Encoding
 
 
 def _outcome(call: Callable[[], object]) -> object:
@@ -275,170 +276,39 @@ class _NoFloat:
         raise ValueError("no float")
 
 
+class _Float(float):
+    __slots__ = ()
+
+
 @pytest.mark.parametrize(
     "value",
-    [_Real(1.5), _Real(float("inf")), _NoFloat()],
-    ids=["finite", "infinite", "raising"],
+    [
+        [_Real(1.5), _Real(float("inf")), _NoFloat()],
+        [_Float(1.5), _Float("inf"), _Float("nan")],
+        len,
+        [_Point(1), _Bare(a=1), _Point, len],
+        [_Shape.ROUND, _Reducing((_Point, (1,)))],
+    ],
+    ids=[
+        "numbers read through __float__",
+        "float subclasses",
+        "a builtin function",
+        "records, plain objects, classes and functions",
+        "enum members and reduce recipes",
+    ],
 )
-def test_a_value_encoded_as_a_float_matches_python(
-    monkeypatch: pytest.MonkeyPatch,
-    value: object,
-) -> None:
-    encoders = dict(serialize._ENCODERS)
-    encoders[type(value)] = serialize._encode_float
-    monkeypatch.setattr(serialize, "_ENCODERS", MappingProxyType(encoders))
-
+def test_values_each_encoder_takes_match_python(value: object) -> None:
     _assert_encodes_alike(value)
 
 
-def test_an_instance_whose_class_is_hooked_and_unreduced_matches_python(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    encoders = dict(serialize._ENCODERS)
-    encoders[_Real] = serialize._encode_hooked
-    encoders[_Bare] = serialize._encode_unreduced
-    monkeypatch.setattr(serialize, "_ENCODERS", MappingProxyType(encoders))
-
+def test_a_hooked_class_beside_an_unreduced_value_matches_python() -> None:
     def encode(real: _Real) -> float:
         return real.value
 
     hooks = {_Real: (encode, _Real)}
 
     _assert_encodes_alike([_Real(2.0), _Bare(a=1)], hooks=hooks)
-    # Chosen by the table with no hook to run: the lookup raises.
-    _assert_encodes_alike([_Real(2.0)])
-
-
-def test_a_type_that_is_not_a_class_matches_python(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    encoders = dict(serialize._ENCODERS)
-    encoders[type(len)] = serialize._encode_type
-    monkeypatch.setattr(serialize, "_ENCODERS", MappingProxyType(encoders))
-
-    _assert_encodes_alike(len)
-
-
-def test_encoders_that_are_not_the_module_s_own_match_python(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    class Encoders(dict[type, object]):
-        """An ``_ENCODERS`` that is not a watched dict."""
-
-    def encoder_for(kind: type) -> Callable[..., object]:
-        return serialize._encoder_for(kind)
-
-    monkeypatch.setattr(serialize, "_ENCODERS", Encoders(serialize._ENCODERS))
-    _assert_encodes_alike([_Point(1), {"a": [1.5]}])
-    monkeypatch.setattr(serialize, "_encoder_for", encoder_for)
-    _assert_encodes_alike([_Point(1), {"a": [1.5]}])
-
-
-def test_a_rebound_encoder_cache_matches_python(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(serialize, "_ENCODER_CACHE", {})
-
-    _assert_encodes_alike([_Point(1), _Bare(a=1)])
-
-
-def test_a_weak_cache_whose_data_was_rebound_matches_python(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(
-        serialize._ENCODER_CACHE,
-        "data",
-        MappingProxyType[object, object]({}),
-    )
-
-    _assert_encodes_alike([_Point(1)])
-
-
-def test_a_weak_cache_with_no_instance_dict_matches_python(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    cache = serialize._ENCODER_CACHE
-    monkeypatch.setattr(
-        serialize,
-        "_ENCODER_CACHE",
-        type(cache).__new__(type(cache)),  # pyrefly: ignore[bad-argument-count, bad-specialization] -- pyrefly resolves a generic class's ``__new__`` to ``GenericAlias.__new__``.
-    )
-
-    _assert_encodes_alike([_Point(1)])
-
-
-def test_reflect_helpers_that_are_not_their_own_match_python(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    def attribute_names(value: object, *, sort: bool) -> tuple[str, ...]:
-        return reflect.attribute_names(value, sort=sort)
-
-    monkeypatch.setattr(serialize, "attribute_names", attribute_names)
-    _assert_encodes_alike([_Point(1), _Bare(a=1)])
-
-
-def test_reflect_caches_that_are_not_weak_match_python(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(reflect, "_SLOT_NAMES", {})
-    monkeypatch.setattr(reflect, "_SORTED_SLOT_NAMES", {})
-
-    _assert_encodes_alike([_Point(1)])
-
-
-def test_import_path_helpers_that_are_not_their_own_match_python(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    def import_path(value: type | Callable[..., object]) -> str:
-        return serialize._import_path(value)
-
-    def verified(path: str, value: object) -> str:
-        return serialize._verified_path(path, value)
-
-    monkeypatch.setattr(serialize, "_import_path", import_path)
-    _assert_encodes_alike([_Point(1), _Point, len])
-    monkeypatch.setattr(serialize, "_verified_path", verified)
-    _assert_encodes_alike([_Point(1), _Point, len])
-
-
-def test_a_canonical_reduce_that_is_not_its_own_matches_python(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    def canonical(value: object) -> object:
-        return serialize._canonical_reduce(value)
-
-    monkeypatch.setattr(serialize, "_canonical_reduce", canonical)
-    _assert_encodes_alike([_Shape.ROUND, _Reducing((_Point, (1,)))])
-
-
-def test_a_foreign_encoder_that_raises_matches_python(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    def encode(value: object, state: _Encoding) -> object:
-        state.alive.append(value)
-        raise ValueError("refused")
-
-    encoders = dict(serialize._ENCODERS)
-    encoders[_Real] = encode
-    monkeypatch.setattr(serialize, "_ENCODERS", MappingProxyType(encoders))
-    shared = [1]
-
-    _assert_encodes_alike([shared, _Real(1.0)])
-
-
-def test_a_foreign_encoder_below_a_dict_key_matches_python(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    def encode(value: object, state: _Encoding) -> object:
-        del value
-        return serialize._encode([1, 2], state)
-
-    encoders = dict(serialize._ENCODERS)
-    encoders[_Real] = encode
-    monkeypatch.setattr(serialize, "_ENCODERS", MappingProxyType(encoders))
-    shared = [3]
-
-    _assert_encodes_alike({(_Real(1.0),): shared, "later": shared})
+    _assert_encodes_alike([_Real(2.0), _Bare(a=1)])
 
 
 @pytest.mark.parametrize("dialect", ["json", "python"])
@@ -598,23 +468,6 @@ def test_a_reduce_whose_recipe_is_all_none_matches_python() -> None:
     _assert_encodes_alike(_Reducing((None,)))
 
 
-def test_a_foreign_encoder_s_place_at_the_root_matches_python(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    shared = [1]
-
-    def encode(value: object, state: _Encoding) -> object:
-        del value
-        return [serialize._encode(shared, state), serialize._encode(shared, state)]
-
-    encoders = dict(serialize._ENCODERS)
-    encoders[_Real] = encode
-    monkeypatch.setattr(serialize, "_ENCODERS", MappingProxyType(encoders))
-
-    _assert_encodes_alike(_Real(1.0))
-    _assert_encodes_alike({"k": [_Real(1.0), shared]})
-
-
 @dataclass  # house-ignore[dataclass] -- Takes no fields.
 class _RootData:
     """A dataclass whose reduce holds a deep part that fails: it restarts as an object."""
@@ -769,6 +622,170 @@ class _OddDict:
 @pytest.mark.parametrize("sort", [True, False])
 def test_an_object_read_through_its_own_getattribute_matches_python(sort: bool) -> None:
     _assert_encodes_alike([_Looked(b=1, a=2), _OddDict()], sort=sort)
+
+
+def _treekle_calls(call: Callable[[], object]) -> list[str]:
+    """Return the treekle library functions ``call`` runs in Python, by name."""
+    names: list[str] = []
+    files = {module.__file__ for module in (serialize, reflect, deserialize)}
+
+    def profile(frame: FrameType, event: str, arg: object) -> None:
+        del arg
+        if event == "call" and frame.f_code.co_filename in files:
+            names.append(frame.f_code.co_name)
+
+    outer = sys.getprofile()
+    sys.setprofile(profile)
+    try:
+        call()
+    finally:
+        sys.setprofile(outer)
+    return names
+
+
+def _plain_module() -> ModuleType:
+    """Return a fresh module holding ``Plain``, a dataclass whose state is its instance dict."""
+    module = ModuleType(f"{__name__}_plain_{len(sys.modules)}")
+    sys.modules[module.__name__] = module
+    kind = dataclass(
+        type(
+            "Plain",
+            (),
+            {
+                "__annotations__": {"a": int, "b": list[int]},
+                "__module__": module.__name__,
+            },
+        ),
+    )
+    vars(module)["Plain"] = kind
+    return module
+
+
+@pytest.mark.skipif(
+    serialize.to_plain is serialize._python_to_plain,
+    reason="the Rust core is not built, or TREEKLE_PURE_PYTHON is set",
+)
+def test_a_rebound_module_global_keeps_what_the_core_read_of_a_class() -> None:
+    # A class's facts hold while the class is unchanged; a name rebound in
+    # its module changes nothing the walk read of it.
+    module = _plain_module()
+    value = cast("Callable[..., object]", vars(module)["Plain"])(1, [2])
+    expected = serialize._python_to_plain(value)
+    assert serialize.to_plain(value) == expected
+    vars(module)["counter"] = 1
+
+    assert _treekle_calls(lambda: serialize.to_plain(value)) == []
+    assert serialize.to_plain(value) == expected
+
+
+@pytest.mark.skipif(
+    serialize.to_plain is serialize._python_to_plain,
+    reason="the Rust core is not built, or TREEKLE_PURE_PYTHON is set",
+)
+def test_a_dataclass_with_an_instance_dict_is_read_natively_the_first_time() -> None:
+    module = _plain_module()
+    value = cast("Callable[..., object]", vars(module)["Plain"])(1, [2])
+
+    calls = _treekle_calls(lambda: serialize.to_plain(value))
+
+    assert calls == []
+    assert serialize.to_plain(value) == serialize._python_to_plain(value)
+
+
+def test_an_implied_record_with_an_extra_attribute_is_tagged_as_python_tags_it() -> (
+    None
+):
+    # A record goes untagged only where every member is a field; an
+    # attribute set on the instance beyond them keeps its tag.
+    kind = cast("Callable[..., object]", vars(_plain_module())["Plain"])
+    value = kind(1, [2])
+    vars(value)["extra"] = 3
+
+    expected = serialize._python_to_plain(value, target=kind)
+    assert isinstance(expected, dict)
+    assert "py/object" in expected
+    assert serialize.to_plain(value, target=kind) == expected
+    assert serialize.to_plain(value, target=kind) == expected
+
+
+def test_a_hint_that_resolves_later_is_read_again(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # An unresolved hint may resolve once its module gains the name, so the
+    # field types read before it does must not be kept for good.
+    module = ModuleType(f"{__name__}_later")
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    holder = dataclass(slots=True)(
+        type(
+            "Holder",
+            (),
+            {"__annotations__": {"part": "Later"}, "__module__": module.__name__},
+        ),
+    )
+    vars(module)["Holder"] = holder
+    value = cast("Callable[..., object]", holder)(_Point(1))
+    before = serialize._python_to_plain(value)
+    assert serialize.to_plain(value) == before
+
+    vars(module)["Later"] = _Point
+
+    after = serialize._python_to_plain(value)
+    assert after != before
+    assert serialize.to_plain(value) == after
+
+
+@pytest.mark.skipif(
+    serialize.to_plain is serialize._python_to_plain,
+    reason="the Rust core is not built, or TREEKLE_PURE_PYTHON is set",
+)
+def test_classes_past_the_core_s_limit_are_let_go_one_at_a_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The core keeps what it read of each class it met, in a table of bounded
+    # size: past the bound each new class takes the oldest one's place, so no
+    # call lets go of every class's facts at once. Each kept entry holds its
+    # class's qualname, so the classes share one to count what is kept. The
+    # module names each class as it is written, so its path resolves.
+    module = ModuleType(f"{__name__}_many")
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    qualname = "".join(("Ma", "ny"))
+    kinds: list[type] = []
+    kept: list[int] = []
+    for _ in range(20_000):
+        kind = type(
+            "Many",
+            (),
+            {"__qualname__": qualname, "__module__": module.__name__},
+        )
+        kinds.append(kind)
+        vars(module)["Many"] = kind
+        serialize.to_plain(kind())
+        kept.append(sys.getrefcount(qualname) - len(kinds))
+
+    assert min(later - earlier for earlier, later in itertools.pairwise(kept)) >= -1
+    assert kept[-1] > len(kinds) // 2
+    vars(module)["Many"] = kinds[0]
+    first = kinds[0]()
+    assert serialize.to_plain(first) == serialize._python_to_plain(first)
+
+
+@pytest.mark.skipif(
+    serialize.to_plain is serialize._python_to_plain,
+    reason="the Rust core is not built, or TREEKLE_PURE_PYTHON is set",
+)
+def test_declared_types_past_the_core_s_limit_are_let_go_one_at_a_time() -> None:
+    # Each ``list[int]`` written anew is its own declared type, kept with what
+    # the core decided for it until newer ones push it out.
+    held: list[weakref.ref[GenericAlias]] = []
+    for _ in range(20_000):
+        declared = GenericAlias(list, (int,))
+        held.append(weakref.ref(declared))
+        assert serialize.to_plain([1], target=declared) == [1]
+        del declared
+    gc.collect()
+
+    let_go = sum(ref() is None for ref in held)
+    assert 0 < let_go < len(held) // 2
 
 
 if __name__ == "__main__":

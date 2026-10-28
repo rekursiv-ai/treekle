@@ -256,7 +256,9 @@ def attribute_names(value: object, *, sort: bool = True) -> tuple[str, ...]:
     kind = type(value)
     slots = slot_names(kind)
     if sort:
-        slots = _SORTED_SLOT_NAMES.get(kind) or _sorted_slots(kind)
+        # ``()`` is a cached answer, as is any other.
+        cached = _SORTED_SLOT_NAMES.get(kind)
+        slots = _sorted_slots(kind) if cached is None else cached
     if _dictless(kind):
         return slots
     state = getattr(value, "__dict__", None)
