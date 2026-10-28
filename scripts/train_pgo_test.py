@@ -64,7 +64,6 @@ def test_a_config_writes_each_kind_the_profile_trains(
     assert tree == {
         "py/object": "treekle_pgo_7.Layer1",
         "child": {
-            "child": None,
             "enabled": True,
             "extra": {"scale": 1.5},
             "name": "layer0",

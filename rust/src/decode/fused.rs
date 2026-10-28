@@ -295,7 +295,7 @@ impl<'py> Exec<'_, 'py, false> {
             }
         }
         if count != rec.fields.len() {
-            return Err(Stop::Abort);
+            rec.fill_defaults(&value, seen, prog.slots.as_ref(), |_, _| Ok(()))?;
         }
         Ok(value)
     }

@@ -8,11 +8,11 @@ fill a cache the native one then reads instead.
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from enum import Enum
 from types import FrameType, GenericAlias, ModuleType
-from typing import TYPE_CHECKING, cast, override
+from typing import cast, override
 
 import copyreg
 import gc
@@ -23,10 +23,6 @@ import weakref
 import pytest
 
 from treekle import deserialize, reflect, serialize
-
-
-if TYPE_CHECKING:
-    from collections.abc import Callable
 
 
 def _outcome(call: Callable[[], object]) -> object:
@@ -708,6 +704,43 @@ def test_an_implied_record_with_an_extra_attribute_is_tagged_as_python_tags_it()
     assert serialize.to_plain(value, target=kind) == expected
 
 
+@pytest.mark.parametrize("slots", [True, False], ids=["slotted", "dict-backed"])
+def test_a_record_s_class_gaining_a_value_is_tagged_again(
+    monkeypatch: pytest.MonkeyPatch,
+    slots: bool,
+) -> None:
+    # A record declared as its own class goes untagged only while the class
+    # reads back as a record, which a ``__value__`` (an alias's mark) undoes.
+    module = ModuleType(f"{__name__}_value")
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    inner = dataclass(slots=slots)(
+        type(
+            "Inner",
+            (),
+            {"__module__": module.__name__, "__annotations__": {"x": int}},
+        ),
+    )
+    outer = dataclass(slots=slots)(
+        type(
+            "Outer",
+            (),
+            {"__module__": module.__name__, "__annotations__": {"inner": inner}},
+        ),
+    )
+    vars(module).update(Inner=inner, Outer=outer)
+    value = cast(Callable[..., object], outer)(
+        cast(Callable[..., object], inner)(1),
+    )
+
+    for change in (None, "set", "delete"):
+        if change == "set":
+            monkeypatch.setattr(inner, "__value__", int, raising=False)
+        elif change == "delete":
+            monkeypatch.delattr(inner, "__value__")
+        _assert_encodes_alike(value)
+        _assert_encodes_alike(value)
+
+
 def test_a_hint_that_resolves_later_is_read_again(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -765,7 +798,7 @@ def test_classes_past_the_core_s_limit_are_let_go_one_at_a_time(
     assert min(later - earlier for earlier, later in itertools.pairwise(kept)) >= -1
     assert kept[-1] > len(kinds) // 2
     vars(module)["Many"] = kinds[0]
-    first = kinds[0]()
+    first = cast(object, kinds[0]())
     assert serialize.to_plain(first) == serialize._python_to_plain(first)
 
 

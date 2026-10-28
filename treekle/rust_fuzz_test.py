@@ -11,12 +11,12 @@ replaced, so the two must fail alike as well.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, make_dataclass
+from dataclasses import dataclass, field, make_dataclass
 from enum import IntEnum, StrEnum
 from functools import partial
 from pathlib import PurePosixPath
 from types import GenericAlias, MappingProxyType
-from typing import Literal, cast
+from typing import Literal, Protocol, cast
 from uuid import UUID
 
 import builtins
@@ -25,7 +25,6 @@ import datetime as dt
 import itertools
 import json
 import math
-import operator
 import re
 
 from hypothesis import (
@@ -37,7 +36,7 @@ from hypothesis import (
 import pytest
 
 from treekle import deserialize, serialize, wire
-from treekle.types import ReadError
+from treekle.types import PlainTree, ReadError
 
 
 class _Color(StrEnum):
@@ -156,23 +155,50 @@ def _records(draw: st.DrawFn, *, depth: int) -> _Schema:
     """Draw a new dataclass whose fields go ``depth`` types deep, and its values."""
     names = draw(st.lists(st.sampled_from(_NAMES), unique=True, max_size=4))
     fields = [(name, *draw(_schemas(depth=depth))) for name in names]
+    specs: list[tuple[str, object] | tuple[str, object, object]] = []
+    parts: dict[str, st.SearchStrategy[object]] = {}
+    for each_name, hint, each in fields:
+        values = _sometimes_wrong(each)
+        if draw(st.booleans()):
+            specs.append((each_name, draw(_hints(hint)), _default(draw(values))))
+            parts[each_name] = st.just(_UNSET) | values
+        else:
+            specs.append((each_name, draw(_hints(hint))))
+            parts[each_name] = values
     slots = draw(st.booleans())
     name = f"_Record{next(_SERIAL)}"
     kind = make_dataclass(
         name,
-        [(field, draw(_hints(hint))) for field, hint, _ in fields],
+        specs,
         slots=slots,
         frozen=draw(st.booleans()),
+        kw_only=True,
         module=__name__,
     )
     globals()[name] = kind
-    values = st.builds(
-        kind,
-        **{field: _sometimes_wrong(each) for field, _, each in fields},
-    )
+    built = st.fixed_dictionaries(parts).map(partial(_built, kind))
     if slots:
-        return kind, values
-    return kind, st.tuples(values, st.none() | _WRONG).map(_with_extra)
+        return kind, built
+    return kind, st.tuples(built, st.none() | _WRONG).map(_with_extra)
+
+
+_UNSET = object()
+"""A field left to its default."""
+
+
+def _default(value: object) -> object:
+    """Return a field defaulting to ``value``, by a factory where it must be."""
+    if type(value) in (list, dict, set) and not value:
+        return field(default_factory=type(value))
+    # Not deepcopy: it cannot copy a MappingProxyType.
+    if type(value).__hash__ is None:
+        return field(default_factory=partial(copy.copy, value))
+    return field(default=value)
+
+
+def _built(kind: Callable[..., object], parts: Mapping[str, object]) -> object:
+    """Return ``kind`` built from ``parts``, each ``_UNSET`` one left to its default."""
+    return kind(**{name: part for name, part in parts.items() if part is not _UNSET})
 
 
 def _with_extra(drawn: tuple[object, object]) -> object:
@@ -251,13 +277,24 @@ def _schemas(draw: st.DrawFn, *, depth: int) -> _Schema:
             MappingProxyType,
         )
     if kind == "optional":
-        return operator.or_(item, None), st.none() | items
+        return _union(item, None), st.none() | items
     if kind == "object":
         return object, items
     second, seconds = draw(_schemas(depth=depth - 1))
     if kind == "fixed":
         return GenericAlias(tuple, (item, second)), st.tuples(items, seconds)
-    return operator.or_(item, second), items | seconds
+    return _union(item, second), items | seconds
+
+
+class _Unionable(Protocol):
+    """A declared type, which ``|`` joins with another into a union."""
+
+    def __or__(self, other: object, /) -> object: ...
+
+
+def _union(first: object, second: object) -> object:
+    """Return the union of the declared types ``first`` and ``second``."""
+    return cast(_Unionable, first) | second
 
 
 def _sometimes_wrong(values: st.SearchStrategy[object]) -> st.SearchStrategy[object]:
@@ -278,7 +315,6 @@ def _python_tree(case: _Case) -> object:
         )
     except (TypeError, ValueError):
         assume(False)
-        raise
 
 
 def _places(tree: object) -> list[Callable[[object], None]]:
@@ -437,7 +473,6 @@ def test_json_loads_matches_python(case: _Case) -> None:
         text = json.dumps(tree)
     except (TypeError, ValueError):
         assume(False)
-        raise
 
     actual = _read(
         lambda: wire.json_loads(
@@ -451,7 +486,7 @@ def test_json_loads_matches_python(case: _Case) -> None:
 
     expected = _read(
         lambda: deserialize._python_from_plain(
-            json.loads(text),
+            cast(PlainTree, json.loads(text)),
             case.target,
             allow_imports=True,
             strict=case.strict,

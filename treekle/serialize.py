@@ -16,6 +16,11 @@ given, declares the root. ``default_concrete_types`` says what an abstract
 declared type implies. Under the default ``object`` target, the tree reads back
 with no target at all.
 
+So is a value: a dataclass field holding what its class would rebuild it with
+is left out, as ``from_plain`` fills a missing field from its default or
+default factory (``_inferred``). A value left out is still registered where the
+walk would register it written, so a later ``py/ref`` to it still reads.
+
 The tag rules and their example are in ``treekle``'s package docstring;
 ``_implied_by`` is rule 1.
 """
@@ -28,12 +33,13 @@ from collections.abc import (
     Mapping,
     Sequence,
     Set as AbstractSet,
+    Sized,
 )
-from dataclasses import dataclass, field, is_dataclass
+from dataclasses import MISSING, Field, dataclass, field, fields, is_dataclass
 from datetime import datetime
 from enum import Enum
 from functools import partial
-from math import isfinite
+from math import copysign, isfinite, isnan
 from pathlib import Path, PurePath
 from types import (
     BuiltinFunctionType,
@@ -42,6 +48,7 @@ from types import (
     ModuleType,
 )
 from typing import (
+    TYPE_CHECKING,
     Final,
     Literal,
     TypeGuard,
@@ -107,6 +114,10 @@ from treekle.types import (
     MutablePlainTree,
     PlainTree,
 )
+
+
+if TYPE_CHECKING:
+    from _typeshed import DataclassInstance
 
 
 __all__ = [
@@ -792,6 +803,8 @@ def _encode_object(value: object, state: _Encoding) -> object:
         member: object = getattr(value, name, PENDING)
         if member is not PENDING:
             members[name] = member
+    if is_dataclass(kind):
+        _leave_out_defaults(kind, members, state)
     record = is_dataclass(kind)
     implied = record and _record_implied(
         kind,
@@ -818,6 +831,125 @@ def _encode_object(value: object, state: _Encoding) -> object:
         node = {"py/object": tag, **members}
     _push_values(node, state, _DeclaredParts(named=types))
     return node
+
+
+def _leave_out_defaults(
+    kind: type[DataclassInstance],
+    members: dict[str, object],
+    state: _Encoding,
+) -> None:
+    """Drop each field of ``members`` its default rebuilds, registered as if written."""
+    defaults = _defaults(kind)
+    # In member order, as the walk would write them: of two fields holding one
+    # value, the first written is left out and the second refers to it.
+    for name, value in list(members.items()):
+        default = defaults.get(name)
+        if default is None or not _omittable(value):
+            continue
+        # A value met before is written as a ``py/ref``; a hooked one reads by its hook.
+        if id(value) in state.seen or type(value) in state.hooks:
+            continue
+        sample = default.sample()
+        if sample is _NO_SAMPLE or not _inferred(value, sample):
+            continue
+        del members[name]
+        if type(value) in _REGISTERED:
+            state.seen[id(value)] = (state.here, name)
+            state.alive.append(value)
+
+
+@dataclass(slots=True, kw_only=True)
+class _Default:
+    """A field's default, as a member is compared with it.
+
+    Attributes:
+      item: The field, its default read anew each time, as ``from_plain`` reads it.
+      factory: The default factory ``built`` was made by.
+      built: What ``factory`` built, or ``_NO_SAMPLE`` if it raised.
+
+    """
+
+    item: Field[object]
+    factory: object
+    built: object
+
+    # A factory is user code, so it runs once, not once per record; one that
+    # raises leaves its field written.
+    def sample(self) -> object:
+        """Return what the field reads back as when left out.
+
+        Returns:
+          sample: The default, or what the factory built; ``_NO_SAMPLE`` where
+            the field has neither or the factory raised.
+
+        """
+        if self.item.default is not MISSING:
+            return self.item.default
+        factory = self.item.default_factory
+        if factory is MISSING:
+            return _NO_SAMPLE
+        if factory is not self.factory:
+            self.factory = factory
+            try:
+                self.built = factory()
+            except Exception:  # noqa: BLE001 -- A factory is user code; any failure leaves its field written.
+                self.built = _NO_SAMPLE
+        return self.built
+
+
+def _defaults(kind: type[DataclassInstance]) -> Mapping[str, _Default]:
+    """Return each field of ``kind`` with a default, by name, kept per class."""
+    declared = kind.__dataclass_fields__
+    held = _DEFAULTS.get(kind)
+    if held is not None and held[0] is declared:
+        return held[1]
+    defaults = {
+        item.name: _Default(item=item, factory=MISSING, built=_NO_SAMPLE)
+        for item in fields(kind)
+        if item.default is not MISSING or item.default_factory is not MISSING
+    }
+    _DEFAULTS[kind] = declared, defaults
+    return defaults
+
+
+# Asked before a default is built, so a factory runs only for a value it could match.
+def _omittable(value: object) -> bool:
+    """Return whether ``value`` is of a kind ``_inferred`` can match at the top."""
+    kind = type(value)
+    if kind in _LEAF_DEFAULTS or isinstance(value, Enum):
+        return True
+    return kind in _EMPTIES and not cast(Sized, value)
+
+
+# Containers count only empty and at the top, where nothing inside them can be referred
+# to; a member counts only as the default member itself.
+def _inferred(value: object, sample: object, *, nested: bool = False) -> bool:
+    """Return whether reading ``sample`` back rebuilds ``value``: same class, same value."""
+    kind = type(value)
+    if kind is not type(sample):
+        return False
+    if kind is float:
+        number, other = cast(float, value), cast(float, sample)
+        if isnan(number):
+            return isnan(other)
+        return number == other and copysign(1.0, number) == copysign(1.0, other)
+    if value is None or kind in (bool, int, str, bytes):
+        return value == sample
+    if isinstance(value, Enum):
+        return value is sample
+    if kind is tuple:
+        items, others = (
+            cast(tuple[object, ...], value),
+            cast(tuple[object, ...], sample),
+        )
+        return len(items) == len(others) and all(
+            _inferred(item, other, nested=True)
+            for item, other in zip(items, others, strict=True)
+        )
+    if nested or kind not in _EMPTIES:
+        return False
+    sized, other_sized = cast(Sized, value), cast(Sized, sample)
+    return len(sized) == 0 and len(other_sized) == 0
 
 
 def _encode_hooked(value: object, state: _Encoding) -> object:
@@ -1230,6 +1362,30 @@ _DECISIONS: Final[dict[tuple[object, ...], object]] = {}
 
 _DECISION_LIMIT: Final = 4096
 """How many decisions ``_DECISIONS`` holds before it starts over."""
+
+
+_EMPTIES: Final = frozenset((dict, list, set, frozenset, MappingProxyType))
+"""Containers a default may leave out when empty."""
+
+
+_LEAF_DEFAULTS: Final = frozenset(
+    (type(None), bool, int, float, str, bytes, tuple),
+)
+"""The classes besides enums and ``_EMPTIES`` ``_inferred`` can match."""
+
+
+_REGISTERED: Final = frozenset((dict, list, set, MappingProxyType))
+"""Of ``_EMPTIES``, those the walk registers for ``py/ref`` when written."""
+
+
+_DEFAULTS: Final[
+    weakref.WeakKeyDictionary[type, tuple[object, Mapping[str, _Default]]]
+] = weakref.WeakKeyDictionary()
+"""Each dataclass's ``_defaults``, with the fields dict they were read from."""
+
+
+_NO_SAMPLE: Final = object()
+"""A field with no default, or one whose factory raised."""
 
 
 _NO_ENTRIES: Final = MappingProxyType[str, PlainTree]({})

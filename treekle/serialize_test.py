@@ -4,12 +4,13 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from collections.abc import (
+    Callable,
     Mapping,
     MutableMapping,
     Sequence,
     Set as AbstractSet,
 )
-from dataclasses import dataclass, field, fields, is_dataclass
+from dataclasses import MISSING, Field, dataclass, field, fields, is_dataclass
 from decimal import Decimal
 from enum import Enum, IntEnum
 from functools import partial
@@ -45,11 +46,10 @@ from treekle.lib.testing.resources import recursion_headroom
 from treekle.plain import immutable
 from treekle.serialize import to_plain
 from treekle.types import PlainTree, ReadError
+from treekle.wire import json_dumps, json_loads
 
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
-
     from treekle.types import Dialect, Hooks, MutablePlainTree
 
 
@@ -422,7 +422,12 @@ class Nest:
 
 
 def _ranked(z: int, a: int, label: str = "") -> MutablePlainTree:
-    return {"py/object": f"{__name__}.Ranked", "z": z, "a": a, "label": label}
+    tree: dict[str, MutablePlainTree] = {
+        "py/object": f"{__name__}.Ranked",
+        "z": z,
+        "a": a,
+    }
+    return {**tree, "label": label} if label else tree
 
 
 # Members order by their encoded tree with sorted keys. Sorting by ``a`` (the
@@ -477,11 +482,7 @@ _STATE_TUPLE_TREE: MutablePlainTree = {
 }
 
 
-_NODE_TREE: MutablePlainTree = {
-    "py/object": f"{__name__}.Node",
-    "name": "n",
-    "children": [],
-}
+_NODE_TREE: MutablePlainTree = {"py/object": f"{__name__}.Node", "name": "n"}
 
 
 def _newobj(kind: type) -> MutablePlainTree:
@@ -698,7 +699,7 @@ class TestToPlain:
                 dt.datetime(2026, 1, 2, tzinfo=dt.UTC),
                 {"py/datetime": "2026-01-02T00:00:00+00:00"},
             ),
-            (Point(x=1), {"py/object": f"{__name__}.Point", "x": 1, "y": 0.0}),
+            (Point(x=1), {"py/object": f"{__name__}.Point", "x": 1}),
             (Bare(1), _BARE_TREE),
         ],
     )
@@ -720,7 +721,7 @@ class TestToPlain:
     def test_object_attributes_sort_by_name_but_can_keep_declaration_order(
         self,
     ) -> None:
-        node = Node(name="root")
+        node = Node(name="root", children=[Node(name="leaf")])
 
         sorted_tree = to_plain(node)
         declared_tree = to_plain(node, sort=False)
@@ -792,11 +793,7 @@ class TestToPlain:
         assert tree == {'json://"py/x"': 1, "json://2": 3, 'json://"json://y"': 4}
 
     def test_dataclass_names_its_class(self) -> None:
-        assert to_plain(Point(x=1)) == {
-            "py/object": f"{__name__}.Point",
-            "x": 1,
-            "y": 0.0,
-        }
+        assert to_plain(Point(x=1)) == {"py/object": f"{__name__}.Point", "x": 1}
 
     @pytest.mark.parametrize(
         ("value", "expected"),
@@ -1371,11 +1368,7 @@ class TestImportPath:
         # Encoded several times first, so its path is kept with its facts.
         value = Point(x=1)
         for _ in range(3):
-            assert to_plain(value) == {
-                "py/object": f"{__name__}.Point",
-                "x": 1,
-                "y": 0.0,
-            }
+            assert to_plain(value) == {"py/object": f"{__name__}.Point", "x": 1}
 
         monkeypatch.setitem(globals(), "Point", Node)
 
@@ -1392,7 +1385,7 @@ class TestImportPath:
         # The name is rebound on the outer class, not on the module.
         value = Nest.Inner()
         for _ in range(3):
-            assert to_plain(value) == {"py/object": f"{__name__}.Nest.Inner", "a": 1}
+            assert to_plain(value) == {"py/object": f"{__name__}.Nest.Inner"}
 
         monkeypatch.setattr(Nest, "Inner", Bare)
 
@@ -1495,17 +1488,11 @@ class Shelf:
 
 
 def _record_tree(*, tagged: bool, **fields: MutablePlainTree) -> MutablePlainTree:
-    """Return a ``Record``'s tree under ``_FROZEN``, ``fields`` replacing."""
+    """Return a ``Record``'s tree under ``_FROZEN``: ``fields``, each other at its default."""
     tag: dict[str, MutablePlainTree] = (
         {"py/object": f"{__name__}.Record"} if tagged else {}
     )
-    defaults: dict[str, MutablePlainTree] = {
-        "extra": {},
-        "loose": None,
-        "names": [],
-        "pairs": [],
-    }
-    return {**tag, **defaults, **fields}
+    return {**tag, **fields}
 
 
 def _kinds(value: object) -> object:
@@ -1645,7 +1632,7 @@ class TestADeclaredRecordIsUntagged:
     ) -> None:
         tree = to_plain(Point(x=1), target=target)
 
-        assert tree == {"py/object": f"{__name__}.Point", "x": 1, "y": 0.0}
+        assert tree == {"py/object": f"{__name__}.Point", "x": 1}
 
     def test_a_record_field_declaring_its_class_is_untagged(self) -> None:
         value = Nest2(
@@ -2366,6 +2353,332 @@ class TestDeepTrees:
             restored = cast("list[object]", _round_trip([value, value]))
 
         assert restored[0] is restored[1]
+
+
+class Shade(Enum):
+    LIGHT = "light"
+    DARK = "dark"
+
+
+def _no_entries() -> Mapping[str, int]:
+    return MappingProxyType[str, int]({})
+
+
+def _one_seed() -> list[int]:
+    return [1]
+
+
+@dataclass(kw_only=True, slots=True)
+class Defaulted:
+    name: str
+    count: int = 0
+    level: int | bool = 1
+    rate: float = 0.0
+    note: str | None = None
+    shade: Shade = Shade.LIGHT
+    shape: tuple[int, int] = (1, 1)
+    tags: list[str] = field(default_factory=list[str])
+    extra: Mapping[str, int] = field(default_factory=_no_entries)
+
+
+@dataclass(
+    kw_only=True,
+)  # house-ignore[dataclass] -- The dict-backed twin of Defaulted.
+class DefaultedDict:
+    name: str
+    count: int = 0
+    tags: list[str] = field(default_factory=list[str])
+
+
+@dataclass(kw_only=True, slots=True)
+class Seeded:
+    seeds: list[int] = field(default_factory=_one_seed)
+
+
+@dataclass(kw_only=True, slots=True)
+class Shared:
+    cache: dict[str, int] = field(default_factory=dict[str, int])
+    alias: object = None
+
+
+@dataclass(kw_only=True, slots=True)
+class Shaded:
+    shade: Shade = Shade.LIGHT
+    other: object = None
+
+
+@dataclass(kw_only=True, slots=True)
+class SharedHolder:
+    records: list[Shared]
+    shared: dict[str, int]
+
+
+@dataclass(kw_only=True, slots=True)
+class Counted:
+    inner: object = field(default_factory=list[int])
+
+
+@dataclass(kw_only=True, slots=True)
+class Unsettled:
+    ratio: float = math.nan
+    nested: tuple[frozenset[int], ...] = (frozenset[int](),)
+
+
+_DEFAULTED: Final = f"{__name__}.Defaulted"
+
+
+class TestDefaults:
+    """A field holding what its class would rebuild it with is left out."""
+
+    def test_fields_at_their_defaults_are_left_out(self) -> None:
+        value = Defaulted(name="n")
+
+        assert to_plain(value) == {"py/object": _DEFAULTED, "name": "n"}
+        assert to_plain(value, target=Defaulted) == {"name": "n"}
+        assert to_plain(DefaultedDict(name="n"), target=DefaultedDict) == {"name": "n"}
+
+    @pytest.mark.parametrize(
+        ("changes", "written"),
+        [
+            ({"count": 1}, {"count": 1}),
+            ({"level": True}, {"level": True}),
+            ({"rate": -0.0}, {"rate": -0.0}),
+            ({"rate": 0}, {"rate": 0}),
+            ({"note": ""}, {"note": ""}),
+            ({"shade": Shade.DARK}, {"shade": "dark"}),
+            ({"shape": (1, 2)}, {"shape": [1, 2]}),
+            ({"tags": ["a"]}, {"tags": ["a"]}),
+            (
+                {"extra": MappingProxyType({"a": 1})},
+                {"extra": {"py/mappingproxy": {"a": 1}}},
+            ),
+        ],
+        ids=[
+            "other int",
+            "bool for int",
+            "negative zero",
+            "int for float",
+            "empty text for None",
+            "other member",
+            "other tuple",
+            "full list",
+            "full mapping",
+        ],
+    )
+    def test_a_field_not_at_its_default_is_written(
+        self,
+        changes: dict[str, object],
+        written: dict[str, object],
+    ) -> None:
+        build = cast(Callable[..., Defaulted], Defaulted)
+        value = build(name="n", **changes)
+
+        assert to_plain(value, target=Defaulted) == {"name": "n", **written}
+
+    def test_an_equal_default_built_anew_is_left_out(self) -> None:
+        value = Defaulted(name="n", shape=(1, 1), tags=[], extra=MappingProxyType({}))
+
+        assert to_plain(value, target=Defaulted) == {"name": "n"}
+
+    def test_a_nan_default_is_left_out_and_a_nested_container_written(self) -> None:
+        tree = to_plain(Unsettled(), target=Unsettled)
+        read = from_plain(tree, Unsettled)
+
+        assert tree == {"nested": [[]]}
+        assert math.isnan(read.ratio)
+        assert to_plain(Unsettled(ratio=0.0), target=Unsettled) == {
+            "ratio": 0.0,
+            "nested": [[]],
+        }
+
+    def test_a_default_its_factory_does_not_build_empty_is_written(self) -> None:
+        assert to_plain(Seeded(), target=Seeded) == {"seeds": [1]}
+        assert to_plain(Seeded(seeds=[]), target=Seeded) == {"seeds": []}
+
+    def test_a_default_factory_is_called_once_per_class(self) -> None:
+        calls: list[None] = []
+
+        def counted() -> int:
+            calls.append(None)
+            return 0
+
+        @dataclass(kw_only=True, slots=True)
+        class Counted:
+            count: int = field(default_factory=counted)
+
+        records = [Counted(), Counted(count=1), Counted()]
+        calls.clear()
+        trees = [to_plain(records, target=list[Counted]) for _ in range(2)]
+
+        assert trees == [[{}, {"count": 1}, {}]] * 2
+        assert len(calls) == 1
+
+    def test_a_changed_default_is_read_anew(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        @dataclass(kw_only=True, slots=True)
+        class Changing:
+            count: int = 1
+            level: int = field(default_factory=int)
+
+        declared = cast(dict[str, Field[object]], Changing.__dataclass_fields__)
+        before = to_plain(Changing(count=1, level=3), target=Changing)
+        monkeypatch.setattr(declared["count"], "default", 2)
+        monkeypatch.setattr(declared["level"], "default_factory", lambda: 3)
+
+        assert before == {"level": 3}
+        assert to_plain(Changing(count=1, level=3), target=Changing) == {"count": 1}
+        assert to_plain(Changing(count=2, level=0), target=Changing) == {"level": 0}
+        monkeypatch.setattr(declared["count"], "default", MISSING)
+        assert to_plain(Changing(count=2, level=3), target=Changing) == {"count": 2}
+
+    def test_a_default_factory_is_called_only_for_a_value_it_could_build(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        calls: list[None] = []
+
+        def counted() -> list[int]:
+            calls.append(None)
+            return []
+
+        declared = cast(Field[object], Counted.__dataclass_fields__["inner"])
+        monkeypatch.setattr(declared, "default_factory", counted)
+        shared: list[int] = []
+        values = [
+            Counted(inner=Shaded()),
+            Counted(inner=[1]),
+            shared,
+            Counted(inner=shared),
+        ]
+
+        written = to_plain(values, target=list[object])
+
+        assert isinstance(written, list)
+        assert written[3] == {
+            "py/object": f"{__name__}.Counted",
+            "inner": {"py/ref": [2]},
+        }
+        assert calls == []
+        assert to_plain([Counted(inner=[])], target=list[Counted]) == [{}]
+        assert len(calls) == 1
+
+    def test_a_default_factory_that_raises_writes_its_field(self) -> None:
+        calls: list[None] = []
+
+        def broken() -> int:
+            calls.append(None)
+            raise RuntimeError("no default")
+
+        @dataclass(kw_only=True, slots=True)
+        class Broken:
+            count: int = field(default_factory=broken)
+
+        tree = to_plain([Broken(count=0), Broken(count=0)], target=list[Broken])
+
+        assert tree == [{"count": 0}, {"count": 0}]
+        assert len(calls) == 1
+
+    def test_a_left_out_value_met_again_is_referred_to(self) -> None:
+        cache: dict[str, int] = {}
+        value = Shared(cache=cache, alias=cache)
+
+        tree = to_plain(value, target=Shared)
+        read = from_plain(tree, Shared)
+
+        assert tree == {"alias": {"py/ref": ["cache"]}}
+        assert read == value
+        assert read.alias is read.cache
+
+    def test_a_value_met_before_its_field_is_written(self) -> None:
+        cache: dict[str, int] = {}
+        value = [cache, Shared(cache=cache)]
+
+        tree = to_plain(value, target=list[object])
+        read = from_plain(tree, list[object], allow_imports=True)
+
+        assert tree == [
+            {},
+            {"py/object": f"{__name__}.Shared", "cache": {"py/ref": [0]}},
+        ]
+        assert cast(Shared, read[1]).cache is read[0]
+
+    def test_a_left_out_member_met_again_is_written_in_full(self) -> None:
+        tree = to_plain(Shaded(other=Shade.LIGHT), target=Shaded)
+
+        assert tree == {"other": to_plain(Shade.LIGHT)}
+
+    def test_a_tagged_record_reads_its_left_out_fields_back(self) -> None:
+        tree = {"py/object": _DEFAULTED, "name": "n"}
+
+        assert from_plain(tree, object, allow_imports=True) == Defaulted(name="n")
+
+    @pytest.mark.parametrize(
+        ("value", "target"),
+        [
+            (Defaulted(name="n"), Defaulted),
+            (Defaulted(name="n", count=2, tags=["a"]), Defaulted),
+            (
+                Defaulted(
+                    name="n",
+                    count=2,
+                    level=3,
+                    rate=1.5,
+                    note="x",
+                    shade=Shade.DARK,
+                    shape=(2, 2),
+                    tags=["a"],
+                ),
+                Defaulted,
+            ),
+            (
+                [Defaulted(name="a"), Defaulted(name="b", note="x")],
+                list[Defaulted],
+            ),
+        ],
+        ids=["defaults", "some set", "one left out", "records in a list"],
+    )
+    def test_left_out_fields_read_back_call_after_call(
+        self,
+        value: object,
+        target: object,
+    ) -> None:
+        for _ in range(3):
+            assert from_plain(to_plain(value, target=target), target) == value
+            assert json_loads(json_dumps(value, target=target), target) == value
+
+    def test_a_left_out_value_referred_to_after_its_record_reads_back_shared(
+        self,
+    ) -> None:
+        record = Defaulted(name="n")
+        target = tuple[Defaulted, list[str]]
+
+        tree = to_plain((record, record.tags), target=target)
+        read = from_plain(tree, target)
+
+        assert tree == [{"name": "n"}, {"py/ref": [0, "tags"]}]
+        assert read[1] is read[0].tags
+
+    def test_a_left_out_value_in_a_list_of_records_reads_back_shared(self) -> None:
+        record = Shared()
+
+        value = SharedHolder(records=[record], shared=record.cache)
+
+        tree = to_plain(value, target=SharedHolder)
+        read = from_plain(tree, SharedHolder)
+
+        assert tree == {
+            "records": [{}],
+            "shared": {"py/ref": ["records", 0, "cache"]},
+        }
+        assert read.shared is read.records[0].cache
+
+    def test_a_shared_left_out_value_reads_back_shared_through_json(self) -> None:
+        cache: dict[str, int] = {}
+        for _ in range(3):
+            read = json_loads(json_dumps(Shared(cache=cache, alias=cache)), Shared)
+            assert read.alias is read.cache
 
 
 type _ColorAlias = Color

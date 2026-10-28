@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from collections.abc import Hashable, Iterator, Mapping, Sequence
-from dataclasses import MISSING, Field, dataclass, field
+from dataclasses import MISSING, Field, dataclass, field, make_dataclass
 from decimal import Decimal
 from enum import Enum, IntEnum
 from fractions import Fraction
@@ -141,6 +141,17 @@ class ChangingField:
 
     def __post_init__(self) -> None:
         self.x *= 10
+
+
+Unfitting = make_dataclass(
+    "Unfitting",
+    # ``()`` is no ``tuple[str]``, which holds exactly one str.
+    [("buz", tuple[str], field(default=())), ("name", str, field(default="n"))],
+    kw_only=True,
+    slots=True,
+    module=__name__,
+)
+"""A record whose default is not of its field's declared type."""
 
 
 @dataclass(
@@ -984,7 +995,7 @@ def _call_outcome(
     [(True, ["py/object", "a", "z"]), (False, ["py/object", "z", "a"])],
 )
 def test_object_attribute_sort_matches_python(sort: bool, names: list[str]) -> None:
-    value = AttributeOrder()
+    value = AttributeOrder(z=3, a=4)
     expected = serialize._python_to_plain(value, sort=sort)
 
     assert isinstance(expected, dict)
@@ -1480,6 +1491,23 @@ def test_a_renamed_dataclass_reads_by_its_new_name() -> None:
     point.__qualname__ = "After"
 
     _assert_reads_alike(data, point, allow_imports=True)
+
+
+@needs_rust
+@pytest.mark.parametrize("target", [object, Unfitting], ids=["tagged", "implied"])
+def test_a_default_not_of_its_declared_type_is_left_out_and_read_back_alike(
+    target: object,
+) -> None:
+    value = cast(object, Unfitting())
+    tree = serialize._python_to_plain(value, target=target)
+
+    assert serialize.to_plain(value, target=target) == tree
+    assert isinstance(tree, dict)
+    assert "buz" not in tree
+    assert deserialize.from_plain(tree, target, allow_imports=True) == value
+    assert deserialize._python_from_plain(tree, target, allow_imports=True) == value
+    assert wire.json_loads(wire.json_dumps(value), target, allow_imports=True) == value
+    _assert_reads_alike(tree, target, allow_imports=True)
 
 
 @needs_rust
@@ -2264,7 +2292,7 @@ def test_setup_takes_a_read_error_that_is_no_class() -> None:
     try:
         core.setup_decode({**vars(deserialize), "ReadError": object()})
     finally:
-        core.setup_decode(vars(deserialize))
+        core.setup_decode(deserialize.__dict__)
 
     assert deserialize.from_plain([1], list[int]) == [1]
 
