@@ -3,14 +3,17 @@
 # fmt: off
 '''' 2>/dev/null #
 exec uv --quiet --project "$(dirname "$0")" run --frozen --no-sync python3 "$0" "$@"
-Count the instructions treekle's Rust core spends on one workload at two refs.
+Count the instructions treekle's Rust core spends on one workload at each ref.
 
-Each ref's treekle package is checked out over the newer ref's tree in a
-detached worktree under ``/opt/scratch/runs``, so both cores read the same
-priml configs, and built there as the release wheels are (PGO). Each case then
-runs in its own process under ``perf stat``, pinned to one CPU, counting user
-instructions only inside the timed calls. Instruction counts barely move with
-machine load, so two refs compare on a busy machine where timings do not.
+Each ref's treekle package is checked out over the head's tree in a detached
+worktree under ``/opt/scratch/runs``, so every core reads the same priml
+configs, and built there as the release wheels are (PGO; ``--no-pgo`` skips
+the profile). A head of ``WORKTREE`` is this checkout as it stands, uncommitted
+edits included, built in place. Each case then runs in its own process under
+``perf stat``, pinned to one CPU, counting user instructions only inside the
+timed calls. Instruction counts barely move with machine load, so refs compare
+on a busy machine where timings do not. The ratio is the head over the ref
+just before it.
 
 Every result is checked against Python's own walk (``_python_to_plain`` and
 ``_python_from_plain``) after the count, so the check warms nothing it counts.
@@ -19,6 +22,8 @@ The exit status is 1 if any result differs.
 Examples:
   scripts/bench_counts.py
   scripts/bench_counts.py --base c4afb1c292 --head HEAD --cpu 3
+  scripts/bench_counts.py --base c4afb1c292 --ref 1dae733a89 --head WORKTREE
+  scripts/bench_counts.py --head WORKTREE --no-pgo --only "encode cold"
 
 '''
 # fmt: on
@@ -56,6 +61,8 @@ _THIS: Final = Path(__file__).resolve()
 _CWD: Final = _THIS.parent
 
 _RUNS: Final = Path("/opt/scratch/runs/treekle-bench-counts")
+_WORKTREE: Final = "WORKTREE"
+"""The ``--head`` naming this checkout as it stands."""
 # ``loop.`` in the monorepo, nothing where treekle is its own package.
 _PREFIX: Final = serialize.__name__.removesuffix("treekle.serialize")
 
@@ -78,14 +85,25 @@ def main() -> int:
         print(f"calls={calls} mismatched={mismatched}")
         return 0
     repo = Path(_git(_CWD, "rev-parse", "--show-toplevel"))
-    base, head = (_git(repo, "rev-parse", ref) for ref in (flags.base, flags.head))
-    roots = [_prepared(repo, ref, head) for ref in (base, head)]
+    pgo = not flags.no_pgo
+    worktree = flags.head == _WORKTREE
+    head = _git(repo, "rev-parse", "HEAD" if worktree else flags.head)
+    refs = [_git(repo, "rev-parse", ref) for ref in (flags.base, *flags.ref)]
+    if not worktree:
+        refs.append(head)
+    roots = [_prepared(repo, ref, head, pgo=pgo) for ref in refs]
+    names = [ref[:10] for ref in refs]
+    if worktree:
+        _build(repo, _CWD.parent.relative_to(repo), pgo=pgo)
+        roots.append(repo)
+        names.append(_WORKTREE)
     rows: list[_Row] = []
-    for case in _CASES:
+    for case in flags.only or _CASES:
         counts = [_count(root, case, flags.cpu) for root in roots]
         rows.append(_Row(case=case, counts=counts))
-    print(f"PGO builds; user instructions on CPU {flags.cpu}; one process per case.")
-    print(_render(rows, refs=[base[:10], head[:10]]))
+    builds = "PGO builds" if pgo else "Builds without a profile"
+    print(f"{builds}; user instructions on CPU {flags.cpu}; one process per case.")
+    print(_render(rows, refs=names))
     return 1 if any(count.mismatched for row in rows for count in row.counts) else 0
 
 
@@ -93,8 +111,11 @@ class Flags(Protocol):
     """Parsed command-line flags."""
 
     base: str
+    ref: list[str]
     head: str
     cpu: str
+    no_pgo: bool
+    only: list[str]
     case: str | None
 
 
@@ -103,10 +124,32 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--base",
         default="c4afb1c292",
-        help="The ref compared against.",
+        help="The first ref counted.",
     )
-    parser.add_argument("--head", default="HEAD", help="The ref under test.")
+    parser.add_argument(
+        "--ref",
+        action="append",
+        default=[],
+        help="A ref counted after the base, before the head; may repeat.",
+    )
+    parser.add_argument(
+        "--head",
+        default="HEAD",
+        help=f"The ref under test; {_WORKTREE} for this checkout as it stands.",
+    )
     parser.add_argument("--cpu", default="2", help="The CPU every case is pinned to.")
+    parser.add_argument(
+        "--no-pgo",
+        action="store_true",
+        help="Build every ref without a profile: faster to build, slower to run.",
+    )
+    parser.add_argument(
+        "--only",
+        action="append",
+        default=[],
+        choices=list(_CASES),
+        help="Count only this case; may repeat.",
+    )
     parser.add_argument(
         "--case",
         choices=list(_CASES),
@@ -152,10 +195,10 @@ def _git(where: Path, *args: str) -> str:
     return done.stdout.strip()
 
 
-def _prepared(repo: Path, ref: str, head: str) -> Path:
+def _prepared(repo: Path, ref: str, head: str, *, pgo: bool) -> Path:
     """Return a worktree of ``head`` holding ``ref``'s treekle, its core built."""
     package = _CWD.parent.relative_to(repo)
-    root = _RUNS / f"{ref[:12]}-on-{head[:12]}"
+    root = _RUNS / f"{ref[:12]}-on-{head[:12]}{'' if pgo else '-no-pgo'}"
     if not root.exists():
         _git(repo, "worktree", "add", "--detach", str(root), head)
         shutil.rmtree(root / package)
@@ -167,14 +210,24 @@ def _prepared(repo: Path, ref: str, head: str) -> Path:
     # finished build counts as built.
     built = root / ".bench-counts-built"
     if not built.exists():
-        subprocess.run(  # noqa: S603 -- Fixed argv.
-            [sys.executable, "-P", str(root / package / "build_rust.py")],
-            cwd=root,
-            env={**os.environ, "PYTHONPATH": str(root)},
-            check=True,
-        )
+        _build(root, package, pgo=pgo)
         built.touch()
     return root
+
+
+def _build(root: Path, package: Path, *, pgo: bool) -> None:
+    """Build ``package``'s core in the checkout at ``root``; with a profile if ``pgo``."""
+    subprocess.run(  # noqa: S603 -- Fixed argv.
+        [
+            sys.executable,
+            "-P",
+            str(root / package / "build_rust.py"),
+            *(() if pgo else ("--no-pgo",)),
+        ],
+        cwd=root,
+        env={**os.environ, "PYTHONPATH": str(root)},
+        check=True,
+    )
 
 
 def _count(root: Path, case: str, cpu: str) -> _Count:
@@ -232,7 +285,7 @@ def _render(rows: list[_Row], *, refs: list[str]) -> str:
     lines = [head + f"{'ratio':>8}{'mismatched':>12}"]
     for row in rows:
         counts = "".join(f"{count.instructions / 1e6:>13.1f}M" for count in row.counts)
-        ratio = row.counts[-1].instructions / row.counts[0].instructions
+        ratio = row.counts[-1].instructions / row.counts[-2].instructions
         mismatched = "/".join(str(count.mismatched) for count in row.counts)
         lines.append(
             f"{row.case:<26}{row.counts[-1].calls:>7}{counts}{ratio:>8.3f}{mismatched:>12}",
@@ -352,6 +405,29 @@ def _loads(
     )
 
 
+def _read(trees: list[object], *, target: object, rounds: int, text: bool) -> _Work:
+    """Count ``from_plain``, or ``json_loads`` when ``text``, of each tree as ``target``."""
+    python = deserialize._python_from_plain  # noqa: SLF001 -- The Python walker has no public name.
+    if text:
+        texts = [json.dumps(tree) for tree in trees]
+        return _Work(
+            calls=[
+                partial(json_loads, each, target, allow_imports=True) for each in texts
+            ],
+            references=[partial(_python_loads, python, each, target) for each in texts],
+            rounds=rounds,
+            warm=True,
+        )
+    return _Work(
+        calls=[partial(from_plain, tree, target, allow_imports=True) for tree in trees],
+        references=[
+            partial(python, tree, target, allow_imports=True) for tree in trees
+        ],
+        rounds=rounds,
+        warm=True,
+    )
+
+
 def _python_loads(read: Callable[..., object], text: str, kind: object) -> object:
     """Return ``text`` read by the standard parser, then by Python's walk."""
     return read(json.loads(text), kind, allow_imports=True)
@@ -395,9 +471,29 @@ class _Plain:
         self.c = c
 
 
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _Defaulted:
+    a: int
+    b: float = 0.0
+    c: str = ""
+    tags: tuple[str, ...] = ()
+
+
 def _rows(kind: Callable[..., object], *, count: int = 2_000) -> list[object]:
     """One list of ``count`` rows of ``kind``."""
     return [[kind(a=index, b=index * 0.5, c=f"r{index}") for index in range(count)]]
+
+
+def _defaulted_rows(*, count: int = 2_000) -> list[object]:
+    """One list of ``count`` ``_Defaulted`` rows' trees, every other one leaving out each field at its default, as ``to_plain`` writes it."""
+    return [
+        [
+            {"a": index}
+            if index % 2
+            else {"a": index, "b": index * 0.5, "c": f"r{index}", "tags": ["t"]}
+            for index in range(count)
+        ],
+    ]
 
 
 # Cold cases read 5 rounds of fresh classes once each; warm ones repeat.
@@ -441,6 +537,18 @@ _CASES: dict[str, Callable[[], _Work]] = {
         rounds=20,
         warm=True,
         target=list[_Plain],
+    ),
+    "defaulted rows decode": lambda: _read(
+        _defaulted_rows(),
+        target=list[_Defaulted],
+        rounds=20,
+        text=False,
+    ),
+    "defaulted rows json_loads": lambda: _read(
+        _defaulted_rows(),
+        target=list[_Defaulted],
+        rounds=20,
+        text=True,
     ),
 }
 

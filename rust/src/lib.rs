@@ -29,6 +29,7 @@ mod class;
 mod class_names;
 mod decode;
 mod encode;
+mod fields;
 mod json;
 mod py;
 mod sync;

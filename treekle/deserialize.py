@@ -1395,7 +1395,8 @@ def _decode_object(
     # fields read, it is there for a field that refers back to it.
     value = _allocate(target)
     _place(value, at, state)
-    return _Object(at, data=data, types=types, target=target, value=value)
+    made = _place_defaults(target, data, at, state)
+    return _Object(at, data=data, types=types, target=target, value=value, made=made)
 
 
 # Taken for a dict whose keys are all ``str``, each a field of ``target`` but a
@@ -1433,10 +1434,11 @@ def _decode_exact_object(
         return None
     value = _allocate(target)
     _place(value, at, state)
+    made = _place_defaults(target, data, at, state)
     # The full path also has a stored record's built object checked against
     # ``target``; that object is exactly ``target``, which ``isinstance``
     # answers without any ``__instancecheck__``, so the check is left out.
-    return _Object(at, data=data, types=types, target=target, value=value)
+    return _Object(at, data=data, types=types, target=target, value=value, made=made)
 
 
 def _decode_stored(
@@ -1453,7 +1455,34 @@ def _decode_stored(
         raise ReadError(f"{_shown(path)} does not name a class")
     value = _allocate(kind)
     _place(value, at, state)
-    return _Stored(at, data=data, types=_stored_types(kind, data), value=value)
+    made = _place_defaults(kind, data, at, state)
+    types = _stored_types(kind, data)
+    return _Stored(at, data=data, types=types, value=value, made=made)
+
+
+# ``to_plain`` leaves out a field its default rebuilds; a ``py/ref`` elsewhere in
+# the tree may name it, so it is placed before any field is read.
+def _place_defaults(
+    kind: type,
+    data: Mapping[str, PlainTree],
+    at: FieldPath,
+    state: _Decoding,
+) -> dict[str, object]:
+    """Build each absent defaulted field of ``kind``, placed for ``py/ref``."""
+    made: dict[str, object] = {}
+    if not is_dataclass(kind):
+        return made
+    for item in cast(tuple[Field[object], ...], fields(kind)):
+        if item.name in data:
+            continue
+        if item.default is not MISSING:
+            made[item.name] = item.default
+        elif item.default_factory is not MISSING:
+            made[item.name] = item.default_factory()
+        else:
+            continue
+        state.placed[(*at, item.name)] = made[item.name]
+    return made
 
 
 # A tag names the class, so its fields' types are implied, as a target's are.
@@ -1469,17 +1498,16 @@ def _with_defaults(
     declared: tuple[Field[object], ...],
     members: dict[str, object],
     name: str,
+    made: Mapping[str, object],
 ) -> dict[str, object]:
-    """Return ``members`` with each absent defaulted field filled from its default."""
+    """Return ``members`` with each absent field filled from ``made``, its built default."""
     filled = dict(members)
     missing: list[str] = []
     for item in declared:
         if item.name in filled:
             continue
-        if item.default is not MISSING:
-            filled[item.name] = item.default
-        elif item.default_factory is not MISSING:
-            filled[item.name] = item.default_factory()
+        if item.name in made:
+            filled[item.name] = made[item.name]
         elif item.init:
             missing.append(item.name)
     if missing:
@@ -1926,7 +1954,7 @@ class _Fields(_PartFrame):
 class _Object(_Fields):
     """A dataclass record's fields, set on its allocated object once read."""
 
-    __slots__ = ("target", "value")
+    __slots__ = ("made", "target", "value")
 
     def __init__(
         self,
@@ -1936,10 +1964,12 @@ class _Object(_Fields):
         types: Mapping[str, object],
         target: type[DataclassInstance],
         value: object,
+        made: Mapping[str, object],
     ) -> None:
         super().__init__(at, data=data, types=types, members={})
         self.target = target
         self.value = value
+        self.made = made
 
     @override
     def finish(self, state: _Decoding) -> object:
@@ -1949,6 +1979,7 @@ class _Object(_Fields):
             fields(target),
             self.members,
             target.__name__,
+            self.made,
         ).items():
             object.__setattr__(value, key, member)
         return value
@@ -1957,7 +1988,7 @@ class _Object(_Fields):
 class _Stored(_Fields):
     """A ``py/object`` record's attributes, set on its allocated object once read."""
 
-    __slots__ = ("value",)
+    __slots__ = ("made", "value")
 
     def __init__(
         self,
@@ -1966,14 +1997,16 @@ class _Stored(_Fields):
         data: Mapping[str, PlainTree],
         types: Mapping[str, object],
         value: object,
+        made: Mapping[str, object],
     ) -> None:
         super().__init__(at, data=data, types=types, members={})
         self.value = value
+        self.made = made
 
     @override
     def finish(self, state: _Decoding) -> object:
         del state
-        for attribute, member in self.members.items():
+        for attribute, member in (*self.members.items(), *self.made.items()):
             object.__setattr__(self.value, attribute, member)
         return self.value
 

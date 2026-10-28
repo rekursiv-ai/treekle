@@ -68,6 +68,7 @@ pub struct Globals {
     paths: crate::class::PathGlobals,
     hints: facts::HintGlobals,
     records: facts::RecordGlobals,
+    defaults: crate::fields::DefaultGlobals,
     /// ``subtype_dict``, the getter of a plain class's ``__dict__``.
     dict_getter: Option<usize>,
 }
@@ -93,6 +94,7 @@ pub fn setup(module: &Bound<'_, PyDict>) -> PyResult<()> {
     let reflect = py.import(format!("{package}.reflect").as_str())?;
     let plain = py.import(format!("{package}.plain").as_str())?;
     let deserialize = py.import(format!("{package}.deserialize").as_str())?;
+    let dataclasses = py.import("dataclasses")?;
     let dialect = get("Dialect")?;
     let dialects = get("get_args")?
         .bind(py)
@@ -171,6 +173,13 @@ pub fn setup(module: &Bound<'_, PyDict>) -> PyResult<()> {
             sys_dict: py.import("sys")?.dict().unbind(),
             module_type: get("ModuleType")?,
             last: std::cell::RefCell::new(None),
+        },
+        defaults: crate::fields::DefaultGlobals {
+            slots: crate::fields::FieldSlots::new(py, &dataclasses.getattr("fields")?)?,
+            fields: dataclasses.getattr("fields")?.unbind(),
+            missing: dataclasses.getattr("MISSING")?.unbind(),
+            enum_type: get("Enum")?,
+            generic_alias: py.import("types")?.getattr("GenericAlias")?.unbind(),
         },
         dict_getter,
     };
@@ -1619,8 +1628,20 @@ impl<'py, 'g> Encoder<'py, 'g> {
         if self.slotted_object(value, &kind, here, declared)? {
             return Ok(());
         }
-        let members = self.members(value, &kind)?;
+        let mut members = self.members(value, &kind)?;
         let record = self.is_dataclass(&kind)?;
+        if record && let Some(defaults) = self.defaults_of(&kind)? {
+            let mut kept = Vec::with_capacity(members.len());
+            for member in members {
+                let name = member.name.get(py);
+                let found = defaults.find(&name);
+                if self.left_out(&defaults, found, here, &name, &member.value, true)? != Some(true)
+                {
+                    kept.push(member);
+                }
+            }
+            members = kept;
+        }
         let implied = record && self.record_implied(&kind, declared)?;
         let types =
             if record && (implied || members.iter().any(|member| !is_plain_leaf(&member.value))) {
@@ -1718,7 +1739,7 @@ impl<'py, 'g> Encoder<'py, 'g> {
     ) -> PyResult<bool> {
         let py = self.py;
         // One read of the class's facts where it was met before.
-        let (dataclass, layout, path, ready) = {
+        let (dataclass, layout, path, ready, defaults) = {
             let facts = self.facts(kind);
             let ready = facts
                 .layout
@@ -1733,6 +1754,7 @@ impl<'py, 'g> Encoder<'py, 'g> {
                 facts.layout.clone(),
                 facts.path.clone(),
                 ready,
+                facts.defaults.clone(),
             )
         };
         let dataclass = match dataclass {
@@ -1767,6 +1789,35 @@ impl<'py, 'g> Encoder<'py, 'g> {
                 },
             })
         };
+        let defaults = match defaults {
+            Some(known) => known,
+            None => match self
+                .g
+                .defaults
+                .defaulted_slots(kind, layout.slots.iter().map(|slot| &slot.name))
+            {
+                Some(found) => {
+                    let found = found.map(Rc::new);
+                    self.facts(kind).defaults = Some(found.clone());
+                    found
+                }
+                None => self.defaults_of(kind)?,
+            },
+        };
+        let by_slot = defaults.as_ref().map(|defaults| {
+            defaults.by_slot.get_or_init(|| {
+                layout
+                    .slots
+                    .iter()
+                    .map(|slot| {
+                        defaults
+                            .find(slot.name.bind(py).as_any())
+                            .map_or(u32::MAX, |found| found as u32)
+                    })
+                    .collect()
+            })
+        });
+        let alive = self.alive.len();
         let mut read = SlotTypes::default();
         // A tree node is made whole at once: each member set in its place,
         // one that is no leaf replaced by its encoding once that is made.
@@ -1879,6 +1930,25 @@ impl<'py, 'g> Encoder<'py, 'g> {
                 continue;
             }
             let name = owner[slot as usize].name.bind(py).clone().into_any();
+            if let (Some(defaults), Some(by_slot)) = (&defaults, by_slot) {
+                let found = match pick {
+                    Pick::Slot(at) => Some(by_slot[at as usize] as usize)
+                        .filter(|&found| found != u32::MAX as usize),
+                    Pick::Key(_) => defaults.find(&name),
+                };
+                let held = unsafe { Bound::from_borrowed_ptr(py, member) };
+                match self.left_out(defaults, found, here, &name, &held, false)? {
+                    Some(true) => continue,
+                    Some(false) => {}
+                    // A factory runs Python code, which could free a member
+                    // borrowed here; ``object`` holds each one it reads.
+                    None => {
+                        self.rollback(alive);
+                        self.sink.rewind(mark);
+                        return Ok(false);
+                    }
+                }
+            }
             if let Some(node) = &node
                 && unsafe { ffi::PyDict_SetItem(node.as_ptr(), name.as_ptr(), member) } < 0
             {
@@ -1905,6 +1975,8 @@ impl<'py, 'g> Encoder<'py, 'g> {
                 Pick::Slot(at) => match self.slot_hint(kind, &layout, &mut read, at)? {
                     Some(declared) => declared,
                     None => {
+                        // ``object`` reads the record again, defaults included.
+                        self.rollback(alive);
                         self.sink.rewind(mark);
                         return Ok(false);
                     }
@@ -2019,6 +2091,69 @@ impl<'py, 'g> Encoder<'py, 'g> {
     #[inline]
     fn facts(&mut self, kind: &B<'py>) -> &mut Facts {
         self.table.of(kind)
+    }
+
+    /// Whether ``member`` is written as other than itself: a ``py/ref`` to
+    /// where it was met before, or by its hook.
+    fn referred(&self, member: &B<'py>) -> bool {
+        self.seen.contains_key(&(member.as_ptr() as usize))
+            || self
+                .hooks
+                .as_ref()
+                .is_some_and(|hooks| hooked(hooks, member).unwrap_or(true))
+    }
+
+    /// ``kind``'s fields with a default, read once per class; ``None`` where
+    /// it has none.
+    fn defaults_of(&mut self, kind: &B<'py>) -> PyResult<Option<facts::Defaulted>> {
+        if let Some(found) = &self.facts(kind).defaults {
+            return Ok(found.clone());
+        }
+        let found = self.g.defaults.defaulted(kind)?.map(Rc::new);
+        self.facts(kind).defaults = Some(found.clone());
+        Ok(found)
+    }
+
+    /// ``_leave_out_defaults`` for one member, ``defaults``' field ``found``:
+    /// whether ``member``, the record at ``here``'s ``name``, is what its
+    /// default rebuilds, and so left out; registered where the walk would
+    /// register it written. ``None`` where that needs Python code run and
+    /// ``call`` is not set.
+    fn left_out(
+        &mut self,
+        defaults: &crate::fields::ClassDefaults,
+        found: Option<usize>,
+        here: u32,
+        name: &B<'py>,
+        member: &B<'py>,
+        call: bool,
+    ) -> PyResult<Option<bool>> {
+        let Some(found) = found else {
+            return Ok(Some(false));
+        };
+        if !self.g.defaults.omittable(member)? {
+            return Ok(Some(false));
+        }
+        let default = &defaults.fields[found];
+        let sample = match self.g.defaults.sample(self.py, default, false)? {
+            Some(sample) => sample,
+            // Python builds the default only for a member it may leave out.
+            None if self.referred(member) => return Ok(Some(false)),
+            None if !call => return Ok(None),
+            None => self
+                .g
+                .defaults
+                .sample(self.py, default, true)?
+                .expect("a call reads the sample"),
+        };
+        if !self.g.defaults.inferred(member, &sample)? || self.referred(member) {
+            return Ok(Some(false));
+        }
+        if crate::fields::registered_kind(tp(member)) {
+            let child = self.place(here, Step::Key(name.clone()));
+            self.register(member, child);
+        }
+        Ok(Some(true))
     }
 
     /// ``_encoder_for(type(value))``.

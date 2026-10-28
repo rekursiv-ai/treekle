@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, cast
@@ -31,8 +31,6 @@ from treekle.types import Classes, Hooks, PlainTree, ReadError
 
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
-
     from treekle.types import Dialect
 
 
@@ -63,6 +61,13 @@ class Unlisted:
 @dataclass(frozen=True, kw_only=True, slots=True)
 class Frozen:
     extra: Mapping[str, PlainTree]
+
+
+@dataclass(frozen=True, kw_only=True, slots=True)
+class Declared:
+    bar: Mapping[str, float]
+    baz: Mapping[str, float]
+    fiz: types.MappingProxyType[str, float]
 
 
 _FROZEN: Final = types.MappingProxyType[type, type](
@@ -230,7 +235,7 @@ class TestJsonDumps:
         assert '"py/hook"' in hooked
         assert json_dumps(math.inf, dialect="python") == "Infinity"
         assert json_dumps(math.inf) == '{"py/float": "inf"}'
-        attributes = AttributeOrder()
+        attributes = AttributeOrder(z=3, a=4)
         assert json_dumps(attributes, sort=False) == json.dumps(
             to_plain(attributes, sort=False),
         )
@@ -284,6 +289,49 @@ def test_default_concrete_types_reach_both_walks() -> None:
     items = read.extra["a"]
     assert isinstance(items, tuple)
     assert isinstance(items[1], types.MappingProxyType)
+
+
+@pytest.mark.parametrize(
+    ("options", "expected"),
+    [
+        (
+            {},
+            (
+                '{"py/object": "treekle.wire_test.Declared", "bar": {"a": 1}, '
+                '"baz": {"py/mappingproxy": {"b": 2.0}}, "fiz": {"c": 3}}'
+            ),
+        ),
+        (
+            {"default_concrete_types": {Mapping: types.MappingProxyType}},
+            (
+                '{"py/object": "treekle.wire_test.Declared", "bar": {"py/dict": {"a": 1}}, '
+                '"baz": {"b": 2.0}, "fiz": {"c": 3}}'
+            ),
+        ),
+        (
+            {
+                "target": Declared,
+                "default_concrete_types": {Mapping: types.MappingProxyType},
+            },
+            '{"bar": {"py/dict": {"a": 1}}, "baz": {"b": 2.0}, "fiz": {"c": 3}}',
+        ),
+    ],
+    ids=["defaults", "mapping reads as a proxy", "declared root"],
+)
+def test_a_field_s_declared_type_decides_its_tag(
+    options: dict[str, object],
+    expected: str,
+) -> None:
+    # A mapping goes untagged exactly where its field's declared type, under
+    # ``default_concrete_types``, reads it back as the class it is.
+    value = Declared(
+        bar={"a": 1},
+        baz=types.MappingProxyType({"b": 2.0}),
+        fiz=types.MappingProxyType({"c": 3}),
+    )
+    write = cast(Callable[..., str], json_dumps)
+
+    assert write(value, **options) == expected
 
 
 def test_json_is_used_as_it_is_at_each_call(monkeypatch: pytest.MonkeyPatch) -> None:

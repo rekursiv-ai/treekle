@@ -277,6 +277,7 @@ impl Facts {
             types: None,
             path: None,
             leaf: None,
+            defaults: None,
         }
     }
 }
@@ -284,6 +285,8 @@ impl Facts {
 /// Dicts, each with its size when a fact was read: the fact holds while
 /// none gains or loses a name.
 pub type Guard = Vec<(Py<PyDict>, isize)>;
+
+pub type Defaulted = Rc<crate::fields::ClassDefaults>;
 
 /// Everything kept about one class.
 pub struct Facts {
@@ -295,6 +298,9 @@ pub struct Facts {
     pub types: Option<(Rc<Types>, Guard)>,
     pub path: Option<Rc<PathFact>>,
     pub leaf: Option<Leaf>,
+    /// Its fields with a default, kept so each factory runs once per class;
+    /// ``Some(None)`` where it has none.
+    pub defaults: Option<Option<Defaulted>>,
 }
 
 /// What a declared type may write a class's instances as: text it reads

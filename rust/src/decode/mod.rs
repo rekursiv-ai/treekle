@@ -30,8 +30,9 @@ use crate::class::{
     version_tag,
 };
 use crate::class_names::ClassNames;
+use crate::fields::{FieldSlots, FieldView};
 use crate::py::*;
-use attrs::{FieldSlots, HasTable, SetTable};
+use attrs::{HasTable, SetTable};
 use errors::*;
 use places::{Loc, Paths, PlacedTable, ROOT, Spare, StepRef};
 
@@ -286,6 +287,28 @@ fn field_stores(kind: &B<'_>, info: &DcInfo) -> (Stamp, Vec<Option<Store>>) {
         Some(names) => stores(kind, names),
         None => (Stamp::always(kind), Vec::new()),
     }
+}
+
+/// The fields a record holds, as ``_place_defaults`` asks of it.
+#[derive(Clone, Copy)]
+enum Fields<'a, 'py> {
+    /// A ``py/object`` record, its tag a key like any other.
+    Record(&'a B<'py>),
+    /// A record's entries, its tag taken out.
+    Entries(&'a [(B<'py>, B<'py>, usize)]),
+}
+
+/// Whether ``entries`` name all ``count`` of a record's state slots, so it
+/// leaves no field out; ``false`` where that is not known at once.
+fn covers<T, U>(entries: &[(T, U, usize)], count: usize) -> bool {
+    if count > 64 || entries.len() < count {
+        return false;
+    }
+    let mut seen = 0u64;
+    for (_, _, slot) in entries {
+        seen |= 1 << slot;
+    }
+    seen.count_ones() as usize == count
 }
 
 fn item<'py>(module: &Bound<'py, PyDict>, name: &str) -> PyResult<B<'py>> {
@@ -834,6 +857,8 @@ enum Body<'py> {
         target: B<'py>,
         value: B<'py>,
         members: Vec<(B<'py>, B<'py>, usize)>,
+        /// Each field the record leaves out, built from its default.
+        made: Vec<(B<'py>, B<'py>)>,
         pending: Option<(B<'py>, usize)>,
     },
     /// ``_Stored``: a ``py/object`` record's attributes, set once read.
@@ -843,6 +868,7 @@ enum Body<'py> {
         hints: Option<B<'py>>,
         value: B<'py>,
         members: Vec<(B<'py>, B<'py>)>,
+        made: Vec<(B<'py>, B<'py>)>,
         pending_name: Option<B<'py>>,
     },
     /// ``_Steps``: a fixed list of parts whose failure is the container's own.
@@ -3149,9 +3175,16 @@ impl<'py, 'g> Decoder<'py, 'g> {
                 target,
                 value,
                 members,
+                made,
                 ..
-            } => self.build_object(&target, value, members),
-            Body::Stored { value, members, .. } => {
+            } => self.build_object(&target, value, members, made),
+            Body::Stored {
+                value,
+                mut members,
+                made,
+                ..
+            } => {
+                members.extend(made);
                 self.setattrs(&value, &members)?;
                 Ok(value)
             }
@@ -4314,6 +4347,11 @@ impl<'py, 'g> Decoder<'py, 'g> {
         let frame = self.frame(at)?;
         let reserved = self.allocate(target)?;
         self.place(frame, &reserved)?;
+        let made = if covers(&entries, info.targets.len()) {
+            Vec::new()
+        } else {
+            self.place_defaults(target, Fields::Entries(&entries), frame)?
+        };
         let members = Vec::with_capacity(entries.len());
         Ok(Start::Frame(Frame::new(
             frame,
@@ -4324,9 +4362,84 @@ impl<'py, 'g> Decoder<'py, 'g> {
                 target: target.clone(),
                 value: reserved,
                 members,
+                made,
                 pending: None,
             },
         )))
+    }
+
+    /// ``_place_defaults``: each defaulted field ``data`` leaves out, built
+    /// and placed by path below ``frame`` before any field reads, so a
+    /// ``py/ref`` elsewhere may name it.
+    fn place_defaults(
+        &mut self,
+        kind: &B<'py>,
+        data: Fields<'_, 'py>,
+        frame: u32,
+    ) -> DR<Vec<(B<'py>, B<'py>)>> {
+        let py = self.py;
+        let missing = self.b(&self.g.missing).clone();
+        let mut declared = Vec::new();
+        match self.views(kind)? {
+            Some(views) => {
+                let slots = self.g.field_slots.as_ref().expect("views need slots");
+                for view in &views {
+                    declared.push((
+                        slots.name(view)?,
+                        slots.default(view)?,
+                        slots.factory(view)?,
+                    ));
+                }
+            }
+            None => {
+                for field in self.b(&self.g.fields).call1((kind,))?.try_iter()? {
+                    let field = field?;
+                    declared.push((
+                        field.getattr(pyo3::intern!(py, "name"))?,
+                        field.getattr(pyo3::intern!(py, "default"))?,
+                        field.getattr(pyo3::intern!(py, "default_factory"))?,
+                    ));
+                }
+            }
+        }
+        let mut made = Vec::new();
+        for (name, default, factory) in declared {
+            let present = match data {
+                Fields::Entries(entries) => {
+                    let mut found = false;
+                    let text = text_of(&name);
+                    for (key, _, _) in entries {
+                        let same = match (text, text_of(key)) {
+                            (Some(text), Some(other)) => text == other,
+                            _ => key.is(&name) || py_eq(key, &name)?,
+                        };
+                        if same {
+                            found = true;
+                            break;
+                        }
+                    }
+                    found
+                }
+                Fields::Record(data) if tp(data) == t_dict() => {
+                    unsafe { data.cast_unchecked::<PyDict>() }.contains(&name)?
+                }
+                Fields::Record(data) => data.contains(&name)?,
+            };
+            if present {
+                continue;
+            }
+            let value = if !default.is(&missing) {
+                default
+            } else if !factory.is(&missing) {
+                factory.call0()?
+            } else {
+                continue;
+            };
+            let at = self.frame(Loc::Child(frame, StepRef::Key(&name)))?;
+            self.place_only(at, &value)?;
+            made.push((name, value));
+        }
+        Ok(made)
     }
 
     /// ``_Object.finish``: each read field, or its default, set on the record.
@@ -4335,29 +4448,32 @@ impl<'py, 'g> Decoder<'py, 'g> {
         target: &B<'py>,
         value: B<'py>,
         members: Vec<(B<'py>, B<'py>, usize)>,
+        made: Vec<(B<'py>, B<'py>)>,
     ) -> DR<B<'py>> {
-        let rest = self.with_defaults(members, target)?;
+        let rest = self.with_defaults(members, made, target)?;
         self.setattrs(&value, &rest)?;
         Ok(value)
     }
 
     /// ``dataclasses.fields(target)`` as slot views, or ``None`` where only
     /// the call itself can say what happens.
-    fn views(&self, target: &B<'py>) -> DR<Option<Vec<attrs::FieldView<'py>>>> {
+    fn views(&self, target: &B<'py>) -> DR<Option<Vec<FieldView<'py>>>> {
         match &self.g.field_slots {
             Some(slots) => Ok(slots.fields(target)?),
             None => Ok(None),
         }
     }
 
+    /// ``_with_defaults``: ``members``, then each field left out from
+    /// ``made``; a field with neither that ``__init__`` takes is missing.
     fn with_defaults(
         &self,
         members: Vec<(B<'py>, B<'py>, usize)>,
+        made: Vec<(B<'py>, B<'py>)>,
         target: &B<'py>,
     ) -> DR<Vec<(B<'py>, B<'py>)>> {
         let py = self.py;
-        let missing_marker = self.b(&self.g.missing);
-        let mut filled = Vec::with_capacity(members.len());
+        let mut filled = Vec::with_capacity(members.len() + made.len());
         let mut missing = Vec::new();
         match self.views(target)? {
             Some(views) => {
@@ -4371,7 +4487,8 @@ impl<'py, 'g> Decoder<'py, 'g> {
                 // default: comparing such strs runs no Python code, so the
                 // set Python builds is skipped.
                 let exact = |key: &B<'py>| tp(key) == t_str();
-                if members.len() >= names.len()
+                if made.is_empty()
+                    && members.len() >= names.len()
                     && names.iter().all(exact)
                     && members.iter().all(|(key, _, _)| exact(key))
                     && names.iter().all(|name| {
@@ -4385,45 +4502,21 @@ impl<'py, 'g> Decoder<'py, 'g> {
                         .map(|(key, member, _)| (key, member))
                         .collect());
                 }
-                let present = PySet::empty(py)?;
-                for (key, member, _) in members {
-                    present.add(&key)?;
-                    filled.push((key, member));
-                }
+                let present = self.filled(members, made, &mut filled)?;
                 for (view, name) in views.iter().zip(names) {
-                    if present.contains(&name)? {
-                        continue;
-                    }
-                    let default = slots.default(view)?;
-                    let factory = slots.factory(view)?;
-                    if !default.is(missing_marker) {
-                        filled.push((name, default));
-                    } else if !factory.is(missing_marker) {
-                        filled.push((name, factory.call0()?));
-                    } else if slots.init(view)?.is_truthy()? {
+                    if !present.contains(&name)? && slots.init(view)?.is_truthy()? {
                         missing.push(name);
                     }
                 }
             }
             None => {
-                let present = PySet::empty(py)?;
-                for (key, member, _) in members {
-                    present.add(&key)?;
-                    filled.push((key, member));
-                }
+                let present = self.filled(members, made, &mut filled)?;
                 for field in self.b(&self.g.fields).call1((target,))?.try_iter()? {
                     let field = field?;
                     let name = field.getattr(pyo3::intern!(py, "name"))?;
-                    if present.contains(&name)? {
-                        continue;
-                    }
-                    let default = field.getattr(pyo3::intern!(py, "default"))?;
-                    let factory = field.getattr(pyo3::intern!(py, "default_factory"))?;
-                    if !default.is(missing_marker) {
-                        filled.push((name, default));
-                    } else if !factory.is(missing_marker) {
-                        filled.push((name, factory.call0()?));
-                    } else if field.getattr(pyo3::intern!(py, "init"))?.is_truthy()? {
+                    if !present.contains(&name)?
+                        && field.getattr(pyo3::intern!(py, "init"))?.is_truthy()?
+                    {
                         missing.push(name);
                     }
                 }
@@ -4438,6 +4531,25 @@ impl<'py, 'g> Decoder<'py, 'g> {
             ));
         }
         Ok(filled)
+    }
+
+    /// ``members`` then ``made`` into ``filled``; the set of their names.
+    fn filled(
+        &self,
+        members: Vec<(B<'py>, B<'py>, usize)>,
+        made: Vec<(B<'py>, B<'py>)>,
+        filled: &mut Vec<(B<'py>, B<'py>)>,
+    ) -> PyResult<Bound<'py, PySet>> {
+        let present = PySet::empty(self.py)?;
+        for (key, member) in members
+            .into_iter()
+            .map(|(key, member, _)| (key, member))
+            .chain(made)
+        {
+            present.add(&key)?;
+            filled.push((key, member));
+        }
+        Ok(present)
     }
 
     /// ``_decode_stored``: the class a ``py/object`` record names, each field by its type.
@@ -4455,7 +4567,13 @@ impl<'py, 'g> Decoder<'py, 'g> {
         let frame = self.frame(at)?;
         self.place(frame, &value)?;
         let g = self.g;
-        let hints = if self.b(&g.is_dataclass).call1((&kind,))?.is_truthy()? {
+        let record = self.b(&g.is_dataclass).call1((&kind,))?.is_truthy()?;
+        let made = if record {
+            self.place_defaults(&kind, Fields::Record(data), frame)?
+        } else {
+            Vec::new()
+        };
+        let hints = if record {
             Some(self.b(&g.stored_types).call1((&kind, data))?)
         } else {
             None
@@ -4470,6 +4588,7 @@ impl<'py, 'g> Decoder<'py, 'g> {
                 hints,
                 value,
                 members,
+                made,
                 pending_name: None,
             },
         )))
@@ -4858,8 +4977,8 @@ fn resolved_of<'py>(py: Python<'py>, plan: &Plan, target: &B<'py>) -> B<'py> {
 // A target's ``Program`` is compiled once, from the same plans the frames
 // read by, and kept on its plan. Reading with it runs no Python code: it
 // allocates objects and fills their slots, lists, tuples and dicts directly.
-// Wherever a node would need anything else (a reference, a hook, a default,
-// a conversion, a part that does not read, a class changed since compiling)
+// Wherever a node would need anything else (a reference, a hook, a default
+// factory to call, a conversion, a part that does not read, a class changed since compiling)
 // the program stops and the whole call is read by the frames instead, which
 // is safe because nothing it built was seen by any Python code.
 /// Whether a plan's program has been compiled, and what it is.
@@ -4872,6 +4991,8 @@ enum Compiled {
 struct Program {
     recs: Vec<Rec>,
     root: Node,
+    /// What reads a ``Field``'s default, for a record that leaves it out.
+    slots: Option<FieldSlots>,
 }
 
 /// A plain dataclass read straight into its fields: its field facts are the
@@ -4889,6 +5010,8 @@ struct Rec {
     new: ffi::newfunc,
     info: Rc<DcInfo>,
     fields: Vec<Field>,
+    /// Each field's name, interned when a record first leaves one out.
+    names: OnceCell<Vec<Py<PyString>>>,
 }
 
 struct Field {
@@ -4897,6 +5020,85 @@ struct Field {
     /// ``None`` for a slot.
     name: Option<Py<PyString>>,
     node: Node,
+}
+
+impl Rec {
+    /// A mark for each field ``raw``, a record ``fill`` read whole, names;
+    /// ``None`` where there are more fields than marks.
+    fn present(&self, raw: &B<'_>) -> Option<u64> {
+        if self.fields.len() > 64 {
+            return None;
+        }
+        let mut set = 0u64;
+        let mut cursor = 0;
+        let mut position: ffi::Py_ssize_t = 0;
+        let mut key = std::ptr::null_mut();
+        let mut each = std::ptr::null_mut();
+        while unsafe { ffi::PyDict_Next(raw.as_ptr(), &mut position, &mut key, &mut each) } != 0 {
+            if let Some(slot) =
+                unsafe { utf8_ptr(key) }.and_then(|name| self.info.slot_of(name, &mut cursor))
+            {
+                set |= 1 << slot;
+            }
+        }
+        Some(set)
+    }
+
+    /// Each field but those ``set`` marks, from its default as ``slots``
+    /// reads it, each placed by ``place``; ``Stop::Abort`` where a field has
+    /// none, building it runs Python code, or ``set`` cannot mark them all.
+    fn fill_defaults<'py>(
+        &self,
+        value: &B<'py>,
+        set: u64,
+        slots: Option<&FieldSlots>,
+        mut place: impl FnMut(&Bound<'py, PyString>, &B<'py>) -> Result<(), Stop>,
+    ) -> Result<(), Stop> {
+        let py = value.py();
+        let Some(slots) = slots.filter(|_| self.fields.len() <= 64) else {
+            return Err(Stop::Abort);
+        };
+        // An exact dict keyed by exact strs: the lookups run no Python code.
+        let declared = unsafe {
+            type_lookup(
+                self.class.cast(),
+                pyo3::intern!(py, "__dataclass_fields__").as_ptr(),
+            )
+        };
+        if declared.is_null() || ob_type(declared) != t_dict() {
+            return Err(Stop::Abort);
+        }
+        let Some(bytes) = self.info.bytes.as_ref() else {
+            return Err(Stop::Abort);
+        };
+        let names = self.names.get_or_init(|| {
+            bytes
+                .iter()
+                .map(|name| {
+                    PyString::intern(py, std::str::from_utf8(name).unwrap_or_default()).unbind()
+                })
+                .collect()
+        });
+        for (index, field) in self.fields.iter().enumerate() {
+            if set & (1 << index) != 0 {
+                continue;
+            }
+            let name = names[index].bind(py);
+            let found = unsafe { ffi::PyDict_GetItem(declared, name.as_ptr()) };
+            if found.is_null() {
+                return Err(Stop::Abort);
+            }
+            let found = unsafe { Borrowed::from_ptr(py, found) };
+            let Some(member) = slots.native_default(&found) else {
+                return Err(Stop::Abort);
+            };
+            place(name, &member)?;
+            if !field.set(value, member) {
+                return Err(Stop::Abort);
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Field {
@@ -5401,10 +5603,25 @@ impl<'py, const PLACE: bool> Exec<'_, 'py, PLACE> {
             }
             count += 1;
         }
-        if count != rec.fields.len() {
-            return Err(Stop::Abort);
+        if count == rec.fields.len() {
+            return Ok(());
         }
-        Ok(())
+        let set = rec.present(raw).ok_or(Stop::Abort)?;
+        let slots = self.prog.slots.as_ref();
+        let place = self.place.as_mut().filter(|_| PLACE);
+        match place {
+            None => rec.fill_defaults(value, set, slots, |_, _| Ok(())),
+            Some(place) => rec.fill_defaults(value, set, slots, |name, member| {
+                let at = place
+                    .paths
+                    .frame(Loc::Child(frame, StepRef::Key(name.as_any())))
+                    .map_err(|_| Stop::Abort)?;
+                place
+                    .placed
+                    .set(place.paths, at, member)
+                    .map_err(|_| Stop::Abort)
+            }),
+        }
     }
 
     /// The member ``union_members`` tries first for ``raw``, if known: a
@@ -5614,6 +5831,11 @@ impl<'py> Decoder<'py, '_> {
         Some(Program {
             recs: compiling.recs,
             root,
+            slots: self
+                .g
+                .field_slots
+                .as_ref()
+                .map(|slots| slots.clone_ref(self.py)),
         })
     }
 
@@ -5796,6 +6018,7 @@ impl<'py> Decoder<'py, '_> {
             new,
             info: info.clone(),
             fields: Vec::new(),
+            names: OnceCell::new(),
         });
         compiling.memo.insert(key, index);
         let mut fields = Vec::with_capacity(names.len());
