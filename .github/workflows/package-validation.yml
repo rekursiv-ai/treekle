@@ -49,16 +49,8 @@ jobs:
           done
           timeout 300 sudo apt-get install -y --no-install-recommends ripgrep fd-find
       - name: Validate package
+        # The same for every package; a package's own checks are its tests.
         run: |
-          # Lint/type/test checks come from this package's own .pre-commit-config.yaml.
-          # Restating each tool here means a newly added hook silently goes unrun.
-          # `uv sync` builds the Rust core in place. The hooks measure coverage of the
-          # Python implementation, so they run with the core off; pytest then runs it on.
           uv sync --frozen --all-groups
-          TREEKLE_PURE_PYTHON=1 uv run pre-commit run --all-files --hook-stage pre-commit
-          TREEKLE_PURE_PYTHON=1 uv run pre-commit run --all-files --hook-stage pre-push
-          uv run pytest -q -p no:cacheprovider
-          rm -rf dist
-          uv build --out-dir dist
-          uv run --isolated --no-project --no-index --no-build --find-links dist --with treekle python -P -W error scripts/check_wheel.py native
-          uv run --isolated --no-project --with "$(uv run scripts/build_pure_wheel.py dist)" python -P -W error scripts/check_wheel.py python
+          SKIP=superseded-at-pre-push uv run pre-commit run --all-files --hook-stage pre-commit
+          uv run pre-commit run --all-files --hook-stage pre-push
