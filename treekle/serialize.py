@@ -16,10 +16,13 @@ given, declares the root. ``default_concrete_types`` says what an abstract
 declared type implies. Under the default ``object`` target, the tree reads back
 with no target at all.
 
-So is a value: a dataclass field holding what its class would rebuild it with
-is left out, as ``from_plain`` fills a missing field from its default or
-default factory (``_inferred``). A value left out is still registered where the
-walk would register it written, so a later ``py/ref`` to it still reads.
+So is a value: a dataclass field holding its default is left out, as
+``from_plain`` fills a missing field from its default or default factory
+(``_inferred``). Only a value every fill rebuilds alike counts: a leaf, a tuple
+of leaves or an enum member equal to the default, or the empty container a
+builtin class builds as a factory; a field a user factory defaults is written.
+A value left out is still registered where the walk would register it written,
+so a later ``py/ref`` to it still reads.
 
 The tag rules and their example are in ``treekle``'s package docstring;
 ``_implied_by`` is rule 1.
@@ -44,6 +47,7 @@ from pathlib import Path, PurePath
 from types import (
     BuiltinFunctionType,
     FunctionType,
+    GenericAlias,
     MappingProxyType,
     ModuleType,
 )
@@ -849,7 +853,7 @@ def _leave_out_defaults(
         # A value met before is written as a ``py/ref``; a hooked one reads by its hook.
         if id(value) in state.seen or type(value) in state.hooks:
             continue
-        sample = default.sample()
+        sample = _sample(default)
         if sample is _NO_SAMPLE or not _inferred(value, sample):
             continue
         del members[name]
@@ -858,53 +862,29 @@ def _leave_out_defaults(
             state.alive.append(value)
 
 
-@dataclass(slots=True, kw_only=True)
-class _Default:
-    """A field's default, as a member is compared with it.
-
-    Attributes:
-      item: The field, its default read anew each time, as ``from_plain`` reads it.
-      factory: The default factory ``built`` was made by.
-      built: What ``factory`` built, or ``_NO_SAMPLE`` if it raised.
-
-    """
-
-    item: Field[object]
-    factory: object
-    built: object
-
-    # A factory is user code, so it runs once, not once per record; one that
-    # raises leaves its field written.
-    def sample(self) -> object:
-        """Return what the field reads back as when left out.
-
-        Returns:
-          sample: The default, or what the factory built; ``_NO_SAMPLE`` where
-            the field has neither or the factory raised.
-
-        """
-        if self.item.default is not MISSING:
-            return self.item.default
-        factory = self.item.default_factory
-        if factory is MISSING:
-            return _NO_SAMPLE
-        if factory is not self.factory:
-            self.factory = factory
-            try:
-                self.built = factory()
-            except Exception:  # noqa: BLE001 -- A factory is user code; any failure leaves its field written.
-                self.built = _NO_SAMPLE
-        return self.built
+# A reader rebuilds a left-out field from its default or by calling its factory,
+# so only what every call builds alike may be left out: the default itself, or
+# the empty container a builtin class builds. A user factory's field is written.
+def _sample(item: Field[object]) -> object:
+    """Return what ``item`` reads back as when left out, read now; else ``_NO_SAMPLE``."""
+    if item.default is not MISSING:
+        return item.default
+    factory: object = item.default_factory
+    if type(factory) is GenericAlias:
+        factory = get_origin(factory)
+    if factory in _BUILTIN_FACTORIES:
+        return cast(Callable[[], object], factory)()
+    return _NO_SAMPLE
 
 
-def _defaults(kind: type[DataclassInstance]) -> Mapping[str, _Default]:
+def _defaults(kind: type[DataclassInstance]) -> Mapping[str, Field[object]]:
     """Return each field of ``kind`` with a default, by name, kept per class."""
     declared = kind.__dataclass_fields__
     held = _DEFAULTS.get(kind)
     if held is not None and held[0] is declared:
         return held[1]
     defaults = {
-        item.name: _Default(item=item, factory=MISSING, built=_NO_SAMPLE)
+        item.name: cast(Field[object], item)
         for item in fields(kind)
         if item.default is not MISSING or item.default_factory is not MISSING
     }
@@ -1315,14 +1295,30 @@ def _decided(
         return decide()
     dispatch = _dispatch()
     if known is not _DECISIONS:
-        held, answer = cast("tuple[object, object]", known)
-        if held is dispatch:
+        held, spelled, answer = cast(tuple[object, tuple[object, ...], object], known)
+        if held is dispatch and all(map(_spelled_alike, spelled, key)):
             return answer
     answer = decide()
     if len(_DECISIONS) >= _DECISION_LIMIT:
         _DECISIONS.clear()
-    _DECISIONS[full] = (dispatch, answer)
+    _DECISIONS[full] = (dispatch, key, answer)
     return answer
+
+
+# Unions of the same members compare and hash equal in any order, but read by
+# their own: a decision keyed by one is kept for the other only when every
+# union, at any depth, lists its members alike.
+def _spelled_alike(kept: object, asked: object) -> bool:
+    """Return whether ``kept`` and ``asked``, known equal, also order every union alike."""
+    if kept is asked:
+        return True
+    kept_args = cast(tuple[object, ...], get_args(kept))
+    asked_args = cast(tuple[object, ...], get_args(asked))
+    if not kept_args:
+        return kept == asked
+    return len(kept_args) == len(asked_args) and all(
+        map(_spelled_alike, kept_args, asked_args),
+    )
 
 
 def _part_types(member: object, kind: type) -> tuple[object, _DeclaredParts]:
@@ -1357,7 +1353,8 @@ _UNDECLARED: Final = frozenset((str, int, bool, float, type(None)))
 
 
 _DECISIONS: Final[dict[tuple[object, ...], object]] = {}
-"""Each decision ``_decided`` keeps, with the decoder table it was made under."""
+"""Each decision ``_decided`` keeps, with the decoder table it was made under and the
+key as it was spelled."""
 
 
 _DECISION_LIMIT: Final = 4096
@@ -1379,13 +1376,17 @@ _REGISTERED: Final = frozenset((dict, list, set, MappingProxyType))
 
 
 _DEFAULTS: Final[
-    weakref.WeakKeyDictionary[type, tuple[object, Mapping[str, _Default]]]
+    weakref.WeakKeyDictionary[type, tuple[object, Mapping[str, Field[object]]]]
 ] = weakref.WeakKeyDictionary()
 """Each dataclass's ``_defaults``, with the fields dict they were read from."""
 
 
+_BUILTIN_FACTORIES: Final = frozenset((dict, list, set, tuple, frozenset))
+"""The factories whose every call builds the same value: an empty one of their class."""
+
+
 _NO_SAMPLE: Final = object()
-"""A field with no default, or one whose factory raised."""
+"""What a field reads back as when that is not known before it is read."""
 
 
 _NO_ENTRIES: Final = MappingProxyType[str, PlainTree]({})

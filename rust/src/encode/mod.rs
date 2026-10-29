@@ -424,6 +424,9 @@ struct Encoder<'py, 'g> {
     alive: Vec<B<'py>>,
     frames: Vec<Frame<'py>>,
     spare: Vec<Vec<Part<'py>>>,
+    /// Whether looking a class up in ``hooks`` runs no Python code: an exact
+    /// dict whose keys' classes are plain ``type``s.
+    pure_hooks: std::cell::OnceCell<bool>,
     sink: Sink<'py>,
 }
 
@@ -1929,6 +1932,7 @@ impl<'py, 'g> Encoder<'py, 'g> {
             if member.is_null() || member == pending {
                 continue;
             }
+            let member = unsafe { Bound::from_borrowed_ptr(py, member) };
             let name = owner[slot as usize].name.bind(py).clone().into_any();
             if let (Some(defaults), Some(by_slot)) = (&defaults, by_slot) {
                 let found = match pick {
@@ -1936,12 +1940,11 @@ impl<'py, 'g> Encoder<'py, 'g> {
                         .filter(|&found| found != u32::MAX as usize),
                     Pick::Key(_) => defaults.find(&name),
                 };
-                let held = unsafe { Bound::from_borrowed_ptr(py, member) };
-                match self.left_out(defaults, found, here, &name, &held, false)? {
+                match self.left_out(defaults, found, here, &name, &member, false)? {
                     Some(true) => continue,
                     Some(false) => {}
-                    // A factory runs Python code, which could free a member
-                    // borrowed here; ``object`` holds each one it reads.
+                    // The check would run Python code, which could change the
+                    // record; ``object`` reads every member first, as Python does.
                     None => {
                         self.rollback(alive);
                         self.sink.rewind(mark);
@@ -1950,11 +1953,10 @@ impl<'py, 'g> Encoder<'py, 'g> {
                 }
             }
             if let Some(node) = &node
-                && unsafe { ffi::PyDict_SetItem(node.as_ptr(), name.as_ptr(), member) } < 0
+                && unsafe { ffi::PyDict_SetItem(node.as_ptr(), name.as_ptr(), member.as_ptr()) } < 0
             {
                 return Err(PyErr::fetch(py));
             }
-            let member = unsafe { Bound::from_borrowed_ptr(py, member) };
             if self.is_leaf(&member) {
                 if !tree {
                     if parts.is_empty() {
@@ -2095,12 +2097,29 @@ impl<'py, 'g> Encoder<'py, 'g> {
 
     /// Whether ``member`` is written as other than itself: a ``py/ref`` to
     /// where it was met before, or by its hook.
-    fn referred(&self, member: &B<'py>) -> bool {
-        self.seen.contains_key(&(member.as_ptr() as usize))
-            || self
-                .hooks
-                .as_ref()
-                .is_some_and(|hooks| hooked(hooks, member).unwrap_or(true))
+    /// ``None`` where the hook lookup would run Python code and ``call`` is
+    /// not set.
+    fn referred(&self, member: &B<'py>, call: bool) -> PyResult<Option<bool>> {
+        if self.seen.contains_key(&(member.as_ptr() as usize)) {
+            return Ok(Some(true));
+        }
+        let Some(hooks) = &self.hooks else {
+            return Ok(Some(false));
+        };
+        let plain = |kind: &B<'py>| tp(kind) == &raw mut ffi::PyType_Type;
+        if !call
+            && !(plain(member.get_type().as_any())
+                && *self.pure_hooks.get_or_init(|| {
+                    tp(hooks) == t_dict()
+                        && unsafe { hooks.cast_unchecked::<PyDict>() }
+                            .keys()
+                            .iter()
+                            .all(|key| plain(&key))
+                }))
+        {
+            return Ok(None);
+        }
+        hooked(hooks, member).map(Some)
     }
 
     /// ``kind``'s fields with a default, read once per class; ``None`` where
@@ -2117,8 +2136,8 @@ impl<'py, 'g> Encoder<'py, 'g> {
     /// ``_leave_out_defaults`` for one member, ``defaults``' field ``found``:
     /// whether ``member``, the record at ``here``'s ``name``, is what its
     /// default rebuilds, and so left out; registered where the walk would
-    /// register it written. ``None`` where that needs Python code run and
-    /// ``call`` is not set.
+    /// register it written. ``None`` where a check would run Python code and
+    /// ``call`` is not set: a caller holding raw members bails then.
     fn left_out(
         &mut self,
         defaults: &crate::fields::ClassDefaults,
@@ -2131,22 +2150,23 @@ impl<'py, 'g> Encoder<'py, 'g> {
         let Some(found) = found else {
             return Ok(Some(false));
         };
-        if !self.g.defaults.omittable(member)? {
-            return Ok(Some(false));
+        match self.g.defaults.omittable(member, call)? {
+            Some(true) => {}
+            other => return Ok(other),
         }
-        let default = &defaults.fields[found];
-        let sample = match self.g.defaults.sample(self.py, default, false)? {
-            Some(sample) => sample,
-            // Python builds the default only for a member it may leave out.
-            None if self.referred(member) => return Ok(Some(false)),
-            None if !call => return Ok(None),
-            None => self
-                .g
-                .defaults
-                .sample(self.py, default, true)?
-                .expect("a call reads the sample"),
+        match self.referred(member, call)? {
+            Some(false) => {}
+            Some(true) => return Ok(Some(false)),
+            None => return Ok(None),
+        }
+        let Some(sample) = self
+            .g
+            .defaults
+            .sample(self.py, &defaults.fields[found], call)?
+        else {
+            return Ok(None);
         };
-        if !self.g.defaults.inferred(member, &sample)? || self.referred(member) {
+        if !self.g.defaults.inferred(member, &sample)? {
             return Ok(Some(false));
         }
         if crate::fields::registered_kind(tp(member)) {
@@ -3060,6 +3080,7 @@ fn walk<'py>(
         alive: Vec::new(),
         frames: Vec::new(),
         spare: Vec::new(),
+        pure_hooks: std::cell::OnceCell::new(),
         sink,
     };
     Buffers::take(py).bind(&mut encoder);

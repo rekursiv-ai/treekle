@@ -2,7 +2,7 @@
 //! without a lookup, and the rule that leaves a field holding what its
 //! default rebuilds out of the written tree.
 
-use std::cell::{OnceCell, RefCell};
+use std::cell::OnceCell;
 
 use pyo3::ffi;
 use pyo3::prelude::*;
@@ -274,45 +274,23 @@ pub enum Sample<'py> {
     /// An empty instance of this builtin container: what a factory that is
     /// the class itself, or a builtin generic of it, builds.
     Empty(*mut ffi::PyTypeObject),
-    /// The default itself, or what the factory built.
+    /// The default itself.
     Value(B<'py>),
-    /// No default, or the factory raised: the field is written.
+    /// Not known before it is read, as where a user factory builds it: the
+    /// field is written.
     Written,
 }
 
-/// What a factory built, kept so it runs once.
-enum Built {
-    Empty(*mut ffi::PyTypeObject),
-    Value(Py<PyAny>),
-    Raised,
-}
-
-impl Built {
-    fn sample<'py>(&self, py: Python<'py>) -> Sample<'py> {
-        match self {
-            Self::Empty(kind) => Sample::Empty(*kind),
-            Self::Value(value) => Sample::Value(value.bind(py).clone()),
-            Self::Raised => Sample::Written,
-        }
-    }
-}
-
-/// ``_Default``: a field with a default, as a member is compared with it.
+/// A field with a default, as a member is compared with it.
 pub struct FieldDefault {
     pub name: Py<PyString>,
     /// The ``Field``, its default read anew each time, as ``from_plain`` reads it.
     field: Py<PyAny>,
-    /// The factory last called, and what it built.
-    made: RefCell<Option<(Py<PyAny>, Built)>>,
 }
 
 impl FieldDefault {
     fn new(name: Py<PyString>, field: Py<PyAny>) -> Self {
-        Self {
-            name,
-            field,
-            made: RefCell::new(None),
-        }
+        Self { name, field }
     }
 }
 
@@ -467,10 +445,9 @@ impl DefaultGlobals {
         }
     }
 
-    /// ``_Default.sample``: what ``default``'s field reads back as, its
-    /// ``default`` and ``default_factory`` read now; a factory is called once,
-    /// until it is replaced, and one that raises leaves the field written.
-    /// ``None`` where that runs Python code and ``call`` is not set.
+    /// ``_sample``: what ``default``'s field reads back as, its ``default`` and
+    /// ``default_factory`` read now. Runs no factory; ``None`` where reading
+    /// the field would run Python code and ``call`` is not set.
     pub fn sample<'py>(
         &self,
         py: Python<'py>,
@@ -502,31 +479,18 @@ impl DefaultGlobals {
         if factory.is(missing) {
             return Ok(Some(Sample::Written));
         }
-        if let Some((last, built)) = &*default.made.borrow()
-            && last.is(&factory)
-        {
-            return Ok(Some(built.sample(py)));
-        }
-        let built = match builtin_factory(&factory, self.generic_alias.bind(py))? {
-            Some(kind) => Built::Empty(kind),
-            None if !call => return Ok(None),
-            // Not borrowed while it runs: a factory may encode this class.
-            None => match factory.call0() {
-                Ok(built) => Built::Value(built.unbind()),
-                Err(error) if error.is_instance_of::<pyo3::exceptions::PyException>(py) => {
-                    Built::Raised
-                }
-                Err(error) => return Err(error),
+        Ok(Some(
+            match builtin_factory(&factory, self.generic_alias.bind(py))? {
+                Some(kind) => Sample::Empty(kind),
+                None => Sample::Written,
             },
-        };
-        let sample = built.sample(py);
-        *default.made.borrow_mut() = Some((factory.unbind(), built));
-        Ok(Some(sample))
+        ))
     }
 
     /// ``_omittable``: whether ``value`` is of a kind ``inferred`` can match,
-    /// so its default is worth building.
-    pub fn omittable(&self, value: &B<'_>) -> PyResult<bool> {
+    /// so its default is worth building. ``None`` where that runs Python code,
+    /// a proxy over a mapping not an exact dict, and ``call`` is not set.
+    pub fn omittable(&self, value: &B<'_>, call: bool) -> PyResult<Option<bool>> {
         let kind = tp(value);
         if kind == t_none()
             || kind == t_bool()
@@ -537,9 +501,27 @@ impl DefaultGlobals {
             || kind == t_tuple()
             || unsafe { ffi::PyType_IsSubtype(kind, self.enum_type.as_ptr().cast()) } != 0
         {
-            return Ok(true);
+            return Ok(Some(true));
         }
-        Ok(empty_kind(kind) && value.len()? == 0)
+        if !empty_kind(kind) {
+            return Ok(Some(false));
+        }
+        // A ``mappingproxy`` holds its mapping right after the object header.
+        if !call
+            && kind == &raw mut ffi::PyDictProxy_Type
+            && unsafe {
+                ffi::Py_TYPE(
+                    *value
+                        .as_ptr()
+                        .cast::<u8>()
+                        .add(std::mem::size_of::<ffi::PyObject>())
+                        .cast::<*mut ffi::PyObject>(),
+                )
+            } != t_dict()
+        {
+            return Ok(None);
+        }
+        Ok(Some(value.len()? == 0))
     }
 
     /// ``_inferred``: whether reading ``sample`` back rebuilds ``value``.

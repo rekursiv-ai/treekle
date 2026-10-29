@@ -9,9 +9,9 @@ Each ref's treekle package is checked out over the head's tree in a detached
 worktree under ``/opt/scratch/runs``, so every core reads the same priml
 configs, and built there as the release wheels are (PGO; ``--no-pgo`` skips
 the profile). A head of ``WORKTREE`` is this checkout as it stands, uncommitted
-edits included, built in place. Each case then runs in its own process under
-``perf stat``, pinned to one CPU, counting user instructions only inside the
-timed calls. Instruction counts barely move with machine load, so refs compare
+edits included, built in place; every ref then reads its workload as it stands
+too, and an uncommitted file outside treekle the workload imports is refused. Each case then runs in its own process under ``perf stat``, pinned to one
+CPU, counting user instructions only inside the timed calls. Instruction counts barely move with machine load, so refs compare
 on a busy machine where timings do not. The ratio is the head over the ref
 just before it.
 
@@ -87,11 +87,19 @@ def main() -> int:
     repo = Path(_git(_CWD, "rev-parse", "--show-toplevel"))
     pgo = not flags.no_pgo
     worktree = flags.head == _WORKTREE
+    if worktree and (edited := _edited_workload(repo)):
+        print(
+            f"The refs read the committed {', '.join(edited)}, which {_WORKTREE} "
+            "has edited; commit it or count a committed head.",
+            file=sys.stderr,
+        )
+        return 2
     head = _git(repo, "rev-parse", "HEAD" if worktree else flags.head)
     refs = [_git(repo, "rev-parse", ref) for ref in (flags.base, *flags.ref)]
     if not worktree:
         refs.append(head)
-    roots = [_prepared(repo, ref, head, pgo=pgo) for ref in refs]
+    workload = (_CWD / "bench_configs.py").read_text() if worktree else None
+    roots = [_prepared(repo, ref, head, pgo=pgo, workload=workload) for ref in refs]
     names = [ref[:10] for ref in refs]
     if worktree:
         _build(repo, _CWD.parent.relative_to(repo), pgo=pgo)
@@ -184,6 +192,27 @@ class _Work:
     warm: bool
 
 
+def _edited_workload(repo: Path) -> list[str]:
+    """Return the uncommitted files outside treekle that the workload imports."""
+    package = _CWD.parent.resolve()
+    _configs(1)
+    imported = {
+        Path(name).resolve()
+        for module in list(sys.modules.values())
+        if (name := cast(str | None, getattr(module, "__file__", None))) is not None
+    }
+    changed = [
+        *_git(repo, "diff", "--name-only", "HEAD").splitlines(),
+        *_git(repo, "ls-files", "--others", "--exclude-standard").splitlines(),
+    ]
+    return sorted(
+        name
+        for name in changed
+        if (path := (repo / name).resolve()) in imported
+        and not path.is_relative_to(package)
+    )
+
+
 def _git(where: Path, *args: str) -> str:
     """Return the stripped output of ``git -C where args``."""
     done = subprocess.run(  # noqa: S603 -- Fixed argv.
@@ -195,7 +224,16 @@ def _git(where: Path, *args: str) -> str:
     return done.stdout.strip()
 
 
-def _prepared(repo: Path, ref: str, head: str, *, pgo: bool) -> Path:
+# Every core reads the head's workload: ``workload``, a worktree head's text, else
+# the commit's. Set on every run, as a worktree's may have changed since.
+def _prepared(
+    repo: Path,
+    ref: str,
+    head: str,
+    *,
+    pgo: bool,
+    workload: str | None,
+) -> Path:
     """Return a worktree of ``head`` holding ``ref``'s treekle, its core built."""
     package = _CWD.parent.relative_to(repo)
     root = _RUNS / f"{ref[:12]}-on-{head[:12]}{'' if pgo else '-no-pgo'}"
@@ -203,9 +241,11 @@ def _prepared(repo: Path, ref: str, head: str, *, pgo: bool) -> Path:
         _git(repo, "worktree", "add", "--detach", str(root), head)
         shutil.rmtree(root / package)
         _git(root, "checkout", ref, "--", str(package))
-        # The workload is the newer ref's, so both cores read the same one.
-        workload = package / "scripts" / "bench_configs.py"
-        _git(root, "checkout", head, "--", str(workload))
+    configs = package / "scripts" / "bench_configs.py"
+    if workload is None:
+        _git(root, "checkout", head, "--", str(configs))
+    else:
+        (root / configs).write_text(workload)
     # The build installs a profiling core before the final one, so only a
     # finished build counts as built.
     built = root / ".bench-counts-built"

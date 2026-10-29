@@ -399,14 +399,14 @@ time as a multiple of msgspec-struct's under ×.
 - **warm:** repeat calls on classes each library has already seen.
 - **cold:** the first call on classes no library has seen.
 
-| library                    | warm encode (ms) |    × | warm decode (ms) |    × | cold encode (ms) |    × | cold decode (ms) |   × |
-|----------------------------|-----------------:|-----:|-----------------:|-----:|-----------------:|-----:|-----------------:|----:|
-| msgspec-struct (reference) |             1.61 |  1.0 |             0.51 |  1.0 |             2.02 |  1.0 |            16.57 | 1.0 |
-| msgspec-dataclass          |             1.62 |  1.0 |                ❌ |      |             2.06 |  1.0 |                ❌ |     |
-| treekle-rust               |             1.38 |  0.9 |             0.46 |  0.9 |             3.41 |  1.7 |            14.67 | 0.9 |
-| pickle                     |             8.45 |  5.2 |             2.56 |  5.0 |             7.39 |  3.7 |             3.93 | 0.2 |
-| treekle-python             |            33.34 | 20.7 |            36.86 | 72.6 |            56.16 | 27.8 |            44.08 | 2.7 |
-| jsonpickle                 |            59.39 | 36.8 |            30.02 | 59.2 |            40.11 | 19.8 |            36.24 | 2.2 |
+| library                    | warm encode (ms) |    × | warm decode (ms) |    × | cold encode (ms) |    × | cold decode (ms) |    × |
+|----------------------------|-----------------:|-----:|-----------------:|-----:|-----------------:|-----:|-----------------:|-----:|
+| msgspec-struct (reference) |              1.6 |  1.0 |             0.50 |  1.0 |              1.9 |  1.0 |               16 |  1.0 |
+| msgspec-dataclass          |              1.6 |  1.0 |                ❌ |      |              1.9 | 0.99 |                ❌ |      |
+| treekle-rust               |              1.4 | 0.85 |             0.47 | 0.93 |              3.4 |  1.8 |               15 | 0.90 |
+| pickle                     |              8.3 |  5.2 |              2.6 |  5.2 |              7.3 |  3.8 |              3.9 | 0.24 |
+| treekle-python             |               37 |   23 |               37 |   74 |               60 |   31 |               44 |  2.7 |
+| jsonpickle                 |               59 |   36 |               30 |   60 |               38 |   20 |               35 |  2.1 |
 
 - **encode:** each library on the config itself. msgspec is given
   `enc_hook=repr`, its only way past the callables a config holds, and writes
