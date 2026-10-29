@@ -2107,19 +2107,20 @@ impl<'py, 'g> Encoder<'py, 'g> {
             return Ok(Some(false));
         };
         let plain = |kind: &B<'py>| tp(kind) == &raw mut ffi::PyType_Type;
-        if !call
-            && !(plain(member.get_type().as_any())
+        let pure = || {
+            plain(member.get_type().as_any())
                 && *self.pure_hooks.get_or_init(|| {
                     tp(hooks) == t_dict()
                         && unsafe { hooks.cast_unchecked::<PyDict>() }
                             .keys()
                             .iter()
                             .all(|key| plain(&key))
-                }))
-        {
-            return Ok(None);
+                })
+        };
+        if call || pure() {
+            return hooked(hooks, member).map(Some);
         }
-        hooked(hooks, member).map(Some)
+        Ok(None)
     }
 
     /// ``kind``'s fields with a default, read once per class; ``None`` where
