@@ -869,7 +869,7 @@ def _sample(item: Field[object]) -> object:
     """Return what ``item`` reads back as when left out, read now; else ``_NO_SAMPLE``."""
     if item.default is not MISSING:
         return item.default
-    factory: object = item.default_factory
+    factory = cast(object, item.default_factory)
     if type(factory) is GenericAlias:
         factory = get_origin(factory)
     if factory in _BUILTIN_FACTORIES:
