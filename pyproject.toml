@@ -3,7 +3,7 @@
 
 [project]
 name = "treekle"
-version = "0.4.0"
+version = "0.4.1"
 description = "Pickle semantics as plain python trees."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -53,7 +53,7 @@ typecheck = [
     "basedpyright>=1.40.1",
     "pyrefly>=1.4.0",
     "ty>=0.0.84",
-    "rekursiv-ai-typings>=0.1.6",
+    "rekursiv-ai-typings>=0.1.11",
 ]
 "pre-commit" = [
     "pre-commit>=4.6",

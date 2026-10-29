@@ -3,6 +3,16 @@
 All notable treekle changes are documented here. This project follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## 0.4.1 - 2026-10-28
+
+### Changed
+
+- Dataclass fields left at their defaults are omitted from treekle trees.
+- Union member order is preserved.
+- The Rust core matches Python attribute and class reads.
+- Hooks dispatch correctly for custom member types.
+- The development dependency floor on `rekursiv-ai-typings` is 0.1.11.
+
 ## 0.4.0 - 2026-10-26
 
 ### Changed
