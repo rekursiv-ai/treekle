@@ -486,7 +486,8 @@ def test_a_worktree_head_with_uncommitted_workload_imports_is_refused(
         }
         return answers.get(args) or _sha(args[-1])
 
-    def prepare(*_: object, **__: object) -> Path:
+    def prepare(*args: object, **kwargs: object) -> Path:
+        del args, kwargs
         raise AssertionError("prepared a ref")
 
     monkeypatch.setattr(bench_counts, "_configs", configs)
