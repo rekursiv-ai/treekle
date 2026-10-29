@@ -30,6 +30,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+from math import floor, log10
 from pathlib import Path
 from types import GenericAlias, ModuleType, UnionType
 from typing import Protocol, cast, get_args, get_origin
@@ -437,8 +438,8 @@ def _render(
     rows = [
         [
             label,
-            *(_cell(row[n], "{:.1f}") for n in names),
-            *(_cell(_ratio(row[n], row["msgspec-struct"]), "{:.1f}") for n in relative),
+            *(_cell(row[n]) for n in names),
+            *(_cell(_ratio(row[n], row["msgspec-struct"])) for n in relative),
         ]
         for label, row in cells.items()
     ]
@@ -461,10 +462,10 @@ def _summary(
         for cells in totals.values():
             total = cells["**total**"]
             us = total[name]
-            row.append(_cell(None if us is None else us / 1000, "{:.2f}"))
+            row.append(_cell(None if us is None else us / 1000))
             if base:
                 multiple = _ratio(us, total["msgspec-struct"])
-                row.append("" if multiple is None else f"{multiple:.1f}")
+                row.append("" if multiple is None else _cell(multiple))
         rows.append(row)
     note = "; × is the multiple of msgspec-struct's" if base else ""
     title = f"**Summary** (total over every config{note})"
@@ -502,8 +503,17 @@ def _ratio(value: float | None, base: float | None) -> float | None:
     return value / base
 
 
-def _cell(value: float | None, spec: str) -> str:
-    return "❌" if value is None else spec.format(value)
+def _cell(value: float | None) -> str:
+    """Return ``value`` to two significant figures, never in exponent form."""
+    if value is None:
+        return "❌"
+    if value == 0:
+        return "0"
+    # Rounding can carry into a new leading digit (9.96 to 10), so the places
+    # are counted again from the rounded value.
+    rounded = round(value, 1 - floor(log10(abs(value))))
+    places = max(0, 1 - floor(log10(abs(rounded))))
+    return f"{round(rounded, places):.{places}f}"
 
 
 def _treekle_codec(

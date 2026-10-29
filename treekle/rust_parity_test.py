@@ -1510,6 +1510,224 @@ def test_a_default_not_of_its_declared_type_is_left_out_and_read_back_alike(
     _assert_reads_alike(tree, target, allow_imports=True)
 
 
+class _Drops(Mapping[str, int]):
+    """An empty mapping whose ``len`` first sets its owner's ``name`` to ``None``."""
+
+    def __init__(self, owner: object, name: str) -> None:
+        self.owner = owner
+        self.name = name
+
+    @override
+    def __getitem__(self, key: str) -> int:
+        raise KeyError(key)
+
+    @override
+    def __iter__(self) -> Iterator[str]:
+        return iter(())
+
+    @override
+    def __len__(self) -> int:
+        if self.owner is not None:
+            object.__setattr__(self.owner, self.name, None)
+            self.owner = None
+        return 0
+
+
+class _DropsOnLookup(Mapping[type, tuple[object, object]]):
+    """Hooks for ``dict`` whose membership test first sets the owner's ``cache`` to ``None``."""
+
+    def __init__(self, owner: object) -> None:
+        self.owner = owner
+
+    @override
+    def __contains__(self, kind: object) -> bool:
+        if kind is dict and self.owner is not None:
+            object.__setattr__(self.owner, "cache", None)
+            self.owner = None
+        return kind is dict
+
+    @override
+    def __getitem__(self, kind: type) -> tuple[object, object]:
+        if kind is not dict:
+            raise KeyError(kind)
+        return (list, dict)
+
+    @override
+    def __iter__(self) -> Iterator[type]:
+        return iter((dict,))
+
+    @override
+    def __len__(self) -> int:
+        return 1
+
+
+@dataclass(kw_only=True, slots=True)
+class _SlottedDrop:
+    m: Mapping[str, int] = field(default_factory=dict[str, int])
+    cache: dict[str, int] = field(default_factory=dict[str, int])
+
+
+@dataclass(
+    kw_only=True,
+)  # house-ignore[dataclass] -- Dict-backed: its fields live in __dict__.
+class _DictDrop:
+    m: Mapping[str, int] = field(default_factory=dict[str, int])
+    z: list[int] = field(default_factory=list[int])
+
+
+def _drops_its_own_slot() -> tuple[object, dict[str, object]]:
+    value = _SlottedDrop()
+    value.m = MappingProxyType(_Drops(value, "m"))
+    return value, {}
+
+
+def _drops_its_own_entry() -> tuple[object, dict[str, object]]:
+    value = _DictDrop()
+    value.m = MappingProxyType(_Drops(value, "m"))
+    return value, {}
+
+
+def _drops_a_later_entry() -> tuple[object, dict[str, object]]:
+    value = _DictDrop(z=[1, 2])
+    value.m = MappingProxyType(_Drops(value, "z"))
+    return value, {}
+
+
+def _drops_on_a_hook_lookup() -> tuple[object, dict[str, object]]:
+    value = _SlottedDrop()
+    return value, {"hooks": _DropsOnLookup(value)}
+
+
+# A field's default is checked while the walk reads the record's members, and
+# the check may run code that drops a member: each must be held until written.
+@needs_rust
+@pytest.mark.parametrize("text", [False, True], ids=["to_plain", "json_dumps"])
+@pytest.mark.parametrize(
+    "build",
+    [
+        _drops_its_own_slot,
+        _drops_its_own_entry,
+        _drops_a_later_entry,
+        _drops_on_a_hook_lookup,
+    ],
+    ids=["own slot", "own dict entry", "later dict entry", "hook lookup"],
+)
+def test_a_default_check_that_drops_a_member_writes_as_python_does(
+    build: Callable[[], tuple[object, dict[str, object]]],
+    text: bool,
+) -> None:
+    def write(walker: Callable[..., object]) -> object:
+        value, options = build()
+        if text:
+            return _text_outcome(lambda: walker(value, **options))
+        return _outcome(lambda: walker(value, **options))
+
+    if text:
+        assert write(wire.json_dumps) == write(_python_json_dumps)
+    else:
+        assert write(serialize.to_plain) == write(serialize._python_to_plain)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _Step:
+    action: int = 1
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _Click:
+    x: int = 0
+    y: int = 0
+
+
+# ``A | B`` and ``B | A`` compare and hash equal, yet a union reads untagged data
+# by its own order: each order must write by its own, whichever was written first.
+@needs_rust
+@pytest.mark.parametrize(
+    ("orders", "values"),
+    [
+        (
+            (_Step | _Click, _Click | _Step),
+            (_Step(), _Click(), _Step(action=3), _Click(x=5)),
+        ),
+        (
+            (list[_Step | _Click], list[_Click | _Step]),
+            ([_Step()], [_Click()], [_Click(x=5), _Step()]),
+        ),
+        (
+            (
+                dict[str, _Step] | dict[str, _Click],
+                dict[str, _Click] | dict[str, _Step],
+            ),
+            ({"k": _Step()}, {"k": _Click()}),
+        ),
+    ],
+    ids=["records", "nested records", "containers"],
+)
+def test_each_order_of_one_union_writes_and_reads_by_its_own_order(
+    orders: tuple[object, object],
+    values: tuple[object, ...],
+) -> None:
+    for target in orders:
+        for value in values:
+            tree = serialize._python_to_plain(value, target=target)
+            assert serialize.to_plain(value, target=target) == tree, (target, value)
+            back = deserialize.from_plain(tree, target, allow_imports=True)
+            assert (type(back), back) == (type(value), value), (target, tree)
+            text = wire.json_dumps(value, target=target)
+            back = wire.json_loads(text, target, allow_imports=True)
+            assert (type(back), back) == (type(value), value), (target, text)
+
+
+_STAMPS: list[int] = []
+
+
+def _stamp() -> int:
+    _STAMPS.append(len(_STAMPS))
+    return _STAMPS[-1]
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _Stamped:
+    x: int
+    n: int = field(default_factory=_stamp)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _Named:
+    x: str
+
+
+def _json_read(data: object, target: object) -> object:
+    return wire.json_loads(json.dumps(data), target)
+
+
+# A user factory may give another value each call, so ``to_plain`` writes its field.
+# Data that leaves it out has it built once for each record that starts, the readers
+# alike: every started record finishes, a bad part included, so a union member tried
+# and refused builds it too.
+@needs_rust
+@pytest.mark.parametrize(
+    "read",
+    [deserialize.from_plain, deserialize._python_from_plain, _json_read],
+    ids=["rust", "python", "json_loads"],
+)
+def test_a_user_factory_runs_once_for_each_record_that_starts(
+    read: Callable[[object, object], object],
+) -> None:
+    _STAMPS.clear()
+
+    assert read({"x": "s"}, _Stamped | _Named) == _Named(x="s")
+    with pytest.raises(ReadError):
+        read({"x": "s"}, _Stamped)
+    assert _STAMPS == [0, 1]
+    assert read({"x": 1}, _Stamped) == _Stamped(x=1, n=2)
+    assert read([{"x": 1}, {"x": 2, "n": 9}, {"x": 3}], list[_Stamped]) == [
+        _Stamped(x=1, n=3),
+        _Stamped(x=2, n=9),
+        _Stamped(x=3, n=4),
+    ]
+
+
 @needs_rust
 def test_mutated_dataclass_field_facts_match_python(
     monkeypatch: pytest.MonkeyPatch,

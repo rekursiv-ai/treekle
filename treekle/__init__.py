@@ -55,8 +55,10 @@ The contract, which ``serialize``, ``deserialize`` and the Rust core follow::
     #    record whose hints declare its fields, and below the root a tagged
     #    value is not refused for not fitting its declared type.
     # 4. An untagged node reads back as its tag would have: a record restores
-    #    its state, and __init__ does not run. A field holding what its
-    #    default or default factory builds is left out, and filled from it.
+    #    its state, and __init__ does not run. A field holding its default,
+    #    or the empty container a builtin factory (list, dict, set, tuple,
+    #    frozenset) builds, is left out and filled back; one a user factory
+    #    defaults is written.
     # 5. Hence, with every node's type kept (an int stays an int):
     assert from_plain(to_plain(v, target=T, default_concrete_types=C), T,
                       default_concrete_types=C) == v

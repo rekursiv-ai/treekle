@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from subprocess import CompletedProcess
+from types import ModuleType
 from typing import TYPE_CHECKING, cast
 
 import subprocess
@@ -199,14 +200,25 @@ def test_a_ref_is_checked_out_once_and_built_once(
     monkeypatch.setattr(subprocess, "run", run)
 
     roots = [
-        bench_counts._prepared(repo, "a" * 40, "b" * 40, pgo=True) for _ in range(2)
+        bench_counts._prepared(repo, "a" * 40, "b" * 40, pgo=True, workload=None)
+        for _ in range(2)
     ]
     root = roots[-1]
+    workload = (
+        "checkout",
+        "b" * 40,
+        "--",
+        str(package / "scripts" / "bench_configs.py"),
+    )
 
     assert roots[0] == root
     assert root == tmp_path / "runs" / f"{'a' * 12}-on-{'b' * 12}"
-    assert [args[0] for args in gits] == ["worktree", "checkout", "checkout"]
-    assert gits[1] == ("checkout", "a" * 40, "--", str(package))
+    assert gits == [
+        ("worktree", "add", "--detach", str(root), "b" * 40),
+        ("checkout", "a" * 40, "--", str(package)),
+        workload,
+        workload,
+    ]
     assert [argv[-1] for argv in builds] == [str(root / package / "build_rust.py")]
     assert (root / ".bench-counts-built").exists()
 
@@ -243,8 +255,15 @@ def test_main_counts_every_case_at_both_refs(
         del where
         return args[-1]
 
-    def prepared(repo: Path, ref: str, head: str, *, pgo: bool) -> Path:
-        del repo, head, pgo
+    def prepared(
+        repo: Path,
+        ref: str,
+        head: str,
+        *,
+        pgo: bool,
+        workload: str | None,
+    ) -> Path:
+        del repo, head, pgo, workload
         return roots["base" if ref == "c4afb1c292" else "head"]
 
     monkeypatch.setattr(bench_counts, "_git", git)
@@ -285,30 +304,47 @@ def _sha(ref: str) -> str:
 
 def _fake_main(
     monkeypatch: pytest.MonkeyPatch,
+    repo: Path,
     argv: list[str],
 ) -> tuple[
-    list[tuple[str, str, bool]],
+    list[tuple[str, str, bool, str | None]],
     list[tuple[Path, bool]],
     list[tuple[Path, str]],
 ]:
-    """Run ``main`` on ``argv`` with git, builds and counts faked; return what each saw."""
-    prepared: list[tuple[str, str, bool]] = []
+    """Run ``main`` in ``repo`` on ``argv``, git, builds and counts faked; return what each saw."""
+    prepared: list[tuple[str, str, bool, str | None]] = []
     built: list[tuple[Path, bool]] = []
     counted: list[tuple[Path, str]] = []
+    scripts = repo / "pkg" / "scripts"
+    scripts.mkdir(parents=True)
+    (scripts / "bench_configs.py").write_text("workload\n")
     monkeypatch.setattr(sys, "argv", ["bench_counts", "--cpu", "5", *argv])
 
     def git(where: Path, *args: str) -> str:
         if args == ("rev-parse", "--show-toplevel"):
             assert where == bench_counts._CWD
-            return "/repo"
-        assert where == Path("/repo")
+            return str(repo)
+        assert where == repo
+        if args[0] in {"diff", "ls-files"}:
+            return ""
         assert args[0] == "rev-parse"
         assert len(args) == 2
         return _sha(args[1])
 
-    def prepare(repo: Path, ref: str, head: str, *, pgo: bool) -> Path:
-        assert repo == Path("/repo")
-        prepared.append((ref, head, pgo))
+    def configs(rounds: int) -> list[object]:
+        del rounds
+        return []
+
+    def prepare(
+        given: Path,
+        ref: str,
+        head: str,
+        *,
+        pgo: bool,
+        workload: str | None,
+    ) -> Path:
+        assert given == repo
+        prepared.append((ref, head, pgo, workload))
         return Path(f"/runs/{ref[:3]}")
 
     def build(root: Path, package: Path, *, pgo: bool) -> None:
@@ -320,8 +356,9 @@ def _fake_main(
         counted.append((root, case))
         return bench_counts._Count(instructions=100, calls=1, mismatched=0)
 
-    monkeypatch.setattr(bench_counts, "_CWD", Path("/repo/pkg/scripts"))
+    monkeypatch.setattr(bench_counts, "_CWD", scripts)
     monkeypatch.setattr(bench_counts, "_git", git)
+    monkeypatch.setattr(bench_counts, "_configs", configs)
     monkeypatch.setattr(bench_counts, "_prepared", prepare)
     monkeypatch.setattr(bench_counts, "_build", build)
     monkeypatch.setattr(bench_counts, "_count", count)
@@ -330,45 +367,149 @@ def _fake_main(
 
 
 def test_main_counts_each_ref_given_between_the_base_and_the_head(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     prepared, _, counted = _fake_main(
         monkeypatch,
+        tmp_path,
         ["--base", "a", "--ref", "b", "--head", "c", "--only", "encode cold"],
     )
 
-    assert prepared == [(_sha(ref), _sha("c"), True) for ref in "abc"]
+    # A committed head's workload is read from the commit.
+    assert prepared == [(_sha(ref), _sha("c"), True, None) for ref in "abc"]
     assert counted == [(Path(f"/runs/{ref * 3}"), "encode cold") for ref in "abc"]
     header = capsys.readouterr().out.splitlines()[1].split()
     assert header[2:5] == [ref * 10 for ref in "abc"]
 
 
 def test_a_worktree_head_counts_the_checkout_as_it_stands(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     prepared, built, counted = _fake_main(
         monkeypatch,
+        tmp_path,
         ["--base", "a", "--head", "WORKTREE", "--only", "decode warm"],
     )
 
-    # The base reads the workload of the commit the checkout stands on.
-    assert prepared == [(_sha("a"), _sha("HEAD"), True)]
-    assert built == [(Path("/repo"), True)]
-    assert counted[-1] == (Path("/repo"), "decode warm")
+    # The base stands on the checkout's commit and reads its workload as it stands.
+    assert prepared == [(_sha("a"), _sha("HEAD"), True, "workload\n")]
+    assert built == [(tmp_path, True)]
+    assert counted[-1] == (tmp_path, "decode warm")
+
+
+def test_every_ref_reads_a_worktree_head_s_workload_as_it_stands(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = tmp_path / "repo"
+    scripts = Path("pkg") / "scripts"
+    (repo / scripts).mkdir(parents=True)
+    (repo / scripts / "bench_configs.py").write_text("edited\n")
+    # A base prepared by an earlier run, holding the committed workload.
+    base = tmp_path / "runs" / f"{_sha('a')[:12]}-on-{_sha('HEAD')[:12]}"
+    (base / scripts).mkdir(parents=True)
+    (base / scripts / "bench_configs.py").write_text("committed\n")
+    (base / ".bench-counts-built").touch()
+    monkeypatch.setattr(bench_counts, "_CWD", repo / scripts)
+    monkeypatch.setattr(bench_counts, "_RUNS", tmp_path / "runs")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["bench_counts", "--base", "a", "--head", "WORKTREE", "--only", "decode warm"],
+    )
+    read: list[str] = []
+
+    def git(where: Path, *args: str) -> str:
+        del where
+        if args == ("rev-parse", "--show-toplevel"):
+            return str(repo)
+        if args[0] in {"diff", "ls-files"}:
+            return ""
+        assert args[0] == "rev-parse"
+        return _sha(args[1])
+
+    def configs(rounds: int) -> list[object]:
+        del rounds
+        return []
+
+    def build(root: Path, package: Path, *, pgo: bool) -> None:
+        del root, package, pgo
+
+    def count(root: Path, case: str, cpu: str) -> bench_counts._Count:
+        del case, cpu
+        read.append((root / scripts / "bench_configs.py").read_text())
+        return bench_counts._Count(instructions=100, calls=1, mismatched=0)
+
+    monkeypatch.setattr(bench_counts, "_git", git)
+    monkeypatch.setattr(bench_counts, "_configs", configs)
+    monkeypatch.setattr(bench_counts, "_build", build)
+    monkeypatch.setattr(bench_counts, "_count", count)
+
+    assert bench_counts.main() == 0
+    assert read == ["edited\n", "edited\n"]
+
+
+def test_a_worktree_head_with_uncommitted_workload_imports_is_refused(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # The refs stand on the head's commit, so they would read the committed
+    # config, and the head the edited one.
+    repo = tmp_path / "repo"
+    scripts = repo / "pkg" / "scripts"
+    scripts.mkdir(parents=True)
+    (scripts / "bench_configs.py").write_text("workload\n")
+    config = ModuleType("fake_priml_config")
+    config.__file__ = str(repo / "priml" / "config.py")
+    monkeypatch.setattr(bench_counts, "_CWD", scripts)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["bench_counts", "--base", "a", "--head", "WORKTREE", "--only", "decode warm"],
+    )
+
+    def configs(rounds: int) -> list[object]:
+        del rounds
+        monkeypatch.setitem(sys.modules, config.__name__, config)
+        return []
+
+    def git(where: Path, *args: str) -> str:
+        del where
+        answers: dict[tuple[str, ...], str] = {
+            ("rev-parse", "--show-toplevel"): str(repo),
+            ("diff", "--name-only", "HEAD"): "priml/config.py\npkg/serialize.py",
+            ("ls-files", "--others", "--exclude-standard"): "notes.txt",
+        }
+        return answers.get(args) or _sha(args[-1])
+
+    def prepare(*_: object, **__: object) -> Path:
+        raise AssertionError("prepared a ref")
+
+    monkeypatch.setattr(bench_counts, "_configs", configs)
+    monkeypatch.setattr(bench_counts, "_git", git)
+    monkeypatch.setattr(bench_counts, "_prepared", prepare)
+
+    assert bench_counts.main() == 2
+    assert "priml/config.py" in capsys.readouterr().err
 
 
 def test_no_pgo_builds_every_ref_without_a_profile(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     prepared, built, _ = _fake_main(
         monkeypatch,
+        tmp_path,
         ["--head", "WORKTREE", "--no-pgo", "--only", "decode warm"],
     )
 
-    assert [pgo for _, _, pgo in prepared] == [False]
-    assert built == [(Path("/repo"), False)]
+    assert [pgo for _, _, pgo, _ in prepared] == [False]
+    assert built == [(tmp_path, False)]
     assert capsys.readouterr().out.startswith("Builds without a profile;")
 
 
@@ -395,7 +536,7 @@ def test_a_ref_built_without_a_profile_is_kept_apart(
     monkeypatch.setattr(bench_counts, "_git", git)
     monkeypatch.setattr(subprocess, "run", run)
 
-    root = bench_counts._prepared(repo, "a" * 40, "b" * 40, pgo=False)
+    root = bench_counts._prepared(repo, "a" * 40, "b" * 40, pgo=False, workload=None)
 
     assert root == tmp_path / "runs" / f"{'a' * 12}-on-{'b' * 12}-no-pgo"
     assert builds[0][-1] == "--no-pgo"

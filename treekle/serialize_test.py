@@ -1441,15 +1441,14 @@ _FROZEN: Final = MappingProxyType[type, type](
 )
 
 
-def _no_json() -> Mapping[str, PlainTree]:
-    return MappingProxyType[str, PlainTree]({})
+_NO_JSON: Final = MappingProxyType[str, PlainTree]({})
 
 
 @dataclass(frozen=True, kw_only=True, slots=True)
 class Record:
     """Provider JSON in ``extra``, beside fields declared otherwise."""
 
-    extra: Mapping[str, PlainTree] = field(default_factory=_no_json)
+    extra: Mapping[str, PlainTree] = _NO_JSON
     names: Sequence[str] = ()
     pairs: tuple[int, ...] = ()
     loose: object = None
@@ -1792,6 +1791,33 @@ class TestAContainerNotOfItsDeclaredType:
 
         assert (first, second) == ([1], [1])
         assert len(decisions) == 1
+
+    def test_a_decision_is_kept_for_an_equal_key_spelled_apart(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        decided: list[object] = []
+        form_by = serialize._form_by
+
+        def counted(
+            kind: type,
+            declared: object,
+            default_concrete_types: Mapping[object, type],
+            fit: serialize._Fit,
+        ) -> serialize._Form | None:
+            decided.append(declared)
+            return form_by(kind, declared, default_concrete_types, fit)
+
+        monkeypatch.setattr(serialize, "_DECISIONS", {})
+        monkeypatch.setattr(serialize, "_form_by", counted)
+        value = tuple(range(300))
+
+        for _ in range(2):
+            assert serialize._python_to_plain(value, target=tuple[int, ...]) == list(
+                value,
+            )
+
+        assert len(decided) == 1
 
 
 class Ratio(Enum):
@@ -2360,8 +2386,7 @@ class Shade(Enum):
     DARK = "dark"
 
 
-def _no_entries() -> Mapping[str, int]:
-    return MappingProxyType[str, int]({})
+_NO_ENTRIES: Final = MappingProxyType[str, int]({})
 
 
 def _one_seed() -> list[int]:
@@ -2378,7 +2403,7 @@ class Defaulted:
     shade: Shade = Shade.LIGHT
     shape: tuple[int, int] = (1, 1)
     tags: list[str] = field(default_factory=list[str])
-    extra: Mapping[str, int] = field(default_factory=_no_entries)
+    extra: Mapping[str, int] = _NO_ENTRIES
 
 
 @dataclass(
@@ -2411,11 +2436,6 @@ class Shaded:
 class SharedHolder:
     records: list[Shared]
     shared: dict[str, int]
-
-
-@dataclass(kw_only=True, slots=True)
-class Counted:
-    inner: object = field(default_factory=list[int])
 
 
 @dataclass(kw_only=True, slots=True)
@@ -2495,23 +2515,24 @@ class TestDefaults:
         assert to_plain(Seeded(), target=Seeded) == {"seeds": [1]}
         assert to_plain(Seeded(seeds=[]), target=Seeded) == {"seeds": []}
 
-    def test_a_default_factory_is_called_once_per_class(self) -> None:
+    def test_a_field_a_user_factory_defaults_is_written_without_calling_it(
+        self,
+    ) -> None:
         calls: list[None] = []
 
         def counted() -> int:
             calls.append(None)
-            return 0
+            return len(calls) - 1
 
         @dataclass(kw_only=True, slots=True)
-        class Counted:
+        class Stamped:
             count: int = field(default_factory=counted)
 
-        records = [Counted(), Counted(count=1), Counted()]
+        records = [Stamped(), Stamped(count=1)]
         calls.clear()
-        trees = [to_plain(records, target=list[Counted]) for _ in range(2)]
 
-        assert trees == [[{}, {"count": 1}, {}]] * 2
-        assert len(calls) == 1
+        assert to_plain(records, target=list[Stamped]) == [{"count": 0}, {"count": 1}]
+        assert calls == []
 
     def test_a_changed_default_is_read_anew(
         self,
@@ -2520,65 +2541,22 @@ class TestDefaults:
         @dataclass(kw_only=True, slots=True)
         class Changing:
             count: int = 1
-            level: int = field(default_factory=int)
+            tags: tuple[int, ...] = field(default_factory=tuple[int, ...])
 
         declared = cast(dict[str, Field[object]], Changing.__dataclass_fields__)
-        before = to_plain(Changing(count=1, level=3), target=Changing)
+        before = to_plain(Changing(count=1), target=Changing)
         monkeypatch.setattr(declared["count"], "default", 2)
-        monkeypatch.setattr(declared["level"], "default_factory", lambda: 3)
+        monkeypatch.setattr(declared["tags"], "default_factory", MISSING)
+        monkeypatch.setattr(declared["tags"], "default", (3,))
 
-        assert before == {"level": 3}
-        assert to_plain(Changing(count=1, level=3), target=Changing) == {"count": 1}
-        assert to_plain(Changing(count=2, level=0), target=Changing) == {"level": 0}
-        monkeypatch.setattr(declared["count"], "default", MISSING)
-        assert to_plain(Changing(count=2, level=3), target=Changing) == {"count": 2}
-
-    def test_a_default_factory_is_called_only_for_a_value_it_could_build(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        calls: list[None] = []
-
-        def counted() -> list[int]:
-            calls.append(None)
-            return []
-
-        declared = cast(Field[object], Counted.__dataclass_fields__["inner"])
-        monkeypatch.setattr(declared, "default_factory", counted)
-        shared: list[int] = []
-        values = [
-            Counted(inner=Shaded()),
-            Counted(inner=[1]),
-            shared,
-            Counted(inner=shared),
-        ]
-
-        written = to_plain(values, target=list[object])
-
-        assert isinstance(written, list)
-        assert written[3] == {
-            "py/object": f"{__name__}.Counted",
-            "inner": {"py/ref": [2]},
+        assert before == {}
+        assert to_plain(Changing(count=1, tags=()), target=Changing) == {
+            "count": 1,
+            "tags": [],
         }
-        assert calls == []
-        assert to_plain([Counted(inner=[])], target=list[Counted]) == [{}]
-        assert len(calls) == 1
-
-    def test_a_default_factory_that_raises_writes_its_field(self) -> None:
-        calls: list[None] = []
-
-        def broken() -> int:
-            calls.append(None)
-            raise RuntimeError("no default")
-
-        @dataclass(kw_only=True, slots=True)
-        class Broken:
-            count: int = field(default_factory=broken)
-
-        tree = to_plain([Broken(count=0), Broken(count=0)], target=list[Broken])
-
-        assert tree == [{"count": 0}, {"count": 0}]
-        assert len(calls) == 1
+        assert to_plain(Changing(count=2, tags=(3,)), target=Changing) == {}
+        monkeypatch.setattr(declared["count"], "default", MISSING)
+        assert to_plain(Changing(count=2, tags=(3,)), target=Changing) == {"count": 2}
 
     def test_a_left_out_value_met_again_is_referred_to(self) -> None:
         cache: dict[str, int] = {}

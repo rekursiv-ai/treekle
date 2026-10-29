@@ -228,6 +228,27 @@ def test_without_msgspec_the_tables_have_no_ratio_columns(
     assert "vs msgspec-struct" not in out
 
 
+@pytest.mark.parametrize(
+    ("value", "shown"),
+    [
+        (0.0, "0"),
+        (0.5133, "0.51"),
+        (0.846, "0.85"),
+        (1.0, "1.0"),
+        (1.6249, "1.6"),
+        (9.96, "10"),
+        (36.58, "37"),
+        (123.4, "120"),
+        (None, "❌"),
+    ],
+)
+def test_every_number_shows_two_significant_figures(
+    value: float | None,
+    shown: str,
+) -> None:
+    assert bench_configs._cell(value) == shown
+
+
 def test_the_flags_default_to_every_library_on_installed_priml() -> None:
     parser = argparse.ArgumentParser()
     bench_configs._add_arguments(parser)
