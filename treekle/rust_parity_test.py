@@ -369,7 +369,8 @@ class Key:
 
     A key's own encoding is dropped once its text is made, so each state
     object and its class die before the next key, whose class may then take
-    the freed address.
+    the freed address. Each class is bound as this module's ``Temp`` so its
+    import path resolves; rebinding it lets the last one die.
     """
 
     def __init__(self, n: int) -> None:
@@ -377,9 +378,14 @@ class Key:
 
     @override
     def __reduce__(self) -> tuple[object, ...]:
-        gc.collect()
+        globals().pop("Temp", None)
+        # A class is a cycle, so only the collector frees it; the young
+        # generation holds the last key's and is cheap to sweep.
+        gc.collect(0)
         name = f"slot{self.n}"
-        state = type("Temp", (), {"__slots__": (name,)})()
+        temp = type("Temp", (), {"__slots__": (name,), "__module__": __name__})
+        globals()["Temp"] = temp
+        state = temp()
         setattr(state, name, self.n)
         return (Key, (self.n,), state)
 
@@ -1956,6 +1962,11 @@ def test_shallow_nesting_still_round_trips() -> None:
     assert deserialize.from_plain(value, object) == value
 
 
+# Past every native walk's fast-path depth (decoding's 128 and 192, the text
+# sink's 96), so a walk that hands deep trees to Python is caught.
+_PAST_FAST_PATHS: Final = 400
+
+
 def _deep(value: object, depth: int) -> object:
     """Return ``value`` nested ``depth`` lists down."""
     for _ in range(depth):
@@ -1967,7 +1978,7 @@ def _deep(value: object, depth: int) -> object:
 def test_references_deep_in_the_tree_match_python(mutable: bool) -> None:
     shared = {"value": 1}
     first_seen_deep = {"value": 2}
-    deep = _deep({"earlier": shared, "new": first_seen_deep}, 5_000)
+    deep = _deep({"earlier": shared, "new": first_seen_deep}, _PAST_FAST_PATHS)
     value = {"first": shared, "deep": deep, "later": first_seen_deep}
 
     expected = serialize._python_to_plain(value, mutable=mutable)
@@ -2083,7 +2094,7 @@ def test_deep_trees_of_every_kind_encode_natively_as_python_does(
 ) -> None:
     # Python's walk is what the native one hands a subtree to when it cannot
     # encode it itself; none of this needs that, however deep.
-    value = _every_native_kind(3_000)
+    value = _every_native_kind(_PAST_FAST_PATHS)
     expected = serialize._python_to_plain(value, mutable=mutable)
 
     def refused(*_args: object, **_kwargs: object) -> object:
@@ -2329,25 +2340,32 @@ def _bad_leaf_chain(depth: int) -> dict[str, object]:
 
 
 _DEEP_READS: dict[str, tuple[Callable[[], object], object, dict[str, object]]] = {
-    "union of lists": (lambda: _deep(0, 5_000), _Tree, {}),
-    "union refusing its deepest leaf": (lambda: _deep("x", 5_000), _Tree, {}),
-    "dataclass chain": (lambda: _plain_chain(5_000), Node, {}),
+    "union of lists": (lambda: _deep(0, _PAST_FAST_PATHS), _Tree, {}),
+    "union refusing its deepest leaf": (
+        lambda: _deep("x", _PAST_FAST_PATHS),
+        _Tree,
+        {},
+    ),
+    "dataclass chain": (lambda: _plain_chain(_PAST_FAST_PATHS), Node, {}),
     "dataclass chain with a bad deepest field": (
-        lambda: _bad_leaf_chain(5_000),
+        lambda: _bad_leaf_chain(_PAST_FAST_PATHS),
         Node,
         {},
     ),
     "every tagged kind": (
-        lambda: serialize._python_to_plain(_every_native_kind(3_000)),
+        lambda: serialize._python_to_plain(_every_native_kind(_PAST_FAST_PATHS)),
         object,
         {"allow_imports": True},
     ),
     "every tagged kind, frozen": (
-        lambda: serialize._python_to_plain(_every_native_kind(3_000), mutable=False),
+        lambda: serialize._python_to_plain(
+            _every_native_kind(_PAST_FAST_PATHS),
+            mutable=False,
+        ),
         object,
         {"allow_imports": True},
     ),
-    "a cycle deep down": (lambda: _cycle_deep_down(3_000), object, {}),
+    "a cycle deep down": (lambda: _cycle_deep_down(_PAST_FAST_PATHS), object, {}),
 }
 
 
