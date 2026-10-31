@@ -12,19 +12,10 @@ lists, and scalars instead of opaque bytes.
 ## Quick Start
 
 ```bash
-# Mac:
-#   # Required for quick install.
-#   brew install uv
-
-# Ubuntu/Debian:
-#   # Required for quick install.
-#   sudo apt-get install -y curl
-#   curl -LsSf https://astral.sh/uv/install.sh | sh
-
 uv add treekle
-
-# Alternatively: python -m pip install treekle
 ```
+
+See [Install](#install) for additional details.
 
 `to_plain` turns a value into plain data any JSON, TOML, or YAML writer can
 store. `from_plain` turns it back into the type you ask for. Neither touches
@@ -306,6 +297,28 @@ def json_loads(
         allow_imports=allow_imports,
         strict=strict,
     )
+```
+
+## Install
+
+```bash
+uv add treekle
+```
+
+If you're missing `uv`,
+- Mac
+  ```bash
+  brew install uv
+  ```
+- Linux
+  ```bash
+  sudo apt install -y curl
+  curl -LsSf https://astral.sh/uv/install.sh | sh
+  ```
+
+Or with pip,
+```bash
+python -m pip install treekle
 ```
 
 ## Why not another serializer
