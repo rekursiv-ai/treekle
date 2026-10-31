@@ -716,7 +716,7 @@ class TestToPlain:
         assert tree == expected
         # The Rust core keeps what it chose with its own class facts.
         if implementation == "python":
-            assert serialize._ENCODER_CACHE[kind] is serialize._encoder_for(kind)
+            assert serialize._ENCODER_CACHE[kind] is serialize._kind_encoder(kind)
 
     def test_object_attributes_sort_by_name_but_can_keep_declaration_order(
         self,

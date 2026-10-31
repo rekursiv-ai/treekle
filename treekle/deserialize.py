@@ -419,7 +419,7 @@ def _start_node(
         value = _decode_reference(data, state)
         checked = True
     else:
-        tag = _tag_of(data)
+        tag = _node_tag(data)
         # A mapping target reads a tag key as data, as ``custom_json.convert``
         # did; callers then pick the payload by key. Without imports no class
         # can be built, so an untyped ``py/object`` record stays a record too.
@@ -466,7 +466,7 @@ def _decode_tagged(
         decoder = _TAG_DECODERS.get(next(iter(data)))
         if decoder is not None:
             return decoder(next(iter(data.values())), object, at, state)
-    tag = _tag_of(data)
+    tag = _node_tag(data)
     if tag is None:
         return _decode_entries(data, object, object, at, state)
     raise ReadError(f"invalid {tag} envelope: {_shown(data)}")
@@ -480,7 +480,7 @@ def _is_plain(data: object) -> bool:
     )
 
 
-def _decoder_for(target: object) -> _Decoder:
+def _target_decoder(target: object) -> _Decoder:
     """Return the decoder for ``target``, keyed on its origin."""
     origin: object = get_origin(target) or target
     decoder = _dispatch().get(origin)
@@ -510,10 +510,10 @@ def _untagged_decoder(
         chosen = default_concrete_types.get(get_origin(target) or target)
         if chosen is not None:
             return _dispatch()[chosen]
-    return _decoder_for(target)
+    return _target_decoder(target)
 
 
-def _tag_of(node: Mapping[str, PlainTree]) -> str | None:
+def _node_tag(node: Mapping[str, PlainTree]) -> str | None:
     """Return the highest-precedence ``py/*`` tag on ``node``, if any."""
     if not _has_tag_key(node):
         return None
@@ -904,11 +904,11 @@ def _decode_complex(
     if isinstance(data, Sequence) and not isinstance(data, str) and len(data) == 2:
         # Each part is a tree of its own: a non-finite one arrives as ``py/float``.
         jobs = [(part, float, (*at, index)) for index, part in enumerate(data)]
-        return _Steps(at, jobs=jobs, done=_complex_of)
+        return _Steps(at, jobs=jobs, done=_complex)
     raise ReadError(f"cannot read {_shown(data)} as complex")
 
 
-def _complex_of(parts: list[object]) -> object:
+def _complex(parts: list[object]) -> object:
     """Return the complex number of a decoded real and imaginary part."""
     real, imag = parts
     return complex(cast("float", real), cast("float", imag))
@@ -998,7 +998,7 @@ def _decode_enum(
 ) -> Enum:
     """Decode an untagged value as a member of ``target``; tagged ones are reduces."""
     del at, state
-    # ``_decoder_for`` picks this decoder only for a class with ``Enum`` in its MRO.
+    # ``_target_decoder`` picks this decoder only for a class with ``Enum`` in its MRO.
     return _enum_member(data, cast("type[Enum]", target))
 
 
@@ -1141,10 +1141,10 @@ def _decode_frozenset(
     if not isinstance(data, Sequence) or isinstance(data, str):
         raise ReadError(f"cannot read {_shown(data)} as {target}")
     types = repeat(_element_type(target))
-    return _Items(at, raws=data, types=types, values=[], done=_frozenset_of)
+    return _Items(at, raws=data, types=types, values=[], done=_hashable_frozenset)
 
 
-def _frozenset_of(members: list[object]) -> object:
+def _hashable_frozenset(members: list[object]) -> object:
     """Return ``members`` as a frozenset, refusing an unhashable one."""
     try:
         return frozenset(members)
@@ -2768,7 +2768,7 @@ _DECODERS: Final[Mapping[object, _Decoder]] = MappingProxyType(
         typing.Union: _decode_union,  # pyright: ignore[reportDeprecated] -- A runtime origin key, not an annotation.
     },
 )
-"""Decoders by origin; ``_decoder_for`` adds Enum, path, dataclass, and Protocol targets."""
+"""Decoders by origin; ``_target_decoder`` adds Enum, path, dataclass, and Protocol targets."""
 
 
 _TAG_DECODERS: Final[Mapping[str, _Decoder]] = MappingProxyType(

@@ -394,7 +394,7 @@ def _encode_node(value: object, state: _Encoding) -> object:
             )
     if kind in state.hooks:
         return _encode_hooked(value, state)
-    return _encoder_for(kind)(value, state)
+    return _kind_encoder(kind)(value, state)
 
 
 def _recover(
@@ -476,7 +476,7 @@ def _encloses(place: _Here, here: _Here) -> bool:
     return False
 
 
-def _encoder_for(kind: type) -> _Encoder:
+def _kind_encoder(kind: type) -> _Encoder:
     """Return the encoder for ``kind``, choosing once per class and caching it."""
     encoder = _ENCODERS.get(kind) or _ENCODER_CACHE.get(kind)
     if encoder is not None:
@@ -1415,7 +1415,7 @@ _ENCODERS: Final[Mapping[type, _Encoder]] = MappingProxyType(
         BuiltinFunctionType: _encode_function,
     },
 )
-"""Encoders by exact type; ``_encoder_for`` resolves and caches every other class."""
+"""Encoders by exact type; ``_kind_encoder`` resolves and caches every other class."""
 
 
 _ENCODER_CACHE: Final[weakref.WeakKeyDictionary[type, _Encoder]] = (

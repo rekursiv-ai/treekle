@@ -196,7 +196,7 @@ pub struct DecGlobals {
     /// ``types.UnionType``, ``types.GenericAlias`` and
     /// ``weakref.WeakKeyDictionary``, held from setup.
     native_types: [Py<PyAny>; 3],
-    /// The module's own ``_resolve_alias``, ``get_origin``, ``_decoder_for``,
+    /// The module's own ``_resolve_alias``, ``get_origin``, ``_target_decoder``,
     /// ``get_args``, ``_import_name``, ``is_dataclass``, ``_is_any``,
     /// ``is_typeddict``, ``_is_protocol`` and ``_DECODERS``: while each is
     /// in place, a plain dataclass's plan is compiled natively.
@@ -269,7 +269,7 @@ pub struct DecGlobals {
     ast_walk: Py<PyAny>,
     ast_name: Py<PyAny>,
     ast_load: Py<PyAny>,
-    /// Whether ``_decoder_for(float)`` is the float decoder, so an int read
+    /// Whether ``_target_decoder(float)`` is the float decoder, so an int read
     /// as ``float`` converts without a plan.
     fast_float: bool,
     /// What ``PathCheck`` reads to recheck a kept resolved path.
@@ -373,7 +373,7 @@ pub fn setup(module: &Bound<'_, PyDict>) -> PyResult<()> {
     .map(|(tag, name)| Ok((tag, get(name)?)))
     .collect::<PyResult<Vec<_>>>()?;
     let float_type = builtins.getattr("float")?;
-    let fast_float = item(module, "_decoder_for")?
+    let fast_float = item(module, "_target_decoder")?
         .call1((&float_type,))
         .is_ok_and(|decoder| {
             decoders
@@ -421,7 +421,7 @@ pub fn setup(module: &Bound<'_, PyDict>) -> PyResult<()> {
         compile_own: [
             "_resolve_alias",
             "get_origin",
-            "_decoder_for",
+            "_target_decoder",
             "get_args",
             "_import_name",
             "is_dataclass",
@@ -465,7 +465,7 @@ pub fn setup(module: &Bound<'_, PyDict>) -> PyResult<()> {
         json_error: json.getattr("JSONDecodeError")?.unbind(),
         lax_bools: get("_LAX_BOOLS")?,
         resolve_alias: get("_resolve_alias")?,
-        decoder_for: get("_decoder_for")?,
+        decoder_for: get("_target_decoder")?,
         union_candidates: get("_union_candidates")?,
         fits: get("_fits")?,
         is_subclass: get("_is_subclass")?,
@@ -3262,7 +3262,7 @@ impl<'py, 'g> Decoder<'py, 'g> {
         Ok(func.call1((data, target, py.None(), py.None()))?)
     }
 
-    /// ``_tag_of`` from a ``classify`` scan where one was made: the tag it
+    /// ``_node_tag`` from a ``classify`` scan where one was made: the tag it
     /// found, raising for a ``py/`` key that names none.
     #[inline]
     fn tag_from(&self, keys: &Option<TagKeys>, data: &B<'py>) -> DR<Option<Tag>> {
@@ -3273,7 +3273,7 @@ impl<'py, 'g> Decoder<'py, 'g> {
         }
     }
 
-    /// ``_tag_of``: the highest-precedence tag on a mapping, if any.
+    /// ``_node_tag``: the highest-precedence tag on a mapping, if any.
     fn tag_of(&self, data: &B<'py>) -> DR<Option<Tag>> {
         // An exact dict of exact str keys answers in one pass: no key's
         // ``__eq__`` or ``__hash__`` is Python code, so membership is bytes.
@@ -3297,7 +3297,7 @@ impl<'py, 'g> Decoder<'py, 'g> {
         self.unknown_tag(data)
     }
 
-    /// ``_tag_of``'s refusal of a node whose ``py/`` keys name no tag.
+    /// ``_node_tag``'s refusal of a node whose ``py/`` keys name no tag.
     fn unknown_tag(&self, data: &B<'py>) -> DR<Option<Tag>> {
         let names = PyList::empty(self.py);
         for key in data.try_iter()? {
@@ -6264,7 +6264,7 @@ impl<'py> Decoder<'py, '_> {
     /// under a plain ``type`` metaclass, straight under ``object``, with its
     /// own ``__dataclass_fields__`` and ``__module__``, no ``__value__``,
     /// and not one of ``_DECODERS``' keys. ``_resolve_alias`` leaves such a
-    /// class as itself, ``get_origin`` gives ``None``, ``_decoder_for`` picks
+    /// class as itself, ``get_origin`` gives ``None``, ``_target_decoder`` picks
     /// ``_decode_object``, and ``get_args`` gives ``()``.
     fn native_compile(&self, target: &B<'py>, persistent: bool) -> PyResult<Option<Plan>> {
         let py = self.py;
@@ -6394,7 +6394,7 @@ impl<'py> Decoder<'py, '_> {
     /// Neither has a ``__value__`` or is ``Annotated``, so ``_resolve_alias``
     /// leaves it as itself; ``get_origin`` is its ``__origin__`` (``Union``
     /// for a union), ``get_args`` its ``__args__`` (an unpacked or
-    /// ``Callable``-flattened alias is left to Python), and ``_decoder_for``
+    /// ``Callable``-flattened alias is left to Python), and ``_target_decoder``
     /// reads ``_DECODERS`` at that origin. Each class it names is stamped,
     /// as ``compile`` would through ``depend``.
     fn native_alias(&self, target: &B<'py>, persistent: bool) -> PyResult<Option<Plan>> {
