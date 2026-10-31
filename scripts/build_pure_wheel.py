@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["hatchling==1.32.4"]
+# dependencies = ["hatchling==1.33.0"]
 # ///
 # house-ignore[cli-shape] -- Runs as `uv run` from its PEP 723 block, which pins hatchling.
 """Build the Python-only universal wheel into a directory and print its path.

@@ -21,7 +21,7 @@ ROOT = _CWD.parent
 
 # The wheel builds from the public repository's ``pyproject.toml``, which the
 # monorepo keeps in ``.export`` and does not build from.
-pytestmark = pytest.mark.skipif(
+_needs_public_layout = pytest.mark.skipif(
     not (ROOT / "pyproject.toml").is_file(),
     reason="needs the public repository layout",
 )
@@ -40,6 +40,7 @@ def pure_wheel(tmp_path_factory: pytest.TempPathFactory) -> Path:
     return Path(result.stdout.strip())
 
 
+@_needs_public_layout
 def test_pure_wheel_uses_project_metadata_but_no_native_files(
     pure_wheel: Path,
 ) -> None:
@@ -67,6 +68,8 @@ def test_pure_wheel_uses_project_metadata_but_no_native_files(
         assert b"Tag: py3-none-any" in wheel_info
 
 
+# Runs in the monorepo too, where the lock's hatchling is the one installed, so
+# a lock bump that leaves the release's pin behind fails here before it ships.
 def test_the_release_builds_with_the_hatchling_the_tests_use() -> None:
     script = (ROOT / "scripts/build_pure_wheel.py").read_text().splitlines()
     block = script[script.index("# /// script") + 1 : script.index("# ///")]
@@ -98,6 +101,7 @@ def _check_wheel(mode: str, installed: Path) -> subprocess.CompletedProcess[str]
     )
 
 
+@_needs_public_layout
 @pytest.mark.parametrize(
     ("mode", "code", "says"),
     [("python", 0, "python: "), ("native", 1, "treekle._rust is missing")],
