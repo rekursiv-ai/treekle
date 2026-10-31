@@ -1726,7 +1726,7 @@ class TestDefault:
         assert from_plain(None, int | None, default=None) is None
 
 
-def _bad_of(tree: MutablePlainTree, hooks: Hooks = _HOOKS) -> dict[FieldPath, str]:
+def _bad_reasons(tree: MutablePlainTree, hooks: Hooks = _HOOKS) -> dict[FieldPath, str]:
     """Return each bad part's reason when ``tree`` reads as ``object``."""
     with pytest.raises(ReadError) as raised:
         from_plain(tree, object, hooks=hooks, allow_imports=True)
@@ -1787,7 +1787,7 @@ class TestReduce:
         payload: MutablePlainTree,
         reason: str,
     ) -> None:
-        assert _bad_of({"r": {"py/reduce": payload}}) == {("r",): reason}
+        assert _bad_reasons({"r": {"py/reduce": payload}}) == {("r",): reason}
 
     def test_each_recipe_part_sits_at_its_index(self) -> None:
         # The callable is a reduce of its own: ``getattr(list, "copy")`` yields a
@@ -1887,7 +1887,7 @@ class TestReduce:
             ),
         }
 
-        assert _bad_of(tree) == {
+        assert _bad_reasons(tree) == {
             ("r", 1, 1): "py/ref ['r'] names a value still being built",
         }
 
@@ -1938,14 +1938,14 @@ class TestReduce:
 
         assert first == bytearray(b"a")
         assert second is first
-        assert _bad_of([to_plain(bytearray(b"a")), {"py/id": 1}]) == {
+        assert _bad_reasons([to_plain(bytearray(b"a")), {"py/id": 1}]) == {
             (1,): "invalid py/id reference: {'py/id': 1}",
         }
 
     def test_a_stateless_hashable_value_is_not_placed(self) -> None:
         tree: MutablePlainTree = [to_plain(Level.LOW), {"py/ref": [0]}]
 
-        assert _bad_of(tree) == {(1,): "py/ref [0] names no earlier value"}
+        assert _bad_reasons(tree) == {(1,): "py/ref [0] names no earlier value"}
 
     @pytest.mark.parametrize(
         ("state", "expected"),
@@ -2017,7 +2017,9 @@ class TestHooked:
         ids=repr,
     )
     def test_a_bad_hook_names_why(self, payload: MutablePlainTree, reason: str) -> None:
-        assert _bad_of({"r": {"py/hook": payload}}, hooks=_HOOKS) == {("r",): reason}
+        assert _bad_reasons({"r": {"py/hook": payload}}, hooks=_HOOKS) == {
+            ("r",): reason,
+        }
 
     @pytest.mark.parametrize("error", [ValueError, TypeError], ids=repr)
     def test_a_hook_that_fails_to_decode_is_a_bad_part(
@@ -2055,7 +2057,7 @@ class TestHooked:
             "r": {"py/hook": [f"{__name__}.Tensor", [reference]]},
         }
 
-        assert _bad_of(tree, hooks=_HOOKS) == {("r", 1, 0): reason}
+        assert _bad_reasons(tree, hooks=_HOOKS) == {("r", 1, 0): reason}
 
     def test_a_hook_payload_decodes_by_its_tags_where_it_sits(self) -> None:
         tree: MutablePlainTree = [
@@ -2541,7 +2543,7 @@ class TestDispatch:
         ids=repr,
     )
     def test_each_target_picks_its_decoder(self, target: object, decoder: str) -> None:
-        assert deserialize._decoder_for(target) is getattr(deserialize, decoder)
+        assert deserialize._target_decoder(target) is getattr(deserialize, decoder)
 
     @pytest.mark.parametrize(
         ("target", "expected"),

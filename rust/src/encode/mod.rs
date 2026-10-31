@@ -2177,7 +2177,7 @@ impl<'py, 'g> Encoder<'py, 'g> {
         Ok(Some(true))
     }
 
-    /// ``_encoder_for(type(value))``.
+    /// ``_kind_encoder(type(value))``.
     #[inline]
     fn encoder(&mut self, value: &B<'py>) -> PyResult<Enc> {
         let kind = tp(value);
