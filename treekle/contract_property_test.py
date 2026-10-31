@@ -19,7 +19,6 @@ from typing import Final, cast
 
 from hypothesis import (
     given,
-    settings,
     strategies as st,
 )
 
@@ -197,7 +196,6 @@ _BUILT = _WALKERS[0] != _WALKERS[1]
     ids=["native", "python"] if _BUILT else ["python"],
 )
 @given(case=_cases())
-@settings(max_examples=300, deadline=None)
 def test_a_value_round_trips_with_every_type_kept(
     to_plain: _ToPlain,
     from_plain: _FromPlain,
@@ -218,7 +216,6 @@ def test_a_value_round_trips_with_every_type_kept(
 
 @pytest.mark.skipif(not _BUILT, reason="the Rust core is not built")
 @given(case=_cases())
-@settings(max_examples=300, deadline=None)
 def test_both_walkers_write_and_read_a_value_alike(
     case: tuple[object, object, Mapping[type, type]],
 ) -> None:

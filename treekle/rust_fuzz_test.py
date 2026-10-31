@@ -11,7 +11,7 @@ replaced, so the two must fail alike as well.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field, make_dataclass
+from dataclasses import dataclass, field, make_dataclass, replace
 from enum import IntEnum, StrEnum
 from functools import partial
 from pathlib import PurePosixPath
@@ -468,7 +468,8 @@ def test_from_plain_matches_python(case: _Case, data: st.DataObject) -> None:
 @_needs_rust
 @given(case=_cases())
 def test_json_loads_matches_python(case: _Case) -> None:
-    tree = _python_tree(case)
+    # Only a mutable json-dialect tree is JSON text; any other draw is wasted.
+    tree = _python_tree(replace(case, dialect="json", mutable=True))
     try:
         text = json.dumps(tree)
     except (TypeError, ValueError):
