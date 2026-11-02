@@ -55,7 +55,6 @@ from typing import (
     TYPE_CHECKING,
     Final,
     Literal,
-    TypeGuard,
     cast,
     get_args,
     get_origin,
@@ -93,9 +92,9 @@ from treekle.deserialize import (
     _is_any,
     _is_protocol,
     _is_union,
-    _reads_tags_as_keys,
     _resolve_alias,
     _shallow_fit,
+    _target_decoder,
     _tuple_types,
     _union_candidates,
     _untagged_decoder,
@@ -224,7 +223,8 @@ class _DeclaredParts:
     """A container's parts' declared types: one for each, or one per name or index.
 
     Attributes:
-      each: Every part's type, where neither ``named`` nor ``indexed`` is given.
+      each: Every part's type, where neither ``named`` nor ``indexed`` is given;
+        ``object`` beside ``named``, for a part written under an escaped key.
       named: Each named part's type; a name absent here is ``object``.
       indexed: Each indexed part's type; an index past the end is ``object``.
 
@@ -248,7 +248,7 @@ class _DeclaredParts:
         if self.indexed is not None:
             return self.indexed[cast("int", key)]
         if self.named is not None:
-            return self.named.get(key, object) if isinstance(key, str) else object
+            return self.named.get(cast("str", key), object)
         return self.each
 
 
@@ -596,24 +596,22 @@ def _settled_leaf(
     declared: object,
 ) -> bool:
     """Return whether ``declared`` reads every ``kind`` leaf written as ``text`` back."""
+    # pragma: no mutate start -- a leaf's decoder takes no override; ``None`` reads as none.
     implied, _ = _implied_by(text(), kind, declared, {}, _KindFit(kind=kind))
+    # pragma: no mutate end
     return bool(implied)
 
 
 def _leaf_class(decoder: _Decoder, member: object) -> object:
     """Return the class leaf ``decoder`` builds from text under ``member``, else ``object``."""
+    # ``from_plain`` dispatches a path to ``_decode_path`` only for a ``PurePath`` class.
     if decoder is _decode_path:
-        return type((member if _is_path_class(member) else Path)())
+        return type(cast("type[PurePath]", member)())
     if decoder is _decode_enum:
         return member
     if decoder is _decode_uuid:
         return UUID
     return datetime if decoder is _decode_datetime else object
-
-
-def _is_path_class(member: object) -> TypeGuard[type[PurePath]]:
-    """Return whether ``member`` is a ``PurePath`` class."""
-    return isinstance(member, type) and issubclass(member, PurePath)
 
 
 def _encode_list(value: object, state: _Encoding) -> object:
@@ -748,8 +746,7 @@ def _entries(
             state.stack.append((item, escaped, plain, here, values.of(plain)))
         else:
             name = _RawKey(key=key, declared=keys)
-            part = values.each if values.named is None else object
-            state.stack.append((item, escaped, name, here, part))
+            state.stack.append((item, escaped, name, here, values.each))
     return escaped
 
 
@@ -810,11 +807,7 @@ def _encode_object(value: object, state: _Encoding) -> object:
     if is_dataclass(kind):
         _leave_out_defaults(kind, members, state)
     record = is_dataclass(kind)
-    implied = record and _record_implied(
-        kind,
-        state.declared,
-        state.default_concrete_types,
-    )
+    implied = record and _record_implied(kind, state.declared)
     # Field types declare only parts that are not plain; reading them is most of
     # a first write of a class, so a record of plain members skips it.
     types = (
@@ -923,8 +916,7 @@ def _inferred(value: object, sample: object, *, nested: bool = False) -> bool:
             cast(tuple[object, ...], sample),
         )
         return len(items) == len(others) and all(
-            _inferred(item, other, nested=True)
-            for item, other in zip(items, others, strict=True)
+            map(partial(_inferred, nested=True), items, others),
         )
     if nested or kind not in _EMPTIES:
         return False
@@ -1094,7 +1086,7 @@ class _ValueFit:
     def __call__(self, member: object, whole: bool) -> bool:
         if whole:
             return _fits(self.value, member, whole=True)
-        return _shallow_fit(self.value, member) is not False
+        return _shallow_fit(self.value, member, whole=False) is not False
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -1159,7 +1151,7 @@ def _implied_by(
             break
         built = builds.get(decoder)
         if built is not None:
-            chosen.append((member, member if decoder is _decode_object else built))
+            chosen.append((member, built))
     if not chosen:
         return False, object
     (member, built), *rest = chosen
@@ -1171,34 +1163,30 @@ def _implied_by(
     return fit(member, any(other is not kind for _, other in rest)), member
 
 
-def _record_implied(
-    kind: type,
-    declared: object,
-    default_concrete_types: Mapping[object, type],
-) -> bool:
+def _record_implied(kind: type, declared: object) -> bool:
     """Return whether ``declared`` implies record class ``kind``, the same for every record."""
     if declared is object:
         return False
     built = _decided(
+        # pragma: no mutate start -- the key differs in length from ``form``'s.
         ("record", declared),
-        default_concrete_types,
-        lambda: _record_built(declared, default_concrete_types),
+        # pragma: no mutate end
+        {},
+        lambda: _record_built(declared),
     )
     return built is kind
 
 
 # ``_implied_by`` for a record: the first member that builds from a mapping
-# decides, and every record fits the class its member names.
-def _record_built(
-    declared: object,
-    default_concrete_types: Mapping[object, type],
-) -> object:
-    """Return the class an untagged record under ``declared`` reads back as, else ``None``."""
+# decides, and every record fits the class its member names. No override is
+# asked: ``concrete_overrides`` keeps each within its abstract type, so a
+# mapping member stays a mapping member.
+def _record_built(declared: object) -> object:
+    """Return the record class an untagged record under ``declared`` reads back as, else ``None``."""
     for member in _union_candidates(_NO_ENTRIES, _members(declared)):
-        decoder = _untagged_decoder(member, default_concrete_types)
-        built = _MAPPING_BUILDS.get(decoder)
-        if built is not None:
-            return member if decoder is _decode_object else built
+        decoder = _target_decoder(member)
+        if decoder in _MAPPING_BUILDS:
+            return member if decoder is _decode_object else None
     return None
 
 
@@ -1234,7 +1222,9 @@ def _settled_form(
     if declared is object:
         return kind is dict or kind is list, object, _DeclaredParts()
     found = _decided(
+        # pragma: no mutate start -- the key differs in length from ``record``'s.
         ("form", kind, declared, size),
+        # pragma: no mutate end
         default_concrete_types,
         lambda: _form_by(
             kind,
@@ -1265,14 +1255,13 @@ def _form_by(
             named = _field_types(cast("type", member))
             return True, object, _DeclaredParts(named=named)
         return True, *_part_types(member, kind)
-    valued = not mapping
-    for member in sorted(
-        _members(declared),
-        key=lambda member: (
-            valued and _reads_tags_as_keys(member, default_concrete_types)
-        ),
-    ):
-        fits = fit(member, False)
+    # The reader tries a member that reads value tags as keys last, but such a member
+    # fits only a mapping, which carries no value tag, so the order here is the same.
+    members = _members(declared)
+    # The reader passes over a member whose parts fail, to the next; where there is
+    # a next, the whole value must fit this one, as in ``_implied_by``.
+    for index, member in enumerate(members):
+        fits = fit(member, index + 1 < len(members))
         if fits is None:
             return None
         if fits:
@@ -1436,12 +1425,14 @@ _python_to_plain: Final = to_plain
 
 def _walker[F](python: F) -> F:
     """Return the Rust core's ``to_plain`` when it serves, else ``python``."""
+    # pragma: no mutate start -- mutmut's tree has no core; test_a_built_core_writes pins it.
     return native(
         python,
         name="to_plain",
         setup="setup_encode",
         module=globals(),
     )
+    # pragma: no mutate end
 
 
 to_plain = _walker(_python_to_plain)

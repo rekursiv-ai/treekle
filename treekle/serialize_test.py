@@ -14,6 +14,7 @@ from dataclasses import MISSING, Field, dataclass, field, fields, is_dataclass
 from decimal import Decimal
 from enum import Enum, IntEnum
 from functools import partial
+from importlib import util
 from pathlib import Path, PurePosixPath
 from types import GenericAlias, MappingProxyType
 from typing import (
@@ -21,6 +22,7 @@ from typing import (
     Annotated,
     Final,
     Literal,
+    NoReturn,
     Protocol,
     SupportsIndex,
     TypedDict,
@@ -33,6 +35,7 @@ from zoneinfo import ZoneInfo
 import datetime as dt
 import json
 import math
+import os
 import re
 import threading
 import typing
@@ -40,7 +43,7 @@ import weakref
 
 import pytest
 
-from treekle import serialize
+from treekle import deserialize, reflect, serialize
 from treekle.deserialize import from_plain
 from treekle.lib.testing.resources import recursion_headroom
 from treekle.plain import immutable
@@ -1820,6 +1823,27 @@ class TestAContainerNotOfItsDeclaredType:
         assert len(decided) == 1
 
 
+def test_a_decision_is_made_again_once_from_plain_s_dispatch_changes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[int] = []
+
+    def decide() -> object:
+        calls.append(len(calls))
+        return len(calls)
+
+    key = ("probe", object())
+    assert serialize._decided(key, {}, decide) == 1
+    assert serialize._decided(key, {}, decide) == 1
+    monkeypatch.setattr(
+        deserialize,
+        "_DECODERS",
+        MappingProxyType(dict(deserialize._DECODERS)),
+    )
+
+    assert serialize._decided(key, {}, decide) == 2
+
+
 class Ratio(Enum):
     HALF = 0.5
     PAIR = (1, 2)
@@ -2754,6 +2778,768 @@ def test_a_leaf_s_verdict_is_its_class_s(
     by_value, _ = serialize._implied_by(text, kind, declared, {}, fit)
 
     assert serialize._settled_leaf(kind, type(text), declared) is bool(by_value)
+
+
+@pytest.mark.parametrize(
+    ("kept", "asked", "alike"),
+    [
+        (int, int, True),
+        (int | str, int | str, True),
+        (int | str, str | int, False),
+        (list[int | str], list[str | int], False),
+        (list[int | str], list[int | str], True),
+        (dict[str, int | bytes], dict[str, bytes | int], False),
+        (tuple[int, ...], tuple[int, ...], True),
+        (tuple[int, int], tuple[int], False),
+        (Literal[1, 2], Literal[2, 1], False),
+    ],
+    ids=repr,
+)
+def test_two_equal_types_are_spelled_alike_only_in_the_same_union_order(
+    kept: object,
+    asked: object,
+    alike: bool,
+) -> None:
+    assert serialize._spelled_alike(kept, asked) is alike
+
+
+@pytest.mark.parametrize(
+    ("value", "omittable"),
+    [
+        (0, True),
+        ("", True),
+        (None, True),
+        (Color.RED, True),
+        (list[object](), True),
+        (dict[str, object](), True),
+        (set[object](), True),
+        (frozenset[object](), True),
+        (MappingProxyType[str, object]({}), True),
+        # A tuple and bytes are compared whole, as leaves.
+        ((1,), True),
+        (b"x", True),
+        ([0], False),
+        ({"a": 1}, False),
+        ({1}, False),
+        (Decimal(0), False),
+    ],
+    ids=repr,
+)
+def test_only_a_leaf_an_enum_or_an_empty_container_may_be_left_out(
+    value: object,
+    omittable: bool,
+) -> None:
+    assert serialize._omittable(value) is omittable
+
+
+@pytest.mark.parametrize(
+    ("value", "sample", "inferred"),
+    [
+        (list[object](), list[object](), True),
+        (list[object](), [1], False),
+        (dict[str, object](), {"a": 1}, False),
+        (list[object](), (), False),
+        ((), (), True),
+        ((1, "a"), (1, "a"), True),
+        ((1,), (1, 2), False),
+        ((list[object](),), (list[object](),), False),
+        (-0.0, 0.0, False),
+        (math.nan, math.nan, True),
+        (Color.RED, Color.RED, True),
+        (True, 1, False),
+    ],
+    ids=repr,
+)
+def test_a_default_rebuilds_a_value_only_as_its_own_class_and_contents(
+    value: object,
+    sample: object,
+    inferred: bool,
+) -> None:
+    assert serialize._inferred(value, sample) is inferred
+
+
+def test_a_tuple_class_settles_its_form_only_once_its_arity_is_known(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Decided afresh, not recalled from an earlier test's write.
+    monkeypatch.setattr(serialize, "_DECISIONS", {})
+    # The Rust core keeps this per class and arity: a fixed tuple type decides by it.
+    assert serialize._settled_form(tuple, tuple[int, int], {}, 2) == (
+        True,
+        object,
+        serialize._DeclaredParts(each=object, indexed=(int, int)),
+    )
+    assert serialize._settled_form(tuple, tuple[int, int], {}) is None
+
+
+def test_a_settled_form_follows_the_chosen_concrete_classes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(serialize, "_DECISIONS", {})
+    concrete: dict[object, type] = {Sequence: tuple}
+
+    assert serialize._settled_form(tuple, Sequence[int], concrete) == (
+        True,
+        object,
+        serialize._DeclaredParts(each=int, indexed=None),
+    )
+    assert serialize._settled_form(tuple, Sequence[int], {}) == (
+        False,
+        object,
+        serialize._DeclaredParts(each=int, indexed=None),
+    )
+
+
+_Tagged = TypedDict("_Tagged", {"py/x": int, "a": tuple[int, int]})
+
+
+def test_beside_an_escaped_key_a_named_part_keeps_its_declared_type() -> None:
+    value: _Tagged = {"py/x": 1, "a": (1, 2)}
+
+    written = to_plain(value, target=_Tagged)
+
+    assert written == {'json://"py/x"': 1, "a": [1, 2]}
+
+
+def test_a_part_s_declared_type_is_its_name_s_its_index_s_or_every_one_s() -> None:
+    parts = serialize._DeclaredParts
+    assert parts(each=int).of(3) is int
+    assert parts(indexed=(int, str)).of(1) is str
+    assert parts(named={"a": int}).of("a") is int
+    assert parts(named={"a": int}).of("b") is object
+    assert parts(named={"a": int}, each=str).of(0) is object
+
+
+@pytest.mark.parametrize(
+    ("value", "declared", "plain"),
+    [
+        ({1: (1, 2)}, dict[int, tuple[int, int]], {"json://1": [1, 2]}),
+        (
+            {"a": (1, 2), 1: (3, 4)},
+            dict[int | str, tuple[int, int]],
+            {"a": [1, 2], "json://1": [3, 4]},
+        ),
+        ({"py/x": (1, 2)}, dict[str, tuple[int, int]], {'json://"py/x"': [1, 2]}),
+    ],
+    ids=repr,
+)
+def test_an_escaped_key_s_value_is_typed_as_its_mapping_declares(
+    value: object,
+    declared: object,
+    plain: PlainTree,
+) -> None:
+    written = to_plain(value, target=declared)
+
+    assert written == plain
+    assert from_plain(written, declared) == value
+
+
+@dataclass(kw_only=True, slots=True)
+class _Defaulted:
+    first: list[int] = field(default_factory=list[int])
+    second: list[int] = field(default_factory=list[int])
+    color: Color = Color.RED
+
+
+class _PairValue(Enum):
+    A = (1, 2)
+
+
+class _Unbounded(Enum):
+    TOP = math.inf
+
+
+def test_an_enum_whose_value_is_not_finite_is_written_by_reduce() -> None:
+    written = to_plain(_Unbounded.TOP, target=_Unbounded)
+
+    assert written == {
+        "py/reduce": [
+            {"py/type": f"{__name__}._Unbounded"},
+            {"py/tuple": [{"py/float": "inf"}]},
+        ],
+    }
+    assert from_plain(written, _Unbounded, allow_imports=True) is _Unbounded.TOP
+
+
+def test_an_enum_whose_value_is_no_plain_leaf_is_written_by_reduce() -> None:
+    written = to_plain(_PairValue.A, target=_PairValue)
+
+    assert written == {
+        "py/reduce": [
+            {"py/type": f"{__name__}._PairValue"},
+            {"py/tuple": [{"py/tuple": [1, 2]}]},
+        ],
+    }
+    assert from_plain(written, _PairValue, allow_imports=True) is _PairValue.A
+
+
+def test_a_default_after_a_referenced_field_is_still_left_out() -> None:
+    shared: list[int] = []
+
+    written = to_plain([shared, _Defaulted(first=shared, second=shared)])
+
+    assert written == [
+        [],
+        {
+            "py/object": f"{__name__}._Defaulted",
+            "first": {"py/ref": [0]},
+            "second": {"py/ref": [0]},
+        },
+    ]
+
+
+def test_a_default_of_a_hooked_class_is_written_through_its_hook() -> None:
+    hooks: dict[type, tuple[Callable[[Color], object], Callable[[object], Color]]] = {
+        Color: (lambda color: color.value, lambda raw: Color(cast("str", raw))),
+    }
+
+    written = to_plain(_Defaulted(), target=_Defaulted, hooks=hooks)
+
+    assert written == {"color": {"py/hook": [f"{__name__}.Color", "red"]}}
+
+
+def test_a_class_s_defaults_are_kept_until_its_fields_change() -> None:
+    @dataclass(kw_only=True, slots=True)
+    class Settings:
+        a: int
+        b: int = 1
+        c: list[int] = field(default_factory=list[int])
+
+    first = serialize._defaults(Settings)
+    assert list(first) == ["b", "c"]
+    assert serialize._defaults(Settings) is first
+
+    # A class whose fields are redeclared, as a reload does, is read again.
+    Settings.__dataclass_fields__ = dict(Settings.__dataclass_fields__)
+    assert serialize._defaults(Settings) is not first
+
+
+class _Row(TypedDict):
+    a: int
+
+
+class _Sized(Protocol):
+    def __len__(self) -> int: ...
+
+
+@pytest.mark.parametrize(
+    ("value", "declared", "plain"),
+    [
+        ({1}, _Sized | set[int], {"py/set": [1]}),
+        ({1}, set[int] | _Sized, [1]),
+        (frozenset({1}), _Sized | frozenset[int], {"py/frozenset": [1]}),
+    ],
+    ids=repr,
+)
+def test_a_set_under_a_protocol_is_judged_by_its_value(
+    value: object,
+    declared: object,
+    plain: PlainTree,
+) -> None:
+    written = to_plain(value, target=declared)
+
+    assert written == plain
+    assert from_plain(written, declared) == value
+
+
+@pytest.mark.skipif(
+    util.find_spec("treekle._rust") is None
+    or os.environ.get("TREEKLE_PURE_PYTHON", "") not in {"", "0"},
+    reason="the Rust core is not built, or TREEKLE_PURE_PYTHON is set",
+)
+def test_a_built_core_writes(implementation: str) -> None:
+    if implementation == "python":
+        pytest.skip("the fixture swapped the core's walker for Python's")
+    # Asked again, as at import.
+    assert (
+        serialize._walker(serialize._python_to_plain) is not serialize._python_to_plain
+    )
+
+
+@pytest.mark.parametrize(
+    ("value", "declared", "plain"),
+    [
+        ({"a": 1}, dict[str, int] | list[int], {"a": 1}),
+        ({"a": 1}, list[int] | dict[str, int], {"a": 1}),
+        ({"a": 1}, Sequence[int] | Mapping[str, int], {"a": 1}),
+        ({"a": 1}, MappingProxyType[str, int] | dict[str, int], {"a": 1}),
+        (MappingProxyType({"a": 1}), Mapping[str, int], {"py/mappingproxy": {"a": 1}}),
+        (
+            MappingProxyType({"a": 1}),
+            dict[str, int] | MappingProxyType[str, int],
+            {"py/mappingproxy": {"a": 1}},
+        ),
+        ([1], tuple[int, ...] | list[int], [1]),
+        ([1], dict[str, int] | list[int], [1]),
+        ((1, 2), list[int] | tuple[int, int], {"py/tuple": [1, 2]}),
+        ((1, 2), Sequence[int], {"py/tuple": [1, 2]}),
+        ({1}, frozenset[int] | set[int], {"py/set": [1]}),
+        (frozenset({1}), set[int] | frozenset[int], {"py/frozenset": [1]}),
+        ({"a": [1]}, dict[str, tuple[int, ...] | list[int]], {"a": [1]}),
+        # Untagged text reads as ``str`` under either order, so a datetime is tagged.
+        (
+            dt.datetime(2024, 1, 2, tzinfo=dt.UTC),
+            str | dt.datetime,
+            {"py/datetime": "2024-01-02T00:00:00+00:00"},
+        ),
+        (MappingProxyType({1: "a"}), MappingProxyType[int, str], {"json://1": "a"}),
+        # A key is written as its declared type reads it: a tuple key, untagged.
+        (
+            MappingProxyType({(1, 2): "a"}),
+            MappingProxyType[tuple[int, int], str],
+            {"json://[1, 2]": "a"},
+        ),
+        (
+            MappingProxyType({(1, 2): "a"}),
+            dict[str, str] | MappingProxyType[tuple[int, int], str],
+            {"py/mappingproxy": {"json://[1, 2]": "a"}},
+        ),
+        (
+            MappingProxyType({1: "a"}),
+            dict[int, str] | MappingProxyType[int, str],
+            {"py/mappingproxy": {"json://1": "a"}},
+        ),
+        ([(1, 2)], list[list[int]] | list[tuple[int, int]], [{"py/tuple": [1, 2]}]),
+        ([(1, 2)], list[tuple[int, int]] | list[list[int]], [[1, 2]]),
+        # A tuple's verdict is its arity's: untagged it reads as the first member.
+        ((1, 2), tuple[int, int] | tuple[int, int, int], [1, 2]),
+        ((1, 2, 3), tuple[int, int] | tuple[int, int, int], {"py/tuple": [1, 2, 3]}),
+        # Each position is typed by its own member of the tuple.
+        ((1, (2, 3)), tuple[int, tuple[int, int]], [1, [2, 3]]),
+        (((1, 2), (3, 4)), tuple[tuple[int, int], ...], [[1, 2], [3, 4]]),
+        (
+            (1, (2, 3)),
+            tuple[int, list[int] | tuple[int, int]],
+            [1, {"py/tuple": [2, 3]}],
+        ),
+        (
+            MappingProxyType({"a": (1, 2)}),
+            Mapping[str, tuple[int, int]] | _Sized,
+            {"py/mappingproxy": {"a": [1, 2]}},
+        ),
+    ],
+    ids=repr,
+)
+def test_a_container_under_a_union_is_tagged_only_where_untagged_reads_otherwise(
+    value: object,
+    declared: object,
+    plain: PlainTree,
+) -> None:
+    written = to_plain(value, target=declared)
+
+    assert written == plain
+    back = from_plain(written, declared)
+    assert back == value
+    assert type(back) is type(value)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        MappingProxyType({"a": (1, 2), "b": "x"}),
+        MappingProxyType({"a": (1, 2)}),
+    ],
+    ids=repr,
+)
+def test_a_tagged_value_s_parts_are_typed_by_the_member_that_reads_it_whole(
+    value: object,
+) -> None:
+    # Only the second fits whole: its ``"b"`` is no pair. The reader tries the first
+    # member on the whole value, so the parts must be written as the second reads them.
+    declared = Mapping[str, tuple[int, int]] | _Sized
+
+    back = from_plain(to_plain(value, target=declared), declared)
+
+    assert back == value
+
+
+def test_a_dict_under_a_record_first_union_is_tagged() -> None:
+    # Untagged, the record would read it.
+    declared = Point | MappingProxyType[str, int]
+
+    assert to_plain({"x": 1}, target=declared) == {"py/dict": {"x": 1}}
+
+
+def test_a_value_its_first_member_fits_only_shallowly_is_tagged() -> None:
+    # Untagged, ``list[int]`` would refuse its ``"x"`` and ``Sequence[str]``, a tuple
+    # here, would read it: so the whole value is judged against the first member.
+    concrete: dict[type, type] = {Sequence: tuple}
+    declared = list[int] | Sequence[str]
+
+    written = to_plain(["x"], target=declared, default_concrete_types=concrete)
+
+    assert written == {"py/list": ["x"]}
+    back = from_plain(written, declared, default_concrete_types=concrete)
+    assert (back, type(back)) == (["x"], list)
+
+
+def test_a_tuple_its_first_member_fits_only_by_class_is_tagged() -> None:
+    # A shallow fit never reads a tuple's items, so only the whole one shows the
+    # ``"x"`` that ``tuple[int, ...]`` refuses, untagged, for ``Sequence[str]``'s list.
+    declared = tuple[int, ...] | Sequence[str]
+
+    written = to_plain(("x",), target=declared)
+
+    assert written == {"py/tuple": ["x"]}
+    assert from_plain(written, declared) == ("x",)
+
+
+def test_a_record_under_a_union_listing_a_mapping_after_it_is_tagged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Decided afresh, not recalled from an earlier test's write.
+    monkeypatch.setattr(serialize, "_DECISIONS", {})
+    # Untagged, a mapping reads as the union's mapping member first.
+    written = to_plain(Point(x=1), target=Point | dict[str, int])
+
+    assert written == {"py/object": f"{__name__}.Point", "x": 1}
+    assert from_plain(written, Point | dict[str, int], allow_imports=True) == Point(x=1)
+
+
+def test_an_abstract_type_s_chosen_concrete_class_goes_untagged() -> None:
+    concrete: dict[type, type] = {Sequence: tuple}
+
+    written = to_plain((1, 2), target=Sequence[int], default_concrete_types=concrete)
+
+    assert written == [1, 2]
+    assert from_plain(written, Sequence[int], default_concrete_types=concrete) == (1, 2)
+
+
+def _kind_fit_members() -> list[object]:
+    """Return the declared members a container's class can be judged against."""
+    return [
+        object,
+        typing.Any,
+        int,
+        str,
+        list,
+        list[int],
+        Sequence[int],
+        Mapping[str, int],
+        dict[str, int],
+        MappingProxyType,
+        tuple,
+        tuple[int, ...],
+        tuple[int, int],
+        tuple[int, int, int],
+        set[int],
+        frozenset[int],
+        type,
+        type[int],
+        _Row,
+        _Sized,
+        Literal[1, 2],
+        int | list[int],
+        Annotated[list[int], "note"],
+        # No class: every value fits it.
+        "Unresolved",
+    ]
+
+
+@pytest.mark.parametrize(
+    "value",
+    [[1], (1, 2), {"a": 1}, {1}, frozenset({1}), MappingProxyType({"a": 1}), int],
+    ids=repr,
+)
+def test_a_class_s_fit_agrees_with_each_of_its_values_wherever_it_decides(
+    value: object,
+) -> None:
+    # The Rust core keeps ``_settled_form`` per class, so a class's verdict must be
+    # the one every value of it would get.
+    kind = type(value)
+    size = len(cast("tuple[object, ...]", value)) if kind is tuple else None
+    by_kind = serialize._KindFit(kind=kind, size=size)
+    by_value = serialize._ValueFit(value=value)
+    for member in _kind_fit_members():
+        assert by_kind(member, True) is None
+        verdict = by_kind(member, False)
+        if verdict is not None:
+            assert verdict is by_value(member, False), member
+
+
+@pytest.mark.parametrize(
+    ("kind", "size", "member", "verdict"),
+    [
+        (list, None, list[int], True),
+        (list, None, Sequence[int], True),
+        (list, None, object, True),
+        (list, None, dict[str, int], False),
+        (tuple, 2, tuple[int, int], True),
+        (tuple, 3, tuple[int, int], False),
+        (tuple, None, tuple[int, int], None),
+        (tuple, 2, tuple[int, ...], True),
+        (type, None, type[int], None),
+        (list, None, type[int], False),
+        (dict, None, _Row, None),
+        (list, None, _Sized, None),
+        (list, None, Literal[1, 2], None),
+        (list, None, int | list[int], None),
+    ],
+    ids=repr,
+)
+def test_a_class_decides_its_fit_where_no_value_can_change_it(
+    kind: type,
+    size: int | None,
+    member: object,
+    verdict: bool | None,
+) -> None:
+    assert serialize._KindFit(kind=kind, size=size)(member, False) is verdict
+
+
+def test_a_value_fits_a_tuple_member_whole_only_where_its_items_do() -> None:
+    fit = serialize._ValueFit(value=(1, "x"))
+
+    assert fit(tuple[int, int], False) is True
+    assert fit(tuple[int, int], True) is False
+    assert fit(tuple[int, str], True) is True
+
+
+def test_a_tuple_under_members_told_apart_by_item_reads_back_as_written() -> None:
+    declared = tuple[int, int] | tuple[int, str]
+
+    assert from_plain(to_plain((1, "x"), target=declared), declared) == (1, "x")
+
+
+class _Unreduced:
+    """A slotted plain class with no reduce recipe, so written by its slots."""
+
+    __slots__ = ("t",)
+    t: tuple[int, int]
+
+    def __init__(self) -> None:
+        self.t = (1, 2)
+
+    @override
+    def __reduce_ex__(self, protocol: SupportsIndex) -> str:
+        del protocol
+        raise TypeError("no recipe")
+
+
+def test_a_plain_object_writes_its_members_by_their_values_not_its_hints() -> None:
+    # Only a dataclass's fields read back by their hints; a plain class's do not.
+    written = to_plain(_Unreduced())
+
+    assert written == {"py/object": f"{__name__}._Unreduced", "t": {"py/tuple": [1, 2]}}
+    read = from_plain(written, object, allow_imports=True)
+    assert isinstance(read, _Unreduced)
+    assert read.t == (1, 2)
+
+
+def test_a_plain_object_is_tagged_by_its_short_name_in_classes() -> None:
+    classes = {"Short": _Unreduced}
+
+    written = to_plain(_Unreduced(), classes=classes)
+
+    assert written == {"py/object": "Short", "t": {"py/tuple": [1, 2]}}
+    read = from_plain(written, object, classes=classes)
+    assert isinstance(read, _Unreduced)
+    assert read.t == (1, 2)
+
+
+def test_a_frozenset_under_sets_told_apart_by_item_goes_untagged() -> None:
+    declared = AbstractSet[int] | AbstractSet[str]
+
+    written = to_plain(frozenset({1}), target=declared)
+
+    assert written == [1]
+    assert from_plain(written, declared) == frozenset({1})
+
+
+@dataclass(kw_only=True, slots=True)
+class _Rec:
+    x: int = 0
+
+
+@pytest.mark.parametrize(
+    ("declared", "built"),
+    [
+        (_Rec, _Rec),
+        (_Rec | None, _Rec),
+        (None | _Rec, _Rec),
+        # Untagged mapping data reads as a mapping member first, wherever it is listed.
+        (dict[str, int] | _Rec, None),
+        (_Rec | dict[str, int], None),
+        (_Rec | Mapping[str, int], None),
+        (int, None),
+        (list[_Rec], None),
+    ],
+    ids=repr,
+)
+def test_a_record_is_implied_only_by_the_first_member_reading_a_mapping(
+    declared: object,
+    built: object,
+) -> None:
+    assert serialize._record_built(declared) is built
+
+
+@pytest.mark.parametrize(
+    ("abstract", "chosen"),
+    [
+        (abstract, chosen)
+        for abstract in reflect.BASELINE_CONCRETE
+        for chosen in reflect._BUILDABLE
+        if issubclass(chosen, abstract)
+    ],
+)
+def test_a_chosen_concrete_class_keeps_whether_a_member_reads_a_mapping(
+    abstract: type,
+    chosen: type,
+) -> None:
+    # Why ``_record_built`` asks no override, and the Rust core keeps it per type.
+    overrides = reflect.concrete_overrides({abstract: chosen})
+
+    overridden = deserialize._untagged_decoder(abstract, overrides)
+
+    assert (overridden in serialize._MAPPING_BUILDS) is (
+        deserialize._target_decoder(abstract) in serialize._MAPPING_BUILDS
+    )
+
+
+@pytest.mark.parametrize("value", [(1, 2), (1, "x")])
+def test_a_fixed_tuple_form_is_settled_by_its_class_and_arity(
+    monkeypatch: pytest.MonkeyPatch,
+    value: tuple[object, ...],
+) -> None:
+    # Its items are not read, so the Rust core can keep the answer per arity.
+    def refuse(**_: object) -> NoReturn:
+        raise AssertionError("judged by value")
+
+    monkeypatch.setattr(serialize, "_ValueFit", refuse)
+
+    assert serialize._form(value, tuple, tuple[int, int], {}) == (
+        True,
+        object,
+        serialize._DeclaredParts(indexed=(int, int)),
+    )
+
+
+@pytest.mark.parametrize("declared", [typing.Any, int | typing.Any])
+def test_a_datetime_stays_tagged_where_its_text_would_read_as_text(
+    declared: object,
+) -> None:
+    moment = dt.datetime(2026, 1, 2, tzinfo=dt.UTC)
+
+    written = to_plain(moment, target=declared)
+
+    assert written == {"py/datetime": "2026-01-02T00:00:00+00:00"}
+    assert from_plain(written, declared) == moment
+
+
+@pytest.mark.parametrize(
+    ("dialect", "queued"),
+    [("json", [6, 5]), ("python", [6])],
+)
+def test_only_parts_not_yet_plain_are_queued(
+    dialect: Dialect,
+    queued: list[int],
+) -> None:
+    # A non-finite float is plain only in the python dialect.
+    node: list[object] = [None, "s", 1, True, 1.5, math.inf, [1]]
+    state = serialize._Encoding(dialect=dialect, hooks={})
+
+    serialize._push_items(node, state, serialize._DeclaredParts())
+
+    assert [entry[2] for entry in state.stack] == queued
+
+
+@pytest.mark.parametrize(
+    ("dialect", "queued"),
+    [("json", ["g", "f"]), ("python", ["g"])],
+)
+def test_only_values_not_yet_plain_are_queued(
+    dialect: Dialect,
+    queued: list[str],
+) -> None:
+    node: dict[str, object] = {
+        "a": None,
+        "b": "s",
+        "c": 1,
+        "d": True,
+        "e": 1.5,
+        "f": math.inf,
+        "g": [1],
+    }
+    state = serialize._Encoding(dialect=dialect, hooks={})
+
+    serialize._push_values(node, state, serialize._DeclaredParts())
+
+    assert [entry[2] for entry in state.stack] == queued
+
+
+@dataclass(eq=False, kw_only=True, slots=True)
+class _Holder:
+    xs: list[int] = field(default_factory=list)
+
+
+def test_a_record_in_a_set_leaves_out_its_default_once_sorted() -> None:
+    # Sorting writes each member once and forgets it, the left-out default too.
+    holder = _Holder()
+
+    written = to_plain({holder})
+
+    assert written == {"py/set": [{"py/object": f"{__name__}._Holder"}]}
+    (read,) = cast("set[_Holder]", from_plain(written, object, allow_imports=True))
+    assert read.xs == []
+
+
+def test_a_default_is_built_only_for_a_value_it_could_match(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    built: list[str] = []
+    sample = serialize._sample
+
+    def spy(item: Field[object]) -> object:
+        built.append(item.name)
+        return sample(item)
+
+    monkeypatch.setattr(serialize, "_sample", spy)
+    # The Rust core keeps its own defaults; this asks the Python walker.
+    write = serialize._python_to_plain
+
+    assert write(_Holder(xs=[1])) == {"py/object": f"{__name__}._Holder", "xs": [1]}
+    assert built == []
+    assert write(_Holder()) == {"py/object": f"{__name__}._Holder"}
+    assert built == ["xs"]
+
+
+class _Labeled:
+    """Written alike whatever its label, which only its ``repr`` shows."""
+
+    def __init__(self, label: str, order: int) -> None:
+        self.label = label
+        self.order = order
+
+    @override
+    def __hash__(self) -> int:
+        return self.order
+
+    @override
+    def __repr__(self) -> str:
+        return self.label
+
+    @override
+    def __getstate__(self) -> dict[str, object]:
+        return {}
+
+
+def test_set_members_written_alike_are_ordered_by_repr() -> None:
+    # Hashed to iterate ``b`` first; a reference to ``a`` finds it first all the same.
+    first, second = _Labeled("b", 1), _Labeled("a", 2)
+
+    written = to_plain({"s": {first, second}, "x": second})
+
+    assert isinstance(written, Mapping)
+    assert written["x"] == {"py/ref": ["s", 0]}
+
+
+def test_a_tagged_frozenset_types_its_items_by_the_member_its_value_fits() -> None:
+    # The Protocol leaves the form to the value: the first set member its items fit.
+    declared = AbstractSet[str] | AbstractSet[tuple[int, int]] | _Sized
+
+    written = to_plain(frozenset({(1, 2)}), target=declared)
+
+    assert written == {"py/frozenset": [[1, 2]]}
+    assert from_plain(written, declared) == frozenset({(1, 2)})
 
 
 if __name__ == "__main__":

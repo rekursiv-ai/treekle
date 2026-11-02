@@ -544,6 +544,11 @@ def _typeddict_targets() -> tuple[object, object]:
 TYPEDDICT_UNION, TYPEDDICT_TUPLE = _typeddict_targets()
 
 
+# ``to_plain`` escapes a key that looks like a tag; ``py/x`` is no identifier, so
+# only the call form can declare it.
+TagKeyed = TypedDict("TagKeyed", {"py/x": int, "a": tuple[int, int]})
+
+
 def _nested(depth: int) -> list[object]:
     root: list[object] = []
     current = root
@@ -726,6 +731,20 @@ DECODE_CASES: list[tuple[str, object, object, dict[str, object]]] = [
         "typeddict tuple with fresh hints",
         ({"x": [1]}, {"y": {"k": 1}}),
         TYPEDDICT_TUPLE,
+        {},
+    ),
+    ("typeddict with an escaped key", {'json://"py/x"': 1, "a": [1, 2]}, TagKeyed, {}),
+    ("typeddict with a bad escaped key", {"json://{": 1, "a": [1, 2]}, TagKeyed, {}),
+    (
+        "typeddict with an escaped key beside one no str",
+        {True: 0, 'json://"py/x"': 1, "a": [1, 2]},
+        TagKeyed,
+        {},
+    ),
+    (
+        "typeddict with a key escaping no str",
+        {"json://1": 0, 'json://"py/x"': 1, "a": [1, 2]},
+        TagKeyed,
         {},
     ),
 ]
@@ -1436,6 +1455,34 @@ def _assert_reads_alike(data: object, target: object, **options: object) -> None
     assert _outcome(read(deserialize.from_plain)) == _outcome(
         read(deserialize._python_from_plain),
     )
+
+
+def _cycles() -> list[tuple[str, object, object]]:
+    """Plain data holding itself, each under a target a compiled reader takes."""
+    loop: list[object] = []
+    loop.append(loop)
+    through: dict[str, object] = {}
+    through["a"] = [through]
+    tagged: dict[str, object] = {"t": {"py/tuple": [1]}}
+    tagged["a"] = [tagged]
+    return [
+        ("a list in itself", loop, list[list[object]]),
+        ("a dict in its list", through, dict[str, list[dict[str, object]]]),
+        (
+            "a tagged dict in its list",
+            tagged,
+            dict[str, list[dict[str, object]] | tuple[int]],
+        ),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("data", "target"),
+    [case[1:] for case in _cycles()],
+    ids=[case[0] for case in _cycles()],
+)
+def test_a_cycle_in_plain_data_reads_as_python(data: object, target: object) -> None:
+    _assert_reads_alike(data, target)
 
 
 def _class(module: str, name: str, **annotations: object) -> type[object]:
@@ -2511,12 +2558,10 @@ def test_dead_target_plans_are_swept_from_the_cache() -> None:
     targets: list[type[object]] = []
     watches: list[weakref.ReferenceType[type[object]]] = []
     for index in range(1_000):
-        target = dataclass(_class(__name__, f"DeadTarget{index}", x=int))
-        watches.append(weakref.ref(target))
-        assert vars(deserialize.from_plain({"x": index}, target)) == {"x": index}
-        targets.append(target)
+        targets.append(dataclass(_class(__name__, f"DeadTarget{index}", x=int)))
+        watches.append(weakref.ref(targets[-1]))
+        assert vars(deserialize.from_plain({"x": index}, targets[-1])) == {"x": index}
 
-    del target
     targets.clear()
     gc.collect()
     assert all(watch() is None for watch in watches)

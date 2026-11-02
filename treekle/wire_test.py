@@ -488,6 +488,8 @@ def test_a_core_without_json_functions_is_left_to_json(
         " (module '_rust' has no attribute 'json_loads_plain');"
         " using the json module until the core is rebuilt"
     )
+    # It names whoever imported ``wire``, never ``wire`` itself.
+    assert warning.filename != wire.__file__
 
 
 def test_a_core_without_json_functions_warns_and_uses_json() -> None:

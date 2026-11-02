@@ -685,7 +685,7 @@ pub struct RecordGlobals {
     pub pure_path: Py<PyAny>,
 }
 
-/// ``serialize._record_built(declared, {})``, read natively: ``Some(None)``
+/// ``serialize._record_built(declared)``, read natively: ``Some(None)``
 /// where no record goes untagged, ``Some(Some(class))`` for the record
 /// class that does, ``None`` where only Python can say. A plain dataclass
 /// builds itself; a union builds its first plain dataclass where only

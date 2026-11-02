@@ -16,6 +16,7 @@ from dataclasses import dataclass, field, make_dataclass
 from decimal import Decimal
 from enum import Enum
 from fractions import Fraction
+from importlib import util
 from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
 from types import GenericAlias, MappingProxyType, ModuleType, SimpleNamespace, UnionType
 from typing import (
@@ -25,6 +26,7 @@ from typing import (
     Final,
     Literal,
     NewType,
+    NoReturn,
     NotRequired,
     Optional,  # pyright: ignore[reportDeprecated] -- Imported to test its pre-3.14 origin.
     Protocol,
@@ -47,15 +49,16 @@ import importlib
 import inspect
 import math
 import numbers
+import os
 import sys
 import typing
 import weakref
 
 import pytest
 
-from treekle import deserialize
+from treekle import deserialize, reflect
 from treekle.deserialize import from_plain
-from treekle.reflect import PENDING
+from treekle.reflect import BASELINE_CONCRETE, PENDING, concrete_overrides
 from treekle.serialize import to_plain
 from treekle.types import (
     FieldPath,
@@ -120,6 +123,17 @@ class Node:
 class HintedLater:
     point: "Rational"  # Bound only under ``TYPE_CHECKING``.
     count: int
+
+
+@dataclass(kw_only=True, slots=True)
+class SettledLater(HintedLater):
+    point: int  # pyright: ignore[reportIncompatibleVariableOverride] -- Redeclaring the base's unresolved hint is what is tested.  # pyrefly: ignore[bad-override] -- Same.
+
+
+@dataclass(kw_only=True, slots=True)
+class SelfHintedLater:
+    point: "Rational"  # Bound only under ``TYPE_CHECKING``.
+    me: SelfHintedLater | None = None
 
 
 class HintedLaterDict(TypedDict):
@@ -644,6 +658,8 @@ class TestTypedDecode:
             ([1], dict[str, int], "cannot read [1] as dict[str, int]"),
             ({"a": 1}, list[int], "cannot read {'a': 1} as list[int]"),
             ("x", list[int], "cannot read 'x' as list[int]"),
+            # A leaf tag reads first, then its value is checked.
+            ({"py/b64": "YQ=="}, int, "cannot read b'a' as <class 'int'>"),
             ([1, 2], tuple[int], "expected 1 items for tuple[int], got 2"),
             ("!", bytes, "cannot read '!' as bytes: Only base64 data is allowed"),
             (1, bytes, "cannot read 1 as bytes"),
@@ -1583,6 +1599,38 @@ class TestReferenceFit:
     def test_a_value_of_a_bare_generic_alias_is_checked(self) -> None:
         assert deserialize._fits([1], list) is True
         assert deserialize._fits({"a": 1}, dict) is True
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            ([[1]], True),
+            ([["x"]], False),
+            ([[1], [["x"]]], False),
+            ([1, [2, [3]]], True),
+        ],
+        ids=repr,
+    )
+    def test_each_part_of_a_recursive_type_is_judged_by_itself(
+        self,
+        value: object,
+        expected: bool,
+    ) -> None:
+        # Every part is judged against the same ``_Nested``; only a part that is the
+        # very value still being judged fits without a look.
+        assert deserialize._fits(value, _Nested) is expected
+
+    def test_a_cycle_fits_while_its_parts_do(self) -> None:
+        good: list[object] = [1]
+        good.append(good)
+        bad: list[object] = ["x"]
+        bad.append(bad)
+
+        assert deserialize._fits(good, _Nested) is True
+        assert deserialize._fits(bad, _Nested) is False
+
+    def test_judged_whole_a_tuple_inside_is_checked_item_by_item(self) -> None:
+        assert deserialize._fits([(1, "x")], list[tuple[int, int]]) is True
+        assert deserialize._fits([(1, "x")], list[tuple[int, int]], whole=True) is False
 
     @pytest.mark.parametrize(
         ("value", "expected"),
@@ -3086,6 +3134,75 @@ class TestFieldTypes:
         assert reads[0] is HintedLater
         assert deserialize._PARTIAL_HINTS.get(HintedLater) is not stale
 
+    def test_a_failed_hint_that_comes_to_resolve_rereads_the_class(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        assert dict(deserialize._field_types(HintedLater)) == {
+            "point": object,
+            "count": int,
+        }
+        # The name its hint waits on is bound at last, as a late import would.
+        monkeypatch.setitem(vars(sys.modules[__name__]), "Rational", Fraction)
+
+        assert dict(deserialize._field_types(HintedLater)) == {
+            "point": Fraction,
+            "count": int,
+        }
+        assert HintedLater not in deserialize._PARTIAL_HINTS
+
+    def test_a_failed_hint_its_class_comes_to_bind_rereads_the_class(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        assert dict(deserialize._field_types(HintedLaterLocal)) == {
+            "point": object,
+            "size": int,
+        }
+        # Bound on the class, so only the class's own names resolve it.
+        monkeypatch.setattr(HintedLaterLocal, "Rational", Fraction, raising=False)
+
+        assert dict(deserialize._field_types(HintedLaterLocal)) == {
+            "point": Fraction,
+            "size": int,
+        }
+
+    def test_a_subclass_that_redeclares_a_failed_hint_resolves_it(self) -> None:
+        assert dict(deserialize._field_types(SettledLater)) == {
+            "point": int,
+            "count": int,
+        }
+        # Kept with nothing left to retry: the base's failed hint was redeclared.
+        assert deserialize._PARTIAL_HINTS[SettledLater][False][1] == {}
+
+    def test_a_class_whose_hint_names_itself_is_never_kept_partial(self) -> None:
+        assert dict(deserialize._field_types(SelfHintedLater)) == {
+            "point": object,
+            "me": SelfHintedLater | None,
+        }
+        assert SelfHintedLater not in deserialize._PARTIAL_HINTS
+
+    def test_a_class_its_module_does_not_reach_is_never_kept_partial(self) -> None:
+        @dataclass(kw_only=True, slots=True)
+        class Unreached:
+            point: "Rational"  # Bound only under ``TYPE_CHECKING``.
+
+        assert dict(deserialize._field_types(Unreached)) == {"point": object}
+        assert Unreached not in deserialize._PARTIAL_HINTS
+
+    def test_a_kept_partial_read_is_kept_per_include_extras(self) -> None:
+        plain, plain_ok = deserialize._resolvable_hints(
+            HintedLater,
+            include_extras=False,
+        )
+        rich, rich_ok = deserialize._resolvable_hints(HintedLater, include_extras=True)
+
+        assert (plain, plain_ok) == ({"point": object, "count": int}, False)
+        assert (rich, rich_ok) == ({"point": object, "count": int}, False)
+        assert set(deserialize._PARTIAL_HINTS[HintedLater]) == {False, True}
+        _, retry = deserialize._PARTIAL_HINTS[HintedLater][False]
+        assert retry == {"point": HintedLater.__mro__.index(HintedLater)}
+
     def test_an_unresolved_hint_leaves_a_class_body_name_resolvable(self) -> None:
         assert dict(deserialize._field_types(HintedLaterLocal)) == {
             "point": object,
@@ -3352,7 +3469,6 @@ class TestSingleHint:
     def test_a_name_resolves_from_the_locals(self) -> None:
         assert (
             deserialize._single_hint(
-                "x",
                 "Local",
                 {},
                 {"Local": Point},
@@ -3364,15 +3480,12 @@ class TestSingleHint:
     def test_extras_are_kept_only_when_asked(self) -> None:
         noted = Annotated[int, "note"]
 
-        assert deserialize._single_hint("x", noted, {}, {}, include_extras=False) is int
-        assert (
-            deserialize._single_hint("x", noted, {}, {}, include_extras=True) == noted
-        )
+        assert deserialize._single_hint(noted, {}, {}, include_extras=False) is int
+        assert deserialize._single_hint(noted, {}, {}, include_extras=True) == noted
 
     def test_a_name_that_does_not_resolve_is_pending(self) -> None:
         assert (
-            deserialize._single_hint("x", "Missing", {}, {}, include_extras=False)
-            is PENDING
+            deserialize._single_hint("Missing", {}, {}, include_extras=False) is PENDING
         )
 
 
@@ -3844,6 +3957,506 @@ class TestCaches:
         gc.collect()
 
         assert ref() is None
+
+
+class _RowTD(TypedDict):
+    a: int
+    b: NotRequired[str]
+
+
+# ``py/x`` is no identifier, so only the call form can declare it.
+_TagKeyed = TypedDict("_TagKeyed", {"py/x": int, "a": tuple[int, int]})
+
+
+def test_a_typeddict_key_written_escaped_reads_back_as_itself() -> None:
+    value: _TagKeyed = {"py/x": 1, "a": (1, 2)}
+    written = to_plain(value, target=_TagKeyed)
+    assert written == {'json://"py/x"': 1, "a": [1, 2]}
+
+    assert from_plain(written, _TagKeyed) == value
+
+
+def test_a_typeddict_key_escaped_badly_is_refused() -> None:
+    with pytest.raises(ReadError, match=r"^invalid escaped key 'json://\{'$"):
+        from_plain({"json://{": 1, "a": [1, 2]}, _TagKeyed)
+
+
+def test_a_typeddict_passes_over_a_key_that_is_no_str_beside_an_escaped_one() -> None:
+    read = from_plain({True: 0, 'json://"py/x"': 1, "a": [1, 2]}, _TagKeyed)
+
+    assert read == {"py/x": 1, "a": (1, 2)}
+
+
+def test_a_typeddict_key_escaping_no_str_is_refused() -> None:
+    with pytest.raises(ReadError, match=r"^cannot read 1 as str$"):
+        from_plain({"json://1": 0, 'json://"py/x"': 1, "a": [1, 2]}, _TagKeyed)
+
+
+@dataclass(kw_only=True, slots=True)
+class _Point:
+    a: int = 0
+
+
+@dataclass(kw_only=True, slots=True)
+class _Point3(_Point):
+    b: int = 0
+
+
+def _exact(
+    data: dict[str, PlainTree],
+    target: object,
+    *,
+    allow_imports: object = False,
+) -> bool:
+    """Return whether ``data`` takes the one-pass record path under ``target``."""
+    state = deserialize._Decoding(hooks={}, allow_imports=cast("bool", allow_imports))
+    return deserialize._decode_exact_object(data, target, (), state) is not None
+
+
+@pytest.mark.parametrize(
+    ("data", "target", "taken"),
+    [
+        ({"a": 1}, _Point, True),
+        ({}, _Point, True),
+        ({"py/object": f"{__name__}._Point", "a": 1}, _Point, True),
+        # A subclass's tag, a tag that is no name, a field the class lacks, or a
+        # key that is not a str: each is the full path's to read or refuse.
+        ({"py/object": f"{__name__}._Point3", "a": 1, "b": 2}, _Point, False),
+        ({"py/object": f"{__name__}._Point3", "a": 1}, _Point, False),
+        ({"py/object": 7, "a": 1}, _Point, False),
+        ({}, int, False),
+        ({}, Shape, False),
+        ({"a": 1, "z": 2}, _Point, False),
+        (cast("dict[str, PlainTree]", cast("object", {1: 1})), _Point, False),
+        ({"a": 1}, int, False),
+        ({"a": 1}, Shape, False),
+        ({"a": 1}, list[int], False),
+    ],
+    ids=repr,
+)
+def test_only_an_exact_record_takes_the_one_pass_path(
+    data: dict[str, PlainTree],
+    target: object,
+    taken: bool,
+) -> None:
+    assert _exact(data, target) is taken
+
+
+@pytest.mark.parametrize(
+    ("data", "target", "options", "expected"),
+    [
+        ({"py/tuple": [1]}, dict[str, object] | tuple[int, ...], {}, (1,)),
+        (
+            {"py/object": f"{__name__}._Point", "a": 1},
+            dict[str, object] | _Point,
+            {},
+            _Point(a=1),
+        ),
+        # A short tag names a class only where ``classes`` lists it; a full path
+        # there is data, so the mapping member reads it.
+        (
+            {"py/object": f"{__name__}._Point", "a": 1},
+            dict[str, object] | _Point,
+            {"classes": {"P": _Point}},
+            {"py/object": f"{__name__}._Point", "a": 1},
+        ),
+        (
+            {"py/object": "P", "a": 1},
+            dict[str, object] | _Point,
+            {"classes": {"P": _Point}},
+            _Point(a=1),
+        ),
+        ([{"py/tuple": [1]}], list[dict[str, object] | tuple[int, ...]], {}, [(1,)]),
+        # With imports off a class path names nothing, so it is data, read in order.
+        (
+            {"py/object": "elsewhere.Thing", "a": 1},
+            dict[str, object] | _Point,
+            {},
+            {"py/object": "elsewhere.Thing", "a": 1},
+        ),
+        (
+            {"py/object": "elsewhere.Thing", "a": 1},
+            _Point | dict[str, object],
+            {},
+            _Point(a=1),
+        ),
+        # Below the root a tag decides: a value fitting no member reads by tags alone.
+        ([{"py/set": [1]}], list[int | str], {}, [{1}]),
+    ],
+    ids=repr,
+)
+def test_a_union_reads_tagged_data_by_the_member_its_tag_names(
+    data: PlainTree,
+    target: object,
+    options: dict[str, object],
+    expected: object,
+) -> None:
+    classes = cast("dict[str, type]", options.get("classes", {}))
+    value = deserialize._python_from_plain(data, target, classes=classes)
+
+    assert value == expected
+    assert type(value) is type(expected)
+
+
+class TestResolveCache:
+    @pytest.fixture(autouse=True)
+    def empty_cache(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(deserialize, "_RESOLVED", {})
+
+    def _state(self) -> deserialize._Decoding:
+        return deserialize._Decoding(hooks={}, allow_imports=True)
+
+    def test_a_resolved_path_is_kept_and_reused_unimported(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        assert deserialize._resolve("builtins.max", self._state()) is max
+        assert {"builtins.max": max} == deserialize._RESOLVED
+
+        def refuse(path: str) -> object:
+            raise AssertionError(f"imported {path} again")
+
+        monkeypatch.setattr(deserialize, "resolve_import", refuse)
+        assert deserialize._resolve("builtins.max", self._state()) is max
+
+    def test_a_kept_path_its_module_rebound_is_resolved_again(self) -> None:
+        deserialize._RESOLVED["builtins.max"] = min
+
+        assert deserialize._resolve("builtins.max", self._state()) is max
+        assert deserialize._RESOLVED["builtins.max"] is max
+
+    def test_a_kept_none_is_a_resolution_too(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        module = ModuleType("treekle_resolve_none")
+        module.__dict__["nothing"] = None
+        monkeypatch.setitem(sys.modules, module.__name__, module)
+        path = f"{module.__name__}.nothing"
+
+        assert deserialize._resolve(path, self._state()) is None
+        assert {path: None} == deserialize._RESOLVED
+
+        def refuse(path: str) -> object:
+            raise AssertionError(f"imported {path} again")
+
+        monkeypatch.setattr(deserialize, "resolve_import", refuse)
+        assert deserialize._resolve(path, self._state()) is None
+
+
+@pytest.mark.parametrize(
+    ("value", "target", "expected"),
+    [
+        ((1, 2), tuple[int, ...], True),
+        ((1, "x"), tuple[int, ...], False),
+        ((1, "x"), tuple[int, str], True),
+        ({"a": 1}, _RowTD, True),
+        ({"a": 1, "b": "x"}, _RowTD, True),
+        ({"b": "x"}, _RowTD, False),
+        ({"a": 1, "z": 0}, _RowTD, False),
+    ],
+    ids=repr,
+)
+def test_judged_whole_a_value_is_checked_part_by_part(
+    value: object,
+    target: object,
+    expected: bool,
+) -> None:
+    assert deserialize._fits(value, target, whole=True) is expected
+
+
+# Without slots, so an instance can carry an attribute that is no field; built
+# through ``dataclass`` called, as a class body here would need slots.
+_Loose = dataclass(kw_only=True)(
+    type("_Loose", (), {"__module__": __name__, "__annotations__": {"a": int}, "a": 0}),
+)
+
+
+def test_a_record_tagged_as_its_target_reads_with_the_target_s_fields_only() -> None:
+    # Its tag names the target, so its keys must be the target's fields, imports on
+    # or off; the full path would set the stray key as an attribute.
+    plain: PlainTree = {"py/object": f"{__name__}._Loose", "a": 1, "extra": 2}
+
+    with pytest.raises(ReadError, match=r"unknown field\(s\) \['extra'\]"):
+        deserialize._python_from_plain(
+            plain,
+            _Loose,
+            allow_imports=cast("bool", cast("object", 1)),
+        )
+
+
+def test_a_tagged_record_s_attribute_that_is_no_field_reads_untyped() -> None:
+    plain: PlainTree = {"py/object": f"{__name__}._Loose", "a": 1, "extra": [2]}
+
+    value = deserialize._python_from_plain(plain, object, allow_imports=True)
+
+    assert isinstance(value, _Loose)
+    assert vars(value) == {"a": 1, "extra": [2]}
+
+
+def test_a_flag_that_is_no_bool_takes_the_full_path() -> None:
+    assert _exact({"a": 1}, _Point, allow_imports=1) is False
+
+
+@dataclass(kw_only=True, slots=True)
+class _Loop:
+    me: _Loop | None = None
+
+
+def test_the_full_path_places_a_record_before_its_fields_refer_to_it() -> None:
+    # A flag that is no bool keeps the record off the one-pass path.
+    back = deserialize._python_from_plain(
+        {"me": {"py/ref": []}},
+        _Loop,
+        allow_imports=cast("bool", cast("object", 0)),
+    )
+
+    assert back.me is back
+
+
+def test_a_field_named_like_the_tag_takes_the_one_pass_path_only_untagged() -> None:
+    # ``py/object`` is no identifier, so no generated method may name it.
+    named = dataclass(init=False, repr=False, eq=False)(
+        type(
+            "Named",
+            (),
+            {
+                "__module__": __name__,
+                "__annotations__": {"py/object": int},
+                "py/object": 0,
+            },
+        ),
+    )
+
+    assert _exact({}, named) is True
+    assert _exact({"py/object": 1}, named) is False
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        {"a": 1},
+        {"py/object": f"{__name__}._Point", "a": 1},
+        {"py/object": f"{__name__}._Point3", "a": 1, "b": 2},
+        {"py/object": 7, "a": 1},
+    ],
+    ids=repr,
+)
+@pytest.mark.parametrize("allow_imports", [False, True])
+def test_the_one_pass_path_reads_as_the_full_one(
+    monkeypatch: pytest.MonkeyPatch,
+    data: dict[str, PlainTree],
+    allow_imports: bool,
+) -> None:
+    def read() -> object:
+        try:
+            return deserialize._python_from_plain(
+                data,
+                _Point,
+                allow_imports=allow_imports,
+            )
+        except ReadError as error:
+            return str(error)
+
+    def full_path(*_: object) -> None:
+        return None
+
+    fast = read()
+    monkeypatch.setattr(deserialize, "_decode_exact_object", full_path)
+
+    assert read() == fast
+
+
+@pytest.mark.skipif(
+    util.find_spec("treekle._rust") is None
+    or os.environ.get("TREEKLE_PURE_PYTHON", "") not in {"", "0"},
+    reason="the Rust core is not built, or TREEKLE_PURE_PYTHON is set",
+)
+def test_a_built_core_reads(implementation: str) -> None:
+    if implementation == "python":
+        pytest.skip("the fixture swapped the core's walker for Python's")
+    # Asked again, as at import.
+    python = deserialize._python_from_plain
+    assert deserialize._walker(python) is not python
+
+
+def test_plain_data_holding_a_cycle_is_refused() -> None:
+    loop: list[object] = []
+    loop.append(loop)
+
+    with pytest.raises(
+        ReadError,
+        match=r"^1 part\(s\) do not read; first at \[0\]: plain data cannot hold a cycle$",
+    ):
+        from_plain(loop, list[list[object]])
+
+
+def test_plain_data_holding_a_cycle_through_a_mapping_is_refused() -> None:
+    outer: dict[str, object] = {}
+    outer["a"] = [outer]
+
+    with pytest.raises(
+        ReadError,
+        match=r"^1 part\(s\) do not read; first at \['a', 0\]: plain data cannot hold a cycle$",
+    ):
+        from_plain(outer, dict[str, list[dict[str, object]]])
+
+
+class _Bare:
+    """A class that is no dataclass, rebuilt from its stored attributes."""
+
+
+def test_a_stored_record_of_a_plain_class_keeps_no_tag_as_an_attribute() -> None:
+    read = from_plain(
+        {"py/object": f"{__name__}._Bare", "x": 1},
+        object,
+        allow_imports=True,
+    )
+
+    assert isinstance(read, _Bare)
+    assert vars(read) == {"x": 1}
+
+
+def test_an_unresolved_id_under_a_union_below_the_root_is_refused() -> None:
+    with pytest.raises(
+        ReadError,
+        match=r"^1 part\(s\) do not read; first at \[0\]: cannot read \{'py/id': 0\} as int \| str$",
+    ):
+        from_plain([{"py/id": 0}], list[int | str])
+
+
+def test_a_path_tag_reads_as_a_path_under_object() -> None:
+    read = from_plain({"py/path": "a/b"}, object)
+
+    assert isinstance(read, Path)
+    assert read == Path("a/b")
+
+
+@dataclass(kw_only=True, slots=True)
+class _Defaulted:
+    a: list[int] = field(default_factory=list)
+    b: object = None
+
+
+def test_a_reference_names_a_default_left_out() -> None:
+    read = from_plain({"b": {"py/ref": ["a"]}}, _Defaulted)
+
+    assert read.b is read.a
+
+
+def test_a_set_is_shown_whole_up_to_its_limit() -> None:
+    assert deserialize._shown(set(range(100))) == (
+        "{" + ", ".join(map(str, range(100))) + "}"
+    )
+
+
+def test_a_hint_of_a_class_whose_module_is_gone_reads_as_object() -> None:
+    gone = dataclass(type("Gone", (), {"__annotations__": {"a": "Missing"}}))
+    gone.__module__ = "gone"
+
+    read = from_plain({"a": "x"}, gone)
+
+    assert vars(read) == {"a": "x"}
+
+
+# Its hints are classes, not text, so they are read straight off the class.
+_PlainHinted = make_dataclass("_PlainHinted", [("a", int)], module=__name__)
+
+
+def test_plain_hints_are_read_once_per_class() -> None:
+    assert deserialize._field_types(_PlainHinted) is deserialize._field_types(
+        _PlainHinted,
+    )
+
+
+@pytest.mark.parametrize(
+    ("declared", "chosen"),
+    [
+        (declared, chosen)
+        for declared in BASELINE_CONCRETE
+        for chosen in reflect._BUILDABLE
+        if issubclass(chosen, declared)
+    ],
+)
+def test_an_override_keeps_whether_a_member_reads_tags_as_keys(
+    declared: type,
+    chosen: type,
+) -> None:
+    overridden = deserialize._untagged_decoder(
+        declared,
+        concrete_overrides({declared: chosen}),
+    )
+
+    assert (
+        overridden in deserialize._MAPPING_DECODERS
+    ) is deserialize._reads_tags_as_keys(
+        declared,
+    )
+
+
+type _Cycle = list[_Cycle] | None
+
+
+def test_a_cycle_is_judged_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The pair met again while still being judged fits; it is not judged again.
+    judged: list[object] = []
+    shallow_fit = deserialize._shallow_fit
+
+    def spy(value: object, target: object, *, whole: bool) -> object:
+        judged.append(target)
+        return shallow_fit(value, target, whole=whole)
+
+    monkeypatch.setattr(deserialize, "_shallow_fit", spy)
+    loop: list[object] = []
+    loop.append(loop)
+
+    assert deserialize._fits(loop, _Cycle) is True
+    assert judged == [_Cycle, list[_Cycle]]
+
+
+def test_a_hint_resolves_once_its_name_exists_or_once_it_is_gone() -> None:
+    pending = type("_Pending", (), {"__annotations__": {"x": "Missing"}})
+
+    assert deserialize._resolves(pending, "x") is False
+    assert deserialize._resolves(pending, "gone") is True
+
+
+def test_plain_hints_are_read_without_evaluating_them(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def refuse(kind: type, *, include_extras: bool) -> NoReturn:
+        del kind, include_extras
+        raise AssertionError("evaluated")
+
+    monkeypatch.setattr(deserialize, "_resolvable_hints", refuse)
+
+    # Its hints are classes, not text, unlike this file's postponed ones.
+    assert deserialize._read_field_types(_PlainHinted) == ({"a": int}, True)
+
+
+def test_only_a_dataclass_record_takes_the_one_pass_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started: list[tuple[object, bool]] = []
+    one_pass = deserialize._decode_exact_object
+
+    def spy(
+        data: dict[str, PlainTree],
+        target: object,
+        at: FieldPath,
+        state: deserialize._Decoding,
+    ) -> object:
+        frame = one_pass(data, target, at, state)
+        started.append((target, frame is not None))
+        return frame
+
+    monkeypatch.setattr(deserialize, "_decode_exact_object", spy)
+    read = deserialize._python_from_plain
+
+    assert read({"x": 1}, Point) == Point(x=1)
+    assert read({"a": 1}, dict[str, int]) == {"a": 1}
+    assert read([{"x": 1}], list[Point]) == [Point(x=1)]
+    assert started == [(Point, True), (Point, True)]
 
 
 if __name__ == "__main__":

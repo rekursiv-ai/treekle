@@ -39,7 +39,6 @@ pub struct Globals {
     partial: Py<PyAny>,
     form: Py<PyAny>,
     settled_form: Py<PyAny>,
-    record_implied: Py<PyAny>,
     record_built: Py<PyAny>,
     field_types_cache: Py<PyAny>,
     read_field_types: Py<PyAny>,
@@ -119,7 +118,6 @@ pub fn setup(module: &Bound<'_, PyDict>) -> PyResult<()> {
         partial: get("partial")?,
         form: get("_form")?,
         settled_form: get("_settled_form")?,
-        record_implied: get("_record_implied")?,
         record_built: get("_record_built")?,
         field_types_cache: deserialize.getattr("_FIELD_TYPES")?.unbind(),
         read_field_types: deserialize.getattr("_read_field_types")?.unbind(),
@@ -2668,12 +2666,7 @@ impl<'py, 'g> Encoder<'py, 'g> {
         let Some(declared) = declared else {
             return Ok(false);
         };
-        if let Some(overrides) = &self.overrides {
-            return self
-                .b(&self.g.record_implied)
-                .call1((kind, declared, overrides))?
-                .is_truthy();
-        }
+        // No override changes it: each keeps a mapping a mapping, so it is kept per type.
         let address = declared.as_ptr() as usize;
         if let Some((_, built)) = self.forms.records.get(&address) {
             return Ok(built
@@ -2684,9 +2677,7 @@ impl<'py, 'g> Encoder<'py, 'g> {
             match facts::record_built(self.py, &self.g.records, &self.g.hints.alias, declared)? {
                 Some(built) => built.map(Bound::unbind),
                 None => {
-                    let built = self
-                        .b(&self.g.record_built)
-                        .call1((declared, PyDict::new(self.py)))?;
+                    let built = self.b(&self.g.record_built).call1((declared,))?;
                     (!built.is_none()).then(|| built.unbind())
                 }
             };
