@@ -511,6 +511,15 @@ pub fn setup(module: &Bound<'_, PyDict>) -> PyResult<()> {
     Ok(())
 }
 
+pub fn cache_sizes(py: Python<'_>) -> (usize, usize) {
+    let caches = CACHES.take(py);
+    let sizes = caches.as_ref().map_or((0, 0), |caches| {
+        (caches.classes.len(), caches.objects.len())
+    });
+    drop(CACHES.replace(py, caches));
+    sizes
+}
+
 // ------------------------------------------------------------------ plans --
 
 enum Fits {

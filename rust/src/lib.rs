@@ -45,6 +45,11 @@ fn setup_decode(module: &Bound<'_, PyDict>) -> PyResult<()> {
     decode::setup(module)
 }
 
+#[pyfunction]
+fn _decode_cache_sizes(py: Python<'_>) -> (usize, usize) {
+    decode::cache_sizes(py)
+}
+
 // The public functions carry ``treekle.deserialize`` and ``treekle.serialize``'s
 // docstrings verbatim, since they replace those functions; ``rust_parity_test``
 // checks that the two stay alike. A text signature can only show literal
@@ -380,6 +385,7 @@ fn json_dumps<'py>(
 fn _rust(module: &Bound<'_, PyModule>) -> PyResult<()> {
     json::setup(module.py())?;
     module.add_function(wrap_pyfunction!(setup_decode, module)?)?;
+    module.add_function(wrap_pyfunction!(_decode_cache_sizes, module)?)?;
     module.add_function(wrap_pyfunction!(from_plain, module)?)?;
     module.add_function(wrap_pyfunction!(setup_encode, module)?)?;
     module.add_function(wrap_pyfunction!(to_plain, module)?)?;
