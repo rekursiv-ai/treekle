@@ -136,6 +136,7 @@ def test_every_library_round_trips_the_analogue(
     )
     out = capsys.readouterr().out
     assert "skipped broken: exp000 raised" in out
+    assert "**Encode**" in out
     encode, rest = out.split("**Decode (analogue)**")
     decode, summary = rest.split("**Summary**")
     header = [
@@ -155,6 +156,8 @@ def test_every_library_round_trips_the_analogue(
     assert _rows(encode)[0] == header
     assert _rows(decode)[0] == header
     decoded = {row[0]: row for row in _rows(decode)}
+    # A test module beside an experiment is not a baseline, even with an exp000.
+    assert set(decoded) == {"config", "toy", "nan", "twins", "**total**"}
     # Without tags, a dataclass among dicts under ``object`` decodes as a dict.
     assert decoded["toy"].count("❌") == 2
     assert decoded["toy"][1] == "❌"
@@ -247,6 +250,44 @@ def test_every_number_shows_two_significant_figures(
     shown: str,
 ) -> None:
     assert bench_configs._cell(value) == shown
+
+
+def test_the_warm_encode_times_the_config_itself(
+    bench: Callable[..., None],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The analogue is only what decodes; what encodes is the baseline's own config."""
+    encoded: list[str] = []
+
+    def record(value: object) -> object:
+        encoded.append(type(value).__module__)
+        return value
+
+    def codec() -> object:
+        return dataclasses.replace(
+            bench_configs._CODECS["pickle"](),
+            name="recorded",
+            encode=record,
+        )
+
+    monkeypatch.setitem(bench_configs._CODECS, "recorded", codec)
+    bench("recorded")
+    assert "fakepriml.baselines.toy.experiments" in encoded
+
+
+@pytest.mark.parametrize("doc", [bench_configs.__doc__, None], ids=["doc", "no-doc"])
+def test_help_describes_the_benchmark_by_its_docstring(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    doc: str | None,
+) -> None:
+    monkeypatch.setattr(bench_configs, "__doc__", doc)
+    monkeypatch.setattr(sys, "argv", ["bench", "--help"])
+    with pytest.raises(SystemExit):
+        bench_configs.main()
+    after_usage = capsys.readouterr().out.split("\n\n")[1]
+    expected = "options:" if doc is None else doc.strip().split("\n\n")[0]
+    assert after_usage.startswith(expected)
 
 
 def test_the_flags_default_to_every_library_on_installed_priml() -> None:
