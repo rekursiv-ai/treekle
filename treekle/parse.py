@@ -70,14 +70,16 @@ def _text_to_plain(text: str, target: object) -> MutablePlainTree:
     """Turn ``text`` into a plain tree the way ``target`` reads it."""
     if _is_verbatim(target):
         loaded = _loads_or_word(text)
-        return loaded if isinstance(loaded, str) else text
+        # A JSON reading no verbatim target takes falls back to the text in ``parse``.
+        return loaded if isinstance(loaded, str) else text  # pragma: no mutate
     number = _non_finite(text)
     if number is not None:
         return number
     loaded = _loads_or_word(text)
     # Quoting is syntax: ``count="7"`` reads the quoted text as typed.
     if isinstance(loaded, str) and loaded != text:
-        return _text_to_plain(loaded, target)
+        # Never verbatim here: those returned above.
+        return _text_to_plain(loaded, target)  # pragma: no mutate
     return loaded
 
 

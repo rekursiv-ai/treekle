@@ -31,6 +31,7 @@ class TestParse:
 
     def test_a_quoted_json_string_reads_as_its_text(self) -> None:
         assert parse('"a b"', str) == "a b"
+        assert parse('"null"', str) == "null"
 
     def test_quoted_text_reads_as_the_text_it_quotes(self) -> None:
         assert parse('"7"', int) == 7

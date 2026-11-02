@@ -128,7 +128,8 @@ def _rebuild(
             node = (
                 sequence(items)
                 if keys is None
-                else mapping(dict(zip(keys, items, strict=True)))
+                # One item is copied per key, so the two never differ in length.
+                else mapping(dict(zip(keys, items, strict=True)))  # pragma: no mutate
             )
             if not stack:
                 return node

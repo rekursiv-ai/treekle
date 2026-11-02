@@ -67,24 +67,39 @@ class TestFreezeChecks:
         assert mutable(cast("object", (1, "x"))) == [1, "x"]
 
     @pytest.mark.parametrize(
-        "bad",
-        [{1: "a"}, [object()], {"a": b"x"}],
+        ("bad", "says"),
+        [
+            ({1: "a"}, "plain mapping key must be str, got 1"),
+            ([object()], "cannot represent object as plain data"),
+            ({"a": b"x"}, "cannot represent bytes as plain data"),
+        ],
         ids=["int-key", "object", "bytes"],
     )
-    def test_a_non_plain_part_raises(self, bad: object) -> None:
-        with pytest.raises(TypeError):
+    def test_a_non_plain_part_raises(self, bad: object, says: str) -> None:
+        with pytest.raises(TypeError) as frozen:
             immutable(bad)
-        with pytest.raises(TypeError):
+        with pytest.raises(TypeError) as thawed:
             mutable(bad)
+        assert str(frozen.value) == str(thawed.value) == says
 
     def test_a_cyclic_tree_raises(self) -> None:
         cyclic: list[object] = []
         cyclic.append({"k": cyclic})
 
-        with pytest.raises(TypeError, match="cycle"):
+        with pytest.raises(TypeError) as frozen:
             immutable(cyclic)
-        with pytest.raises(TypeError, match="cycle"):
+        with pytest.raises(TypeError) as thawed:
             mutable(cyclic)
+        assert (
+            str(frozen.value) == str(thawed.value) == "plain data cannot hold a cycle"
+        )
+
+    def test_a_cycle_below_the_root_raises(self) -> None:
+        inner: list[object] = []
+        inner.append(inner)
+
+        with pytest.raises(TypeError, match="cycle"):
+            mutable({"a": inner})
 
     def test_a_shared_subtree_copies_at_each_use(self) -> None:
         shared = [1]
