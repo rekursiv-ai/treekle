@@ -1086,7 +1086,10 @@ class _ValueFit:
     def __call__(self, member: object, whole: bool) -> bool:
         if whole:
             return _fits(self.value, member, whole=True)
-        return _shallow_fit(self.value, member, whole=False) is not False
+        # pragma: no mutate start -- ``whole`` picks ``True`` or parts; neither is ``False``.
+        verdict = _shallow_fit(self.value, member, whole=False)
+        # pragma: no mutate end
+        return verdict is not False
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -1167,13 +1170,8 @@ def _record_implied(kind: type, declared: object) -> bool:
     """Return whether ``declared`` implies record class ``kind``, the same for every record."""
     if declared is object:
         return False
-    built = _decided(
-        # pragma: no mutate start -- the key differs in length from ``form``'s.
-        ("record", declared),
-        # pragma: no mutate end
-        {},
-        lambda: _record_built(declared),
-    )
+    # A one-part key, so it never meets ``_settled_form``'s three-part keys.
+    built = _decided((declared,), {}, lambda: _record_built(declared))
     return built is kind
 
 
@@ -1222,9 +1220,7 @@ def _settled_form(
     if declared is object:
         return kind is dict or kind is list, object, _DeclaredParts()
     found = _decided(
-        # pragma: no mutate start -- the key differs in length from ``record``'s.
-        ("form", kind, declared, size),
-        # pragma: no mutate end
+        (kind, declared, size),
         default_concrete_types,
         lambda: _form_by(
             kind,

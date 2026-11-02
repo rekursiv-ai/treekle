@@ -3052,8 +3052,8 @@ class TestFieldTypes:
 
     @pytest.mark.parametrize(
         ("kind", "resolved"),
-        [(Point, True), (HintedLater, False)],
-        ids=["resolved", "unresolved"],
+        [(Point, True), (HintedLater, False), (HintedLaterAlias, False)],
+        ids=["resolved", "unresolved", "unresolved-alias"],
     )
     def test_a_read_says_whether_every_hint_resolved(
         self,
