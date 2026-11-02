@@ -479,8 +479,15 @@ def test_a_core_without_json_functions_is_left_to_json(
 ) -> None:
     monkeypatch.setitem(sys.modules, "treekle._rust", types.ModuleType("_rust"))
     _walkers(monkeypatch, writes=True, reads=True)
-    with pytest.warns(RuntimeWarning, match="Rust core does not match"):
+
+    with pytest.warns(RuntimeWarning) as caught:
         assert wire._core_json() == {}
+    (warning,) = caught
+    assert str(warning.message) == (
+        "treekle's Rust core does not match this treekle"
+        " (module '_rust' has no attribute 'json_loads_plain');"
+        " using the json module until the core is rebuilt"
+    )
 
 
 def test_a_core_without_json_functions_warns_and_uses_json() -> None:

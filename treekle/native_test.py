@@ -57,12 +57,15 @@ def test_a_missing_core_keeps_python(monkeypatch: pytest.MonkeyPatch) -> None:
     assert _choose({"__package__": "treekle"}) is _python
 
 
-@pytest.mark.parametrize("setting", ["", "0"])
+@pytest.mark.parametrize("setting", [None, "", "0"])
 def test_a_matching_core_replaces_python_once_set_up(
     monkeypatch: pytest.MonkeyPatch,
-    setting: str,
+    setting: str | None,
 ) -> None:
-    monkeypatch.setenv("TREEKLE_PURE_PYTHON", setting)
+    if setting is None:
+        monkeypatch.delenv("TREEKLE_PURE_PYTHON", raising=False)
+    else:
+        monkeypatch.setenv("TREEKLE_PURE_PYTHON", setting)
     monkeypatch.setitem(
         sys.modules,
         "treekle._rust",
@@ -92,7 +95,13 @@ def test_a_stale_core_keeps_python_and_warns_at_the_importer(
     with pytest.warns(RuntimeWarning, match=says) as caught:
         chosen = _choose({"__package__": "treekle"})
     assert chosen is _python
-    assert "treekle's Rust core does not match" in str(caught[0].message)
+    (warning,) = caught
+    assert str(warning.message).endswith(
+        "); using the Python implementation until the core is rebuilt",
+    )
+    assert str(warning.message).startswith(
+        "treekle's Rust core does not match this treekle (",
+    )
 
 
 def test_a_core_missing_its_walker_is_not_set_up(

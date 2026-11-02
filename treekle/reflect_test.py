@@ -247,6 +247,22 @@ class TestResolveImport:
 
 
 class TestResolvesTo:
+    @pytest.fixture(autouse=True)
+    def empty_cache(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Start each test uncached, so a path's splits are computed, not recalled."""
+        monkeypatch.setattr(reflect, "_SPLITS", {})
+
+    def test_a_path_s_splits_are_cached_longest_prefix_first(self) -> None:
+        assert resolves_to("builtins.max.x", max) is False
+        assert reflect._SPLITS == {
+            "builtins.max.x": (("builtins.max", ("x",)), ("builtins", ("max", "x"))),
+        }
+
+    def test_a_cached_split_is_read_unrecomputed(self) -> None:
+        reflect._SPLITS["planted.path"] = (("builtins", ("max",)),)
+
+        assert resolves_to("planted.path", max) is True
+
     @pytest.mark.parametrize(
         ("path", "value"),
         [
@@ -346,6 +362,8 @@ class TestSlotNames:
             # A public slot ending in a private one's name is not its mangling.
             (Shadowed, ("_Shadowed__x", "_Q__x")),
             (WeakSlot, ("w",)),
+            # A dunder name is never mangled.
+            (type("Dunder", (), {"__slots__": ("__p__",)}), ("__p__",)),
             (Unslotted, ()),
             (int, ()),
         ],
@@ -357,6 +375,13 @@ class TestSlotNames:
         expected: tuple[str, ...],
     ) -> None:
         assert slot_names(kind) == expected
+
+    def test_a_bereft_class_strips_only_its_name_s_leading_underscores(self) -> None:
+        # CPython strips the leading ``_`` alone, so ``X`` and a trailing ``_`` stay.
+        bereft = type("_XGone_", (), {"__slots__": ("__p",)})
+        delattr(bereft, "_XGone___p")
+
+        assert slot_names(bereft) == ("_XGone___p",)
 
     def test_the_result_is_cached(self) -> None:
         first = slot_names(Slotted)
@@ -455,6 +480,32 @@ class TestAttributeNames:
         assert list(attribute_names(Hooked())) == ["a"]
         assert asked == []
 
+    def test_a_dict_a_class_declares_without_storage_is_read(self) -> None:
+        def answer(_: object) -> dict[str, object]:
+            return {"extra": 2}
+
+        # Built through ``type``: a class body's ``__dict__`` property is an override
+        # no checker accepts, and declaring one is exactly what is tested.
+        declared = type(
+            "Declared",
+            (),
+            {"__slots__": ("a",), "__dict__": property(answer)},
+        )
+
+        assert list(attribute_names(declared())) == ["a", "extra"]
+
+    def test_a_dict_that_raises_attribute_error_names_nothing(self) -> None:
+        def refuse(_: object) -> dict[str, object]:
+            raise AttributeError("__dict__")
+
+        refusing = type(
+            "Refusing",
+            (),
+            {"__slots__": ("a",), "__dict__": property(refuse)},
+        )
+
+        assert list(attribute_names(refusing())) == ["a"]
+
     def test_a_class_with_no_slots_sorts_them_once(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -514,20 +565,40 @@ class TestConcreteOverrides:
         assert reflect.concrete_overrides({alias: tuple}) == {Sequence: tuple}
 
     @pytest.mark.parametrize(
-        ("concrete", "match"),
+        ("concrete", "says"),
         [
-            ({int: int}, "keys must be one of .* not <class 'int'>"),
-            ({Sequence: str}, r"default_concrete_types\[Sequence\] must be one of"),
+            (
+                {int: int},
+                (
+                    "default_concrete_types keys must be one of Mapping, MutableMapping,"
+                    " Sequence, MutableSequence, Set, MutableSet, not <class 'int'>"
+                ),
+            ),
+            (
+                {Sequence: str},
+                (
+                    "default_concrete_types[Sequence] must be one of list, tuple,"
+                    " not <class 'str'>"
+                ),
+            ),
+            (
+                {Sequence: dict},
+                (
+                    "default_concrete_types[Sequence] must be one of list, tuple,"
+                    " not <class 'dict'>"
+                ),
+            ),
         ],
-        ids=["not a baseline key", "not a buildable subclass"],
+        ids=["not a baseline key", "not a buildable subclass", "not a subclass"],
     )
     def test_a_bad_entry_is_refused(
         self,
         concrete: dict[type, type],
-        match: str,
+        says: str,
     ) -> None:
-        with pytest.raises(ValueError, match=match):
+        with pytest.raises(ValueError, match=r"^default_concrete_types") as refused:
             reflect.concrete_overrides(concrete)
+        assert str(refused.value) == says
 
 
 @pytest.mark.parametrize(

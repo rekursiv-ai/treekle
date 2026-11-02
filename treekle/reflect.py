@@ -307,7 +307,10 @@ def _mangling_prefix(owner: type, declared: Iterable[str]) -> str:
                     and entry.__objclass__ is owner
                 ):
                     prefix = key.removesuffix(slot)
+                    # pragma: no mutate start -- CPython's prefix is ``_`` and the name
+                    # less its leading ``_``, so the descriptor found always passes.
                     if prefix.startswith("_") and not prefix.startswith("__"):
+                        # pragma: no mutate end
                         return prefix
     # Every private slot's descriptor is gone; the current name is all there is.
     stripped = owner.__name__.lstrip("_")
