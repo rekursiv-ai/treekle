@@ -76,7 +76,7 @@ impl<'py> Decoder<'py, '_> {
             return Ok(None);
         };
         let mut reader = Reader::open(self.py, bytes)?;
-        let mut exec = Exec::new(self.py, &program, self.class_names.as_ref(), None);
+        let mut exec = Exec::new(self.py, &program, self.class_names.as_ref(), None, None);
         reader.space();
         let read = exec.json(&mut reader, &program.root, 0);
         reader.space();

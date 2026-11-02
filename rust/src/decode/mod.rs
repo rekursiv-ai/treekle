@@ -1192,6 +1192,11 @@ impl Reading {
         self.spill.insert(identity)
     }
 
+    /// Whether ``identity`` is being read.
+    fn holds(&self, identity: usize) -> bool {
+        self.stack.contains(&identity) || self.spill.contains(&identity)
+    }
+
     /// Forget ``identity``, entered frames leaving last first.
     fn leave(&mut self, identity: usize) {
         if self.spill.is_empty() {
@@ -4933,6 +4938,33 @@ impl<'py, 'g> Decoder<'py, 'g> {
         }
         let hints = self.b(&self.g.field_types).call1((target,))?;
         let required = self.b(&self.g.required_keys).call1((target,))?;
+        // ``to_plain`` escapes a key that looks like a tag, as it does any dict's.
+        let mut escaped = false;
+        for key in data.try_iter()? {
+            if str_starts(&key?, "json://")? {
+                escaped = true;
+                break;
+            }
+        }
+        let data = if escaped {
+            let str_type = self.b(&self.g.str_type).clone();
+            let plan = self.plan_for(&str_type, true)?;
+            let unescaped = PyDict::new(py);
+            for item in data.call_method0(pyo3::intern!(py, "items"))?.try_iter()? {
+                let (key, raw): (B<'py>, B<'py>) = item?.extract()?;
+                // A key that is no str is no field, so it is left to the fields to pass over.
+                let key = if is_str(&key) {
+                    self.decode_key(&key, &str_type, &plan, at)?
+                } else {
+                    key
+                };
+                unescaped.set_item(key, raw)?;
+            }
+            unescaped.into_any()
+        } else {
+            data.clone()
+        };
+        let data = &data;
         let keys = PySet::empty(py)?;
         for key in data.try_iter()? {
             keys.add(key?)?;
@@ -5243,6 +5275,9 @@ struct Exec<'a, 'py, const PLACE: bool> {
     /// ``object`` container is then neither the input itself nor a copy.
     untagged: Option<bool>,
     stack: Vec<usize>,
+    /// The containers the walk around this run is reading, if any: meeting
+    /// one again is a cycle, which the walk reports.
+    outer: Option<&'a Reading>,
     /// Where the walk records what it builds, for a program read inside a
     /// walk of a tree with tags: each container is placed as the walk places
     /// it, so a later ``py/ref`` or ``py/id`` finds it. ``None``, and
@@ -5257,6 +5292,7 @@ impl<'a, 'py> Exec<'a, 'py, false> {
         prog: &'a Program,
         class_names: Option<&'a ClassNames>,
         untagged: Option<bool>,
+        outer: Option<&'a Reading>,
     ) -> Self {
         Self {
             py,
@@ -5264,6 +5300,7 @@ impl<'a, 'py> Exec<'a, 'py, false> {
             class_names,
             untagged,
             stack: Vec::new(),
+            outer,
             place: None,
         }
     }
@@ -5274,6 +5311,7 @@ impl<'a, 'py> Exec<'a, 'py, true> {
         py: Python<'py>,
         prog: &'a Program,
         class_names: Option<&'a ClassNames>,
+        outer: &'a Reading,
         place: Placing<'a, 'py>,
     ) -> Self {
         Self {
@@ -5282,6 +5320,7 @@ impl<'a, 'py> Exec<'a, 'py, true> {
             class_names,
             untagged: Some(false),
             stack: Vec::new(),
+            outer: Some(outer),
             place: Some(place),
         }
     }
@@ -5344,7 +5383,10 @@ impl<'py, const PLACE: bool> Exec<'_, 'py, PLACE> {
     #[inline]
     fn enter(&mut self, raw: &B<'py>) -> Result<(), Stop> {
         let address = raw.as_ptr() as usize;
-        if self.stack.len() >= FAST_DEPTH || self.stack.contains(&address) {
+        if self.stack.len() >= FAST_DEPTH
+            || self.stack.contains(&address)
+            || self.outer.is_some_and(|outer| outer.holds(address))
+        {
             return Err(Stop::Abort);
         }
         self.stack.push(address);
@@ -5744,7 +5786,7 @@ impl<'py> Decoder<'py, '_> {
         untagged: Option<bool>,
     ) -> Option<B<'py>> {
         let program = self.program(target, plan)?;
-        let mut exec = Exec::new(self.py, &program, self.class_names.as_ref(), untagged);
+        let mut exec = Exec::new(self.py, &program, self.class_names.as_ref(), untagged, None);
         let read = exec.read(data, &program.root, Loc::At(ROOT));
         Self::ended(plan, read)
     }
@@ -5764,15 +5806,25 @@ impl<'py> Decoder<'py, '_> {
         if items && !(tp(data) == t_list() || tp(data) == t_tuple()) {
             return Ok(None);
         }
+        // A part an enclosing frame is reading is a cycle, which the frames report.
+        if self.reading.holds(data.as_ptr() as usize) {
+            return Ok(None);
+        }
         let Some(program) = self.program(target, plan) else {
             return Ok(None);
         };
         let mark = self.mark();
         let (py, root) = (self.py, &program.root);
         let read = if self.untagged {
-            let mut exec = Exec::new(py, &program, self.class_names.as_ref(), Some(true));
+            let mut exec = Exec::new(
+                py,
+                &program,
+                self.class_names.as_ref(),
+                Some(true),
+                Some(&self.reading),
+            );
             if items {
-                exec.items(data, root, at)
+                exec.list(data, root, at)
             } else {
                 exec.read(data, root, at)
             }
@@ -5782,9 +5834,15 @@ impl<'py> Decoder<'py, '_> {
                 placed: &mut self.placed,
                 built: &mut self.built,
             };
-            let mut exec = Exec::placing(py, &program, self.class_names.as_ref(), place);
+            let mut exec = Exec::placing(
+                py,
+                &program,
+                self.class_names.as_ref(),
+                &self.reading,
+                place,
+            );
             if items {
-                exec.items(data, root, at)
+                exec.list(data, root, at)
             } else {
                 exec.read(data, root, at)
             }

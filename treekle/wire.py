@@ -229,8 +229,7 @@ def _core_json() -> dict[str, Callable[..., object]]:
             f"{package}'s Rust core does not match this {package} ({error}); "
             "using the json module until the core is rebuilt",
             RuntimeWarning,
-            # The importer's frame; mutmut's trampoline adds one, so no test sees it.
-            stacklevel=3,  # pragma: no mutate
+            stacklevel=3,  # pragma: no mutate -- under mutmut its trampoline is this frame.
         )
         return {}
     if not writes:

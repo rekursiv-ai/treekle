@@ -531,8 +531,10 @@ def _holds_tags(data: object) -> bool:
     seen: dict[int, object] = {}
     while stack:
         node = stack.pop()
+        # pragma: no mutate start -- a shortcut: a leaf is no Mapping or Sequence below.
         if isinstance(node, (str, int, float)) or node is None:
             continue
+        # pragma: no mutate end
         if id(node) in seen:
             continue
         seen[id(node)] = node
@@ -603,7 +605,7 @@ def _shallow_fit(
     value: object,
     target: object,
     *,
-    whole: bool = False,
+    whole: bool,
 ) -> bool | _Parts:
     """Judge ``value`` against ``target`` alone, or return the parts left to judge."""
     # A part that did not read is already recorded where it sits.
@@ -639,7 +641,9 @@ def _shallow_fit(
             return False
         if not whole:
             return True
+        # pragma: no mutate start -- Ruff's B905 asks for ``strict``; False is its default.
         return True, zip(items, fixed or repeat(each), strict=False)
+        # pragma: no mutate end
     if isinstance(value, Mapping) and len(args) == 2:
         mapping = cast("Mapping[object, object]", value)
         key_type, item_type = args
@@ -903,7 +907,7 @@ def _decode_complex(
         return complex(data)
     if isinstance(data, Sequence) and not isinstance(data, str) and len(data) == 2:
         # Each part is a tree of its own: a non-finite one arrives as ``py/float``.
-        jobs = [(part, float, (*at, index)) for index, part in enumerate(data)]
+        jobs = [(part, float, index) for index, part in enumerate(data)]
         return _Steps(at, jobs=jobs, done=_complex)
     raise ReadError(f"cannot read {_shown(data)} as complex")
 
@@ -1069,6 +1073,11 @@ def _decode_tuple(
 ) -> object:
     """Decode a fixed or variadic tuple; tuples take no ``py/id`` number."""
     del state
+    return _tuple_items(data, target, at)
+
+
+def _tuple_items(data: PlainTree, target: object, at: FieldPath) -> _Items:
+    """Return the frame reading ``data``'s items as tuple ``target``'s."""
     if not isinstance(data, Sequence) or isinstance(data, str):
         raise ReadError(f"cannot read {_shown(data)} as {target}")
     fixed, each = _tuple_types(target)
@@ -1099,8 +1108,7 @@ def _decode_untagged_tuple(
     state: _Decoding,
 ) -> object:
     """Decode an untagged sequence as a tuple, placed by path once built."""
-    frame = _decode_tuple(data, target, at, state)
-    assert isinstance(frame, _Items)
+    frame = _tuple_items(data, target, at)
     fixed, _ = _tuple_types(target)
     count = len(cast("Sequence[PlainTree]", data))
     if fixed is not None and len(fixed) != count:
@@ -1341,12 +1349,25 @@ def _decode_typeddict(
     if not isinstance(data, Mapping):
         raise ReadError(f"expected object for {kind.__name__}, got {_shown(data)}")
     hints = _field_types(kind)
-    missing = sorted(_required_keys(kind) - set(data))
+    fields = data
+    # ``to_plain`` escapes a key that looks like a tag, as it does any dict's. A key
+    # that is no str, as a YAML reader yields, is no field, so it is left out.
+    entries = cast("Mapping[object, PlainTree]", data)
+    if any(isinstance(key, str) and key.startswith("json://") for key in entries):
+        unescaped: dict[str, PlainTree] = {}
+        for key, raw in entries.items():
+            if isinstance(key, str):
+                # pragma: no mutate start -- a key read as ``str`` is a leaf; ``at`` goes unread.
+                name = cast("str", _decode_key(key, str, at, state))
+                # pragma: no mutate end
+                unescaped[name] = raw
+        fields = unescaped
+    missing = sorted(_required_keys(kind) - set(fields))
     if missing:
         raise ReadError(f"{kind.__name__}: missing required field(s) {missing}")
     result: dict[str, object] = {}
     _place(result, at, state)
-    return _Fields(at, data=data, types=hints, members=result)
+    return _Fields(at, data=fields, types=hints, members=result)
 
 
 # ``__required_keys__`` applies each declaring class's own totality, but under
@@ -1420,17 +1441,16 @@ def _decode_exact_object(
     ):
         return None
     types = _field_types(target)
-    tagged = False
     for key, raw in data.items():
         if type(key) is not str:
             return None
         if key == "py/object":
             if type(raw) is not str or raw != _class_tag(target, state):
                 return None
-            tagged = True
         elif key not in types:
             return None
-    if tagged and "py/object" in types:
+    # Annotated through ``type``, a dataclass may have a field named ``py/object``.
+    if "py/object" in data and "py/object" in types:
         return None
     value = _allocate(target)
     _place(value, at, state)
@@ -1558,7 +1578,7 @@ def _decode_hooked(
     _place(PENDING, at, state)
     return _Steps(
         at,
-        jobs=[(payload, object, (*at, 1))],
+        jobs=[(payload, object, 1)],
         done=partial(
             _hooked,
             decode=hook[1],
@@ -1672,8 +1692,7 @@ def _decode_union(
                 members,
                 key=lambda member: (
                     path is not None and _class_tag(member, state) != path,
-                    valued
-                    and _reads_tags_as_keys(member, state.default_concrete_types),
+                    valued and _reads_tags_as_keys(member),
                 ),
             ),
         )
@@ -1720,9 +1739,11 @@ class _Frame:
         self.at = at
         self.check: object = _UNCHECKED
         self.then: Callable[[object], object] | None = None
+        # pragma: no mutate start -- placeholders ``step`` sets before any read.
         self.pending_raw: PlainTree = None
         self.pending_at: FieldPath = at
         self.reading: int | None = None
+        # pragma: no mutate end
 
     def step(self, state: _Decoding) -> _Frame | None:
         """Read parts until one needs a frame of its own; return it, or ``None``."""
@@ -1756,10 +1777,10 @@ class _PartFrame(_Frame):
         return True
 
 
-class _Items(_PartFrame):
+class _Sequence(_PartFrame):
     """A sequence read part by part, each part as the next of ``types``."""
 
-    __slots__ = ("done", "parts", "values")
+    __slots__ = ("parts",)
 
     def __init__(
         self,
@@ -1767,13 +1788,11 @@ class _Items(_PartFrame):
         *,
         raws: Sequence[PlainTree],
         types: Iterator[object],
-        values: list[object],
-        done: Callable[[list[object]], object],
     ) -> None:
         super().__init__(at)
+        # pragma: no mutate start -- Ruff's B905 asks for ``strict``; False is its default.
         self.parts = enumerate(zip(raws, types, strict=False))
-        self.values = values
-        self.done = done
+        # pragma: no mutate end
 
     @override
     def step(self, state: _Decoding) -> _Frame | None:
@@ -1792,6 +1811,25 @@ class _Items(_PartFrame):
             self.take(value, state)
         return None
 
+
+class _Items(_Sequence):
+    """A sequence read into ``values``, then built by ``done``."""
+
+    __slots__ = ("done", "values")
+
+    def __init__(
+        self,
+        at: FieldPath,
+        *,
+        raws: Sequence[PlainTree],
+        types: Iterator[object],
+        values: list[object],
+        done: Callable[[list[object]], object],
+    ) -> None:
+        super().__init__(at, raws=raws, types=types)
+        self.values = values
+        self.done = done
+
     @override
     def take(self, value: object, state: _Decoding) -> None:
         del state
@@ -1803,7 +1841,7 @@ class _Items(_PartFrame):
         return self.done(self.values)
 
 
-class _SetItems(_Items):
+class _SetItems(_Sequence):
     """A set read part by part into ``members``, refusing an unhashable part."""
 
     __slots__ = ("members",)
@@ -1816,13 +1854,7 @@ class _SetItems(_Items):
         item: object,
         members: set[object],
     ) -> None:
-        super().__init__(
-            at,
-            raws=raws,
-            types=repeat(item),
-            values=[],
-            done=_as_built,
-        )
+        super().__init__(at, raws=raws, types=repeat(item))
         self.members = members
 
     @override
@@ -1858,7 +1890,9 @@ class _Entries(_PartFrame):
         self.key_type = key_type
         self.value_type = value_type
         self.result = result
+        # pragma: no mutate start -- a placeholder ``step`` sets before any read.
         self.pending_key: Hashable = None
+        # pragma: no mutate end
 
     @override
     def step(self, state: _Decoding) -> _Frame | None:
@@ -1919,7 +1953,7 @@ class _Fields(_PartFrame):
         self.parts = iter(data.items())
         self.types = types
         self.members = members
-        self.pending_name = ""
+        self.pending_name = ""  # pragma: no mutate -- ``step`` sets it first.
 
     @override
     def step(self, state: _Decoding) -> _Frame | None:
@@ -2020,7 +2054,7 @@ class _Steps(_Frame):
         self,
         at: FieldPath,
         *,
-        jobs: Sequence[tuple[PlainTree, object, FieldPath]],
+        jobs: Sequence[tuple[PlainTree, object, int]],
         done: Callable[[list[object]], object],
     ) -> None:
         super().__init__(at)
@@ -2030,7 +2064,8 @@ class _Steps(_Frame):
 
     @override
     def step(self, state: _Decoding) -> _Frame | None:
-        for raw, target, where in self.jobs:
+        for raw, target, key in self.jobs:
+            where = (*self.at, key)
             value = _start(raw, target, where, state)
             if isinstance(value, _Frame):
                 self.pending_raw, self.pending_at = raw, where
@@ -2069,8 +2104,10 @@ class _Reduce(_Frame):
         self.stateful = stateful
         self.index = index
         self.part = 0
+        # pragma: no mutate start -- placeholders ``take`` sets from parts 0 and 1.
         self.func: object = None
         self.value: object = None
+        # pragma: no mutate end
 
     @override
     def step(self, state: _Decoding) -> _Frame | None:
@@ -2180,7 +2217,7 @@ class _Union(_Frame):
         self.members = iter(members)
         self.key = key
         self.references = references
-        self.marks = (0, 0, 0)
+        self.marks = (0, 0, 0)  # pragma: no mutate -- ``step`` sets it first.
         self.value: object = PENDING
 
     @override
@@ -2234,13 +2271,11 @@ class _Union(_Frame):
             state.placed.popitem()
 
 
-def _reads_tags_as_keys(
-    member: object,
-    default_concrete_types: Mapping[object, type],
-) -> bool:
+# No ``default_concrete_types`` override is asked: ``concrete_overrides`` keeps
+# each within its abstract type, so a mapping stays a mapping.
+def _reads_tags_as_keys(member: object) -> bool:
     """Return whether union ``member`` reads a value tag as a mapping key."""
-    decoder = _untagged_decoder(_resolve_alias(member), default_concrete_types)
-    return decoder in _MAPPING_DECODERS
+    return _target_decoder(_resolve_alias(member)) in _MAPPING_DECODERS
 
 
 def _import_name(member: object) -> str | None:
@@ -2307,7 +2342,9 @@ def _dispatch() -> Mapping[object, _Decoder]:
 def _class_tag(member: object, state: _Decoding) -> str | None:
     """Return the ``py/object`` text naming class ``member``, if any."""
     if state.classes:
+        # pragma: no mutate start -- a tag builds its own class whichever member is tried.
         return state.tags.get(member) if isinstance(member, type) else None
+        # pragma: no mutate end
     return _import_name(member)
 
 
@@ -2387,25 +2424,21 @@ def _read_field_types(kind: type) -> tuple[Mapping[str, object], bool]:
         else hints
     )
     found: dict[str, object] = {}
+    unresolved: list[str] = []
     for name in names:
         # An alias whose value names what is imported for type checking only
         # does not evaluate; it reads as ``object``, as an unresolved hint does.
         try:
-            found[name] = _resolved_hint(hints.get(name, object))
+            found[name] = _resolve_alias(hints.get(name, object))
         except NameError:
             found[name] = object
-            resolved = False
-    return MappingProxyType(found), resolved
+            unresolved.append(name)
+    return MappingProxyType(found), resolved and not unresolved
 
 
 def _names(hint: object, kind: object) -> bool:
     """Return whether ``hint`` is ``kind`` or holds it as an argument."""
-    if hint is kind:
-        return True
-    # A plain class has no arguments; skip asking ``get_args`` for them.
-    if type(hint) is type:
-        return False
-    return kind in cast("tuple[object, ...]", get_args(hint))
+    return hint is kind or kind in cast("tuple[object, ...]", get_args(hint))
 
 
 # ``get_type_hints`` evaluates each annotation and strips ``Annotated``; for a
@@ -2438,7 +2471,7 @@ def _rebuilt_hint(hint: object) -> object:
     """Return ``hint`` as ``get_type_hints`` hands it back."""
     if hint is None:
         return type(None)
-    if isinstance(hint, GenericAlias) and type(hint) is GenericAlias:
+    if type(hint) is GenericAlias:
         origin = cast("type", hint.__origin__)
         return GenericAlias(origin, hint.__args__)
     return hint
@@ -2453,16 +2486,12 @@ def _is_plain_hint(hint: object) -> bool:
         return True
     if isinstance(hint, UnionType):
         return all(map(_is_plain_hint, cast("tuple[object, ...]", hint.__args__)))
-    if isinstance(hint, GenericAlias) and type(hint) is GenericAlias:
+    # Not a subclass, such as ``collections.abc.Callable``'s alias.
+    if type(hint) is GenericAlias:
         return not hint.__unpacked__ and all(
             map(_is_plain_hint, cast("tuple[object, ...]", hint.__args__)),
         )
     return False
-
-
-def _resolved_hint(hint: object) -> object:
-    """``_resolve_alias``, skipped for a plain class, which is no alias."""
-    return hint if type(hint) is type else _resolve_alias(hint)
 
 
 def _module_reaches(kind: type) -> bool:
@@ -2498,10 +2527,7 @@ def _resolvable_hints(
     known = _PARTIAL_HINTS.get(kind, {}).get(include_extras)
     if known is not None:
         kept, retry = known
-        if not any(
-            _resolves(kind.__mro__[at], name, include_extras=include_extras)
-            for name, at in retry.items()
-        ):
+        if not any(_resolves(kind.__mro__[at], name) for name, at in retry.items()):
             return dict(kept), False
         # Another thread may have dropped the entry since it was read.
         _PARTIAL_HINTS.pop(kind, None)
@@ -2518,7 +2544,6 @@ def _resolvable_hints(
         globalns, localns = _namespaces(base)
         for name, hint in _own_annotations(base).items():
             hints[name] = _single_hint(
-                name,
                 hint,
                 globalns,
                 localns,
@@ -2536,19 +2561,15 @@ def _resolvable_hints(
     return hints, False
 
 
-def _resolves(base: type, name: str, *, include_extras: bool) -> bool:
+# Whether a hint resolves never turns on its ``Annotated`` extras. One that is gone
+# reads as ``None``, which resolves too.
+def _resolves(base: type, name: str) -> bool:
     """Return whether ``base``'s own annotation ``name`` resolves now, or is gone."""
-    hint = _own_annotations(base).get(name, PENDING)
-    if hint is PENDING:
-        return True
+    hint = _own_annotations(base).get(name)
     globalns, localns = _namespaces(base)
-    resolved = _single_hint(
-        name,
-        hint,
-        globalns,
-        localns,
-        include_extras=include_extras,
-    )
+    # pragma: no mutate start -- extras never decide whether a hint resolves; see above.
+    resolved = _single_hint(hint, globalns, localns, include_extras=False)
+    # pragma: no mutate end
     return resolved is not PENDING
 
 
@@ -2559,7 +2580,6 @@ def _namespaces(base: type) -> tuple[dict[str, object], dict[str, object]]:
 
 
 def _single_hint(
-    name: str,
     hint: object,
     globalns: dict[str, object],
     localns: dict[str, object],
@@ -2567,7 +2587,7 @@ def _single_hint(
     include_extras: bool,
 ) -> object:
     """Resolve one annotation by itself, or return ``PENDING`` if it fails."""
-    single = SimpleNamespace(__annotations__={name: hint})
+    single = SimpleNamespace(__annotations__={"hint": hint})
     try:
         return cast(
             "object",
@@ -2576,7 +2596,7 @@ def _single_hint(
                 globalns,
                 localns,
                 include_extras=include_extras,
-            )[name],
+            )["hint"],
         )
     except (AttributeError, NameError, TypeError):
         return PENDING
@@ -2824,12 +2844,14 @@ _python_from_plain: Final = from_plain
 
 def _walker[F](python: F) -> F:
     """Return the Rust core's ``from_plain`` when it serves, else ``python``."""
+    # pragma: no mutate start -- mutmut's tree has no core; test_a_built_core_reads pins it.
     return native(
         python,
         name="from_plain",
         setup="setup_decode",
         module=globals(),
     )
+    # pragma: no mutate end
 
 
 from_plain = _walker(_python_from_plain)

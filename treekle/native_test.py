@@ -102,6 +102,8 @@ def test_a_stale_core_keeps_python_and_warns_at_the_importer(
     assert str(warning.message).startswith(
         "treekle's Rust core does not match this treekle (",
     )
+    # It names whoever chose, never ``native`` itself.
+    assert warning.filename != native.__file__
 
 
 def test_a_core_missing_its_walker_is_not_set_up(
