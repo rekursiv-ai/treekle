@@ -308,7 +308,7 @@ def test_each_fresh_mirror_has_classes_of_its_own() -> None:
     class Leaf:
         x: int = 1
 
-    first, second = bench_configs._fresh(Leaf()), bench_configs._fresh(Leaf())
+    first, second = bench_configs.fresh(Leaf()), bench_configs.fresh(Leaf())
     assert type(first) is not type(second)
     assert type(first).__module__ != type(second).__module__
     assert type(first).__name__.startswith("Leaf")

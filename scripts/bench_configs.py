@@ -63,7 +63,7 @@ def main() -> int:
     )
     _add_arguments(parser)
     flags = cast("Flags", parser.parse_args())
-    configs, skipped = _configs(f"{flags.priml}.baselines")
+    configs, skipped = workload_configs(f"{flags.priml}.baselines")
     for label in skipped:
         print(f"skipped {label}: exp000 raised")
     # Treekle caches the class each import path names, so every run needs a
@@ -108,6 +108,51 @@ class Flags(Protocol):
     budget_sec: float
     repeat: int
     cold_repeat: int
+
+
+def workload_configs(package: str) -> tuple[list[tuple[str, object]], list[str]]:
+    """Build every ``exp000`` under ``package``.
+
+    Args:
+      package: The importable baselines package, such as ``priml.baselines``.
+
+    Returns:
+      configs: Each built config, labelled by its baseline's path.
+      skipped: The labels of baselines whose ``exp000`` raised.
+
+    """
+    module = importlib.import_module(package)
+    baselines = Path(next(iter(cast("Iterable[str]", module.__path__))))
+    configs: list[tuple[str, object]] = []
+    skipped: list[str] = []
+    for path in sorted(baselines.rglob("experiments*.py")):
+        if path.name.endswith("_test.py") or "def exp000(" not in path.read_text():
+            continue
+        name = ".".join([package, *path.relative_to(baselines).with_suffix("").parts])
+        label = str(path.relative_to(baselines).with_suffix("")).removesuffix(
+            "/experiments",
+        )
+        try:
+            module = importlib.import_module(name)
+            configs.append((label, cast("Callable[[], object]", module.exp000)()))
+        except Exception:  # noqa: BLE001 -- A baseline that cannot build is skipped.
+            skipped.append(label)
+    return configs, skipped
+
+
+def fresh(config: object) -> object:
+    """Mirror ``config`` into classes no library has seen, in a module of its own.
+
+    Args:
+      config: A built config.
+
+    Returns:
+      mirrored: An equal value built from new classes.
+
+    """
+    module = ModuleType(f"treekle_bench_cold_{uuid.uuid4().hex}")
+    sys.modules[module.__name__] = module
+    return _mirror(config, module=module, classes={})
 
 
 type _Times = dict[str, tuple[float | None, float | None]]
@@ -208,27 +253,6 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
         default=3,
         help="Cold samples per config and library, each on fresh classes; the fastest counts.",
     )
-
-
-def _configs(package: str) -> tuple[list[tuple[str, object]], list[str]]:
-    """Build every ``exp000`` under ``package``; return them and those that raised."""
-    module = importlib.import_module(package)
-    baselines = Path(next(iter(cast("Iterable[str]", module.__path__))))
-    configs: list[tuple[str, object]] = []
-    skipped: list[str] = []
-    for path in sorted(baselines.rglob("experiments*.py")):
-        if path.name.endswith("_test.py") or "def exp000(" not in path.read_text():
-            continue
-        name = ".".join([package, *path.relative_to(baselines).with_suffix("").parts])
-        label = str(path.relative_to(baselines).with_suffix("")).removesuffix(
-            "/experiments",
-        )
-        try:
-            module = importlib.import_module(name)
-            configs.append((label, cast("Callable[[], object]", module.exp000)()))
-        except Exception:  # noqa: BLE001 -- A baseline that cannot build is skipped.
-            skipped.append(label)
-    return configs, skipped
 
 
 def _mirror(value: object, *, module: ModuleType, classes: _Classes) -> object:
@@ -341,9 +365,9 @@ def _cold_row(config: object, *, codecs: list[_Codec], repeat: int) -> _Times:
         encodes: list[float] = []
         decodes: list[float | None] = []
         for _ in range(repeat):
-            encode_us, _ = _once(functools.partial(codec.encode, _fresh(config)))
+            encode_us, _ = _once(functools.partial(codec.encode, fresh(config)))
             encodes.append(encode_us)
-            decode, check = codec.prepare(_fresh(config))
+            decode, check = codec.prepare(fresh(config))
             decodes.append(_cold_decode_us(decode, check))
         failed = any(us is None for us in decodes)
         times[codec.name] = (
@@ -351,13 +375,6 @@ def _cold_row(config: object, *, codecs: list[_Codec], repeat: int) -> _Times:
             None if failed else min(us for us in decodes if us is not None),
         )
     return times
-
-
-def _fresh(config: object) -> object:
-    """Mirror ``config`` into classes no library has seen, in a module of its own."""
-    module = ModuleType(f"treekle_bench_cold_{uuid.uuid4().hex}")
-    sys.modules[module.__name__] = module
-    return _mirror(config, module=module, classes={})
 
 
 def _cold_decode_us(
