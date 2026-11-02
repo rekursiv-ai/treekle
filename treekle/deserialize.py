@@ -2424,7 +2424,6 @@ def _read_field_types(kind: type) -> tuple[Mapping[str, object], bool]:
         else hints
     )
     found: dict[str, object] = {}
-    unresolved: list[str] = []
     for name in names:
         # An alias whose value names what is imported for type checking only
         # does not evaluate; it reads as ``object``, as an unresolved hint does.
@@ -2432,8 +2431,8 @@ def _read_field_types(kind: type) -> tuple[Mapping[str, object], bool]:
             found[name] = _resolve_alias(hints.get(name, object))
         except NameError:
             found[name] = object
-            unresolved.append(name)
-    return MappingProxyType(found), resolved and not unresolved
+            resolved = False
+    return MappingProxyType(found), resolved
 
 
 def _names(hint: object, kind: object) -> bool:

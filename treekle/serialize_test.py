@@ -1822,6 +1822,51 @@ class TestAContainerNotOfItsDeclaredType:
 
         assert len(decided) == 1
 
+    def test_a_list_class_settles_one_form_for_every_length(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Only a tuple's arity can change its form; a list's length cannot."""
+        decided: list[object] = []
+        form_by = serialize._form_by
+
+        def counted(
+            kind: type,
+            declared: object,
+            default_concrete_types: Mapping[object, type],
+            fit: serialize._Fit,
+        ) -> serialize._Form | None:
+            decided.append(fit)
+            return form_by(kind, declared, default_concrete_types, fit)
+
+        monkeypatch.setattr(serialize, "_DECISIONS", {})
+        monkeypatch.setattr(serialize, "_form_by", counted)
+
+        assert serialize._python_to_plain([1], target=list[int]) == [1]
+        assert serialize._python_to_plain([1, 2], target=list[int]) == [1, 2]
+
+        assert decided == [serialize._KindFit(kind=list)]
+
+    def test_a_record_class_is_decided_once_per_declared_type(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        decided: list[object] = []
+        record_built = serialize._record_built
+
+        def counted(declared: object) -> object:
+            decided.append(declared)
+            return record_built(declared)
+
+        monkeypatch.setattr(serialize, "_DECISIONS", {})
+        monkeypatch.setattr(serialize, "_record_built", counted)
+
+        assert serialize._record_implied(Point, Point)
+        assert serialize._record_implied(Point, Point)
+        assert not serialize._record_implied(Point, dict[str, int] | Point)
+
+        assert decided == [Point, dict[str, int] | Point]
+
 
 def test_a_decision_is_made_again_once_from_plain_s_dispatch_changes(
     monkeypatch: pytest.MonkeyPatch,
