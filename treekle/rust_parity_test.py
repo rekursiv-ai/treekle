@@ -48,7 +48,6 @@ import subprocess
 import sys
 import textwrap
 import threading
-import tracemalloc
 import weakref
 
 import pytest
@@ -79,6 +78,8 @@ needs_rust = pytest.mark.skipif(
 
 class _Core(Protocol):
     def setup_decode(self, module: dict[str, object], /) -> None: ...
+
+    def _decode_cache_sizes(self) -> tuple[int, int]: ...
 
     def json_dumps_plain(
         self,
@@ -2501,23 +2502,29 @@ def test_nonclass_type_plan_does_not_keep_its_target_alive() -> None:
 
 
 @needs_rust
-def test_a_dead_targets_plan_leaves_the_cache() -> None:
-    # ``list[int]`` is a new alias each time it is written, so a caller that
-    # writes it in place plans a new target on every call. The cache kept each
-    # dead target's entry until it filled, so memory grew with the number of
-    # calls rather than with the targets still alive.
-    _core().setup_decode(deserialize.__dict__)
-    targets = [list[int] for _ in range(500)]
+def test_dead_target_plans_are_swept_from_the_cache() -> None:
+    # The cache kept each dead target's plan until it filled, so it grew with
+    # the number of calls rather than with the targets still alive. Rust's
+    # allocator is invisible to tracemalloc, so count the entries instead.
+    core = _core()
+    core.setup_decode(deserialize.__dict__)
+    targets: list[type[object]] = []
+    watches: list[weakref.ReferenceType[type[object]]] = []
+    for index in range(1_000):
+        target = dataclass(_class(__name__, f"DeadTarget{index}", x=int))
+        watches.append(weakref.ref(target))
+        assert vars(deserialize.from_plain({"x": index}, target)) == {"x": index}
+        targets.append(target)
+
+    del target
+    targets.clear()
     gc.collect()
-    tracemalloc.start()
-    try:
-        while targets:
-            assert deserialize.from_plain([1], targets.pop()) == [1]
-        gc.collect()
-        kept, _ = tracemalloc.get_traced_memory()
-    finally:
-        tracemalloc.stop()
-    assert kept < 4_096
+    assert all(watch() is None for watch in watches)
+
+    trigger = dataclass(_class(__name__, "TriggerTarget", x=int))
+    assert vars(deserialize.from_plain({"x": 0}, trigger)) == {"x": 0}
+    # Only the trigger's plans remain: the class and its field's ``int``.
+    assert core._decode_cache_sizes() == (2, 0)
 
 
 @needs_rust
