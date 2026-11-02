@@ -378,8 +378,8 @@ def _perf(command: str) -> None:
 
 def _configs(rounds: int) -> list[object]:
     """Every priml ``exp000`` config, mirrored ``rounds`` times into classes never seen."""
-    configs, _ = bench_configs._configs(f"{_PREFIX}priml.baselines")  # noqa: SLF001 -- The bench's own workload, shared rather than copied.
-    fresh = bench_configs._fresh  # noqa: SLF001 -- The bench's own workload, shared rather than copied.
+    configs, _ = bench_configs.workload_configs(f"{_PREFIX}priml.baselines")
+    fresh = bench_configs.fresh
     return [fresh(config) for _ in range(rounds) for _, config in configs]
 
 

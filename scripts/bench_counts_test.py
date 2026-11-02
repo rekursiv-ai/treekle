@@ -151,8 +151,8 @@ def test_configs_are_mirrored_once_per_round(monkeypatch: pytest.MonkeyPatch) ->
     def fresh(config: object) -> object:
         return ("fresh", config)
 
-    monkeypatch.setattr(bench_configs, "_configs", configs)
-    monkeypatch.setattr(bench_configs, "_fresh", fresh)
+    monkeypatch.setattr(bench_configs, "workload_configs", configs)
+    monkeypatch.setattr(bench_configs, "fresh", fresh)
 
     values = bench_counts._configs(2)
 
