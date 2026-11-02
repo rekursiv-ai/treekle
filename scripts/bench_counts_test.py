@@ -465,6 +465,8 @@ def test_a_worktree_head_with_uncommitted_workload_imports_is_refused(
     (scripts / "bench_configs.py").write_text("workload\n")
     config = ModuleType("fake_priml_config")
     config.__file__ = str(repo / "priml" / "config.py")
+    layers = ModuleType("fake_priml_layers")
+    layers.__file__ = str(repo / "priml" / "layers.py")
     monkeypatch.setattr(bench_counts, "_CWD", scripts)
     monkeypatch.setattr(
         sys,
@@ -475,13 +477,16 @@ def test_a_worktree_head_with_uncommitted_workload_imports_is_refused(
     def configs(rounds: int) -> list[object]:
         del rounds
         monkeypatch.setitem(sys.modules, config.__name__, config)
+        monkeypatch.setitem(sys.modules, layers.__name__, layers)
         return []
 
     def git(where: Path, *args: str) -> str:
         del where
         answers: dict[tuple[str, ...], str] = {
             ("rev-parse", "--show-toplevel"): str(repo),
-            ("diff", "--name-only", "HEAD"): "priml/config.py\npkg/serialize.py",
+            ("diff", "--name-only", "HEAD"): (
+                "priml/config.py\npriml/layers.py\npkg/serialize.py"
+            ),
             ("ls-files", "--others", "--exclude-standard"): "notes.txt",
         }
         return answers.get(args) or _sha(args[-1])
@@ -495,7 +500,39 @@ def test_a_worktree_head_with_uncommitted_workload_imports_is_refused(
     monkeypatch.setattr(bench_counts, "_prepared", prepare)
 
     assert bench_counts.main() == 2
-    assert "priml/config.py" in capsys.readouterr().err
+    assert capsys.readouterr().err == (
+        "The refs read the committed priml/config.py, priml/layers.py, which"
+        " WORKTREE has edited;"
+        " commit it or count a committed head.\n"
+    )
+
+
+def test_help_opens_with_the_prose_after_the_launcher_lines(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The docstring's first two lines are the shell launcher, never help."""
+    monkeypatch.setattr(sys, "argv", ["bench_counts", "--help"])
+    with pytest.raises(SystemExit):
+        _ = bench_counts.main()
+    shown = capsys.readouterr().out.split("\n\n", 1)[1]
+    assert shown.startswith(
+        "Count the instructions treekle's Rust core spends on one workload at each ref.\n",
+    )
+    assert "exec uv" not in shown
+    assert "\nExamples:\n" in shown
+
+
+def test_help_without_a_docstring_has_no_description(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Under ``python -OO`` there is no docstring; help still opens."""
+    monkeypatch.setattr(bench_counts, "__doc__", None)
+    monkeypatch.setattr(sys, "argv", ["bench_counts", "--help"])
+    with pytest.raises(SystemExit):
+        _ = bench_counts.main()
+    assert capsys.readouterr().out.split("\n\n", 1)[1].startswith("options:")
 
 
 def test_no_pgo_builds_every_ref_without_a_profile(

@@ -196,20 +196,26 @@ def _edited_workload(repo: Path) -> list[str]:
     """Return the uncommitted files outside treekle that the workload imports."""
     package = _CWD.parent.resolve()
     _configs(1)
+    changed = {
+        (repo / name).resolve(): name
+        for name in (
+            *_git(repo, "diff", "--name-only", "HEAD").splitlines(),
+            *_git(repo, "ls-files", "--others", "--exclude-standard").splitlines(),
+        )
+    }
+    # Only a module named as a changed file is resolved: resolving all of
+    # ``sys.modules`` cost a process holding thousands of them half a second.
+    leaves = {path.name for path in changed}
     imported = {
         Path(name).resolve()
         for module in list(sys.modules.values())
         if (name := cast(str | None, getattr(module, "__file__", None))) is not None
+        and Path(name).name in leaves
     }
-    changed = [
-        *_git(repo, "diff", "--name-only", "HEAD").splitlines(),
-        *_git(repo, "ls-files", "--others", "--exclude-standard").splitlines(),
-    ]
     return sorted(
         name
-        for name in changed
-        if (path := (repo / name).resolve()) in imported
-        and not path.is_relative_to(package)
+        for path, name in changed.items()
+        if path in imported and not path.is_relative_to(package)
     )
 
 
