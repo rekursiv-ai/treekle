@@ -129,7 +129,9 @@ def _rebuild(
                 sequence(items)
                 if keys is None
                 # One item is copied per key, so the two never differ in length.
-                else mapping(dict(zip(keys, items, strict=True)))  # pragma: no mutate
+                else mapping(
+                    dict(zip(keys, items, strict=True)),
+                )  # pragma: no mutate -- see above.
             )
             if not stack:
                 return node
