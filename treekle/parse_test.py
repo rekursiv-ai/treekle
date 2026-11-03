@@ -128,6 +128,16 @@ class TestParse:
             parse(text, target)
 
 
+@pytest.mark.parametrize(
+    ("text", "shown"),
+    [("5", "'5'"), ('"5"', "'5'"), ("[5]", "'[5]'")],
+)
+def test_a_verbatim_failure_names_the_text_typed(text: str, shown: str) -> None:
+    with pytest.raises(ReadError) as raised:
+        parse(text, UUID)
+    assert str(raised.value) == f"cannot read {shown} as UUID"
+
+
 if __name__ == "__main__":
     from treekle.lib.testing.runner import test_main
 
