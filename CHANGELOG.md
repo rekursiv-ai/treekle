@@ -3,6 +3,15 @@
 All notable treekle changes are documented here. This project follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## 0.4.2 - 2026-11-05
+
+### Changed
+
+- Text that spells a JSON value parses to that value, else to the bare word.
+- An untagged record under a union no longer depends on the default concrete
+  types to decide which record class it reads back as.
+- Project-only dependencies moved to dependency groups.
+
 ## 0.4.1 - 2026-10-28
 
 ### Changed
