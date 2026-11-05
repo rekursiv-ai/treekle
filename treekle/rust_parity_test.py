@@ -4359,14 +4359,16 @@ def test_json_dumps_runs_hooks_as_often_as_python_where_text_falls_short(
 def test_json_dumps_gives_up_where_json_does_on_a_deep_tree() -> None:
     # The text walk could write any depth; ``json`` stops where the C stack
     # runs short, and so must ``json_dumps``. Notes differ with the stack.
-    value = _wrapped(5_000, [_Counted()], lambda inner: [inner])
+    value = _wrapped(100_000, [_Counted()], lambda inner: [inner])
     outcomes: list[tuple[object, int]] = []
 
     def kind(write: Callable[[object, Hooks], str]) -> tuple[object, int]:
         outcome, calls = _counted_dumps(lambda: value, write, lambda count: count)
         return cast("tuple[object, ...]", outcome)[:2], calls
 
-    previous = threading.stack_size(512 * 1024)
+    # Before 3.14 ``json`` counts to 10,000 levels rather than measure the stack, so
+    # this stack must hold that many: on 512 KiB it overflows and kills the process.
+    previous = threading.stack_size(8 * 1024 * 1024)
     try:
         thread = threading.Thread(
             target=lambda: outcomes.extend(
