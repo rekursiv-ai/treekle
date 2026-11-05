@@ -4359,15 +4359,32 @@ def test_json_dumps_runs_hooks_as_often_as_python_where_text_falls_short(
 def test_json_dumps_gives_up_where_json_does_on_a_deep_tree() -> None:
     # The text walk could write any depth; ``json`` stops where the C stack
     # runs short, and so must ``json_dumps``. Notes differ with the stack.
-    value = _wrapped(100_000, [_Counted()], lambda inner: [inner])
+    value = _wrapped(5_000, [_Counted()], lambda inner: [inner])
+    outcomes: list[tuple[object, int]] = []
 
     def kind(write: Callable[[object, Hooks], str]) -> tuple[object, int]:
         outcome, calls = _counted_dumps(lambda: value, write, lambda count: count)
         return cast("tuple[object, ...]", outcome)[:2], calls
 
-    assert kind(lambda tree, hooks: wire.json_dumps(tree, hooks=hooks)) == kind(
-        lambda tree, hooks: json.dumps(serialize._python_to_plain(tree, hooks=hooks)),
-    )
+    previous = threading.stack_size(512 * 1024)
+    try:
+        thread = threading.Thread(
+            target=lambda: outcomes.extend(
+                (
+                    kind(lambda tree, hooks: wire.json_dumps(tree, hooks=hooks)),
+                    kind(
+                        lambda tree, hooks: json.dumps(
+                            serialize._python_to_plain(tree, hooks=hooks),
+                        ),
+                    ),
+                ),
+            ),
+        )
+        thread.start()
+        thread.join()
+    finally:
+        threading.stack_size(previous)
+    assert outcomes == [(("raise", "RecursionError"), 1)] * 2
 
 
 _JSON_DUMPS = cast("Callable[..., str]", json.dumps)
