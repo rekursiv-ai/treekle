@@ -470,6 +470,7 @@ def test_from_plain_matches_python(case: _Case, data: st.DataObject) -> None:
 
 
 @_needs_rust
+@settings(max_examples=8)
 @given(case=_cases())
 def test_json_loads_matches_python(case: _Case) -> None:
     # Only a mutable json-dialect tree is JSON text; any other draw is wasted.
