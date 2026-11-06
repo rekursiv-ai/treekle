@@ -4375,8 +4375,10 @@ def test_json_dumps_gives_up_where_json_does_on_a_deep_tree() -> None:
         return cast("tuple[object, ...]", outcome)[:2], calls
 
     # Before 3.14 ``json`` counts to 10,000 levels rather than measure the stack, so
-    # this stack must hold that many: on 512 KiB it overflows and kills the process.
-    previous = threading.stack_size(8 * 1024 * 1024)
+    # that stack must hold that many: on 512 KiB it overflows and kills the process.
+    # From 3.14 the stack must run short first, and 8 MiB held this tree on CI's runners.
+    kib = 512 if sys.version_info >= (3, 14) else 8 * 1024
+    previous = threading.stack_size(kib * 1024)
     try:
         thread = threading.Thread(
             target=lambda: outcomes.extend(
