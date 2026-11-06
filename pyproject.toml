@@ -4,7 +4,7 @@
 
 [project]
 name = "treekle"
-version = "0.4.3"
+version = "0.4.4"
 description = "Pickle semantics as plain python trees."
 readme = "README.md"
 requires-python = ">=3.12"
