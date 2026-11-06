@@ -3,6 +3,12 @@
 All notable treekle changes are documented here. This project follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## 0.4.3 - 2026-11-06
+
+### Changed
+
+- Test and development tooling updates; library code is unchanged.
+
 ## 0.4.2 - 2026-11-05
 
 ### Changed
