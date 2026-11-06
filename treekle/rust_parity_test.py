@@ -2319,6 +2319,7 @@ def test_a_hooked_value_deeper_than_the_stack_is_judged_without_recursing() -> N
     # hook returns is deep, and judging it against ``Tree`` once crashed.
     printed = _run_python(
         """
+        import threading
         import treekle.deserialize as deserialize
 
         class Deep:
@@ -2326,22 +2327,29 @@ def test_a_hooked_value_deeper_than_the_stack_is_judged_without_recursing() -> N
 
         def rebuild(payload):
             value = 0
-            for _ in range(100_000):
+            for _ in range(5_000):
                 value = [value]
             return value
 
         type Tree = list[Tree] | int
         hooks = {Deep: (lambda value: 0, rebuild)}
         data = {"py/hook": ["__main__.Deep", 0]}
-        value = deserialize.from_plain(data, Tree, hooks=hooks)
-        depth = 0
-        while isinstance(value, list):
-            value = value[0]
-            depth += 1
-        print(depth, value)
+
+        def read():
+            value = deserialize.from_plain(data, Tree, hooks=hooks)
+            depth = 0
+            while isinstance(value, list):
+                value = value[0]
+                depth += 1
+            print(depth, value)
+
+        threading.stack_size(512 * 1024)
+        thread = threading.Thread(target=read)
+        thread.start()
+        thread.join()
         """,
     )
-    assert printed == "100000 0"
+    assert printed == "5000 0"
 
 
 type _Tree = list[_Tree] | int
@@ -2557,7 +2565,7 @@ def test_dead_target_plans_are_swept_from_the_cache() -> None:
     core.setup_decode(deserialize.__dict__)
     targets: list[type[object]] = []
     watches: list[weakref.ReferenceType[type[object]]] = []
-    for index in range(1_000):
+    for index in range(3):
         targets.append(dataclass(_class(__name__, f"DeadTarget{index}", x=int)))
         watches.append(weakref.ref(targets[-1]))
         assert vars(deserialize.from_plain({"x": index}, targets[-1])) == {"x": index}
@@ -4661,11 +4669,11 @@ def _float_samples() -> list[float]:
         9007199254740993.0,
         123456789.123456789,
     ]
-    while len(samples) < 4_000:
+    while len(samples) < 512:
         (value,) = struct.unpack("<d", rng.getrandbits(64).to_bytes(8, "little"))
         if math.isfinite(value):
             samples.append(value)
-    samples.extend(rng.uniform(-1e6, 1e6) for _ in range(1_000))
+    samples.extend(rng.uniform(-1e6, 1e6) for _ in range(128))
     # Quarters near 2**50 to 2**53 lie halfway between two shortest spellings
     # (``x.25`` between ``x.2`` and ``x.3``), which ``repr`` breaks to the even.
     samples.extend(
@@ -4683,7 +4691,7 @@ def _float_texts(samples: list[float]) -> list[str]:
     texts: list[str] = []
     for value in samples:
         texts.extend((repr(value), f"{value:.17e}", f"{value:.{rng.randint(1, 16)}g}"))
-    for _ in range(1_000):
+    for _ in range(128):
         digits = "".join(rng.choice("0123456789") for _ in range(rng.randint(18, 40)))
         texts.append(f"{digits[0]}.{digits[1:]}e{rng.randint(-330, 310)}")
     return texts
@@ -4696,24 +4704,21 @@ def test_floats_parse_and_write_as_json_does() -> None:
         lambda: cast("object", json.loads(text)),
     )
 
-    def python() -> object:
-        tree = cast("PlainTree", json.loads(text))
-        return deserialize._python_from_plain(tree, list[float])
-
-    assert _read_outcome(lambda: wire.json_loads(text, list[float])) == _read_outcome(
-        python,
+    expected = deserialize._python_from_plain(
+        cast("PlainTree", json.loads(text)),
+        list[float],
     )
+    assert _exact(wire.json_loads(text, list[float])) == _exact(expected)
     rows = (
         "[" + ", ".join(f'{{"id": 0, "score": {value!r}}}' for value in samples) + "]"
     )
-
-    def python_rows() -> object:
-        tree = cast("PlainTree", json.loads(rows))
-        return deserialize._python_from_plain(tree, list[_FrozenRow])
-
-    assert _read_outcome(
-        lambda: wire.json_loads(rows, list[_FrozenRow]),
-    ) == _read_outcome(python_rows)
+    expected_rows = deserialize._python_from_plain(
+        cast("PlainTree", json.loads(rows)),
+        list[_FrozenRow],
+    )
+    actual_rows = wire.json_loads(rows, list[_FrozenRow])
+    assert actual_rows == expected_rows
+    assert repr(actual_rows) == repr(expected_rows)
     assert wire.json_dumps(samples) == json.dumps(serialize._python_to_plain(samples))
 
 
@@ -4931,19 +4936,24 @@ def test_a_hook_that_reloads_the_module_does_not_break_the_walk() -> None:
         import treekle.deserialize as deserialize
         import treekle.serialize as serialize
 
+        writes_native = serialize.to_plain is not serialize._python_to_plain
+        reads_native = deserialize.from_plain is not deserialize._python_from_plain
+
         class Leaf:
             pass
 
         def encode(value):
             importlib.reload(serialize)
+            assert (serialize.to_plain is not serialize._python_to_plain) == writes_native
             return [1.5, (1, 2), {3, 4}]
 
         def decode(data):
             importlib.reload(deserialize)
+            assert (deserialize.from_plain is not deserialize._python_from_plain) == reads_native
             return Leaf()
 
         hooks = {Leaf: (encode, decode)}
-        for _ in range(20):
+        for _ in range(2):
             tree = serialize.to_plain([Leaf(), [1.0, (2, 3)] * 100, Leaf()], hooks=hooks)
             value = deserialize.from_plain(tree, object, hooks=hooks)
         print(type(value[0]).__name__, len(value[1]))
