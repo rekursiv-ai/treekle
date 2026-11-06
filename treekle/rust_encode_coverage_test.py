@@ -67,6 +67,20 @@ class _Loose:
         vars(self).update(members)
 
 
+@pytest.fixture
+def young_cycles() -> Iterator[None]:
+    """Collect temporary cycles without sweeping unrelated older generations."""
+    enabled = gc.isenabled()
+    gc.disable()
+    try:
+        yield
+    finally:
+        gc.collect(0)
+        if enabled:
+            gc.enable()
+
+
+@pytest.mark.usefixtures("young_cycles")
 def test_a_huge_tree_does_not_keep_its_buffers_and_matches_python() -> None:
     # Past the buffer limit the walk drops its buffers rather than keep them.
     value = [[index] for index in range(70_000)]
@@ -771,6 +785,7 @@ def test_a_hint_that_resolves_later_is_read_again(
     serialize.to_plain is serialize._python_to_plain,
     reason="the Rust core is not built, or TREEKLE_PURE_PYTHON is set",
 )
+@pytest.mark.usefixtures("young_cycles")
 def test_classes_past_the_core_s_limit_are_let_go_one_at_a_time(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -806,6 +821,7 @@ def test_classes_past_the_core_s_limit_are_let_go_one_at_a_time(
     serialize.to_plain is serialize._python_to_plain,
     reason="the Rust core is not built, or TREEKLE_PURE_PYTHON is set",
 )
+@pytest.mark.usefixtures("young_cycles")
 def test_declared_types_past_the_core_s_limit_are_let_go_one_at_a_time() -> None:
     # Each ``list[int]`` written anew is its own declared type, kept with what
     # the core decided for it until newer ones push it out.
@@ -815,7 +831,7 @@ def test_declared_types_past_the_core_s_limit_are_let_go_one_at_a_time() -> None
         held.append(weakref.ref(declared))
         assert serialize.to_plain([1], target=declared) == [1]
         del declared
-    gc.collect()
+    gc.collect(0)
 
     let_go = sum(ref() is None for ref in held)
     assert 0 < let_go < len(held) // 2
