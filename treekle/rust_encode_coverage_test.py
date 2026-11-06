@@ -781,34 +781,46 @@ def test_a_hint_that_resolves_later_is_read_again(
     assert serialize.to_plain(value) == after
 
 
+@pytest.fixture
+def many_classes(
+    monkeypatch: pytest.MonkeyPatch,
+    young_cycles: None,
+) -> tuple[ModuleType, str, list[type]]:
+    """Build the distinct classes separately from exercising the eviction ring."""
+    del young_cycles
+    module = ModuleType(f"{__name__}_many")
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    qualname = "".join(("Ma", "ny"))
+    kinds: list[type] = [
+        type(
+            "Many",
+            (),
+            {"__qualname__": qualname, "__module__": module.__name__},
+        )
+        for _ in range(16_385)
+    ]
+    return module, qualname, kinds
+
+
 @pytest.mark.skipif(
     serialize.to_plain is serialize._python_to_plain,
     reason="the Rust core is not built, or TREEKLE_PURE_PYTHON is set",
 )
-@pytest.mark.usefixtures("young_cycles")
 def test_classes_past_the_core_s_limit_are_let_go_one_at_a_time(
-    monkeypatch: pytest.MonkeyPatch,
+    many_classes: tuple[ModuleType, str, list[type]],
 ) -> None:
     # The core keeps what it read of each class it met, in a table of bounded
     # size: past the bound each new class takes the oldest one's place, so no
     # call lets go of every class's facts at once. Each kept entry holds its
     # class's qualname, so the classes share one to count what is kept. The
     # module names each class as it is written, so its path resolves.
-    module = ModuleType(f"{__name__}_many")
-    monkeypatch.setitem(sys.modules, module.__name__, module)
-    qualname = "".join(("Ma", "ny"))
-    kinds: list[type] = []
+    module, qualname, kinds = many_classes
+    baseline = sys.getrefcount(qualname)
     kept: list[int] = []
-    for _ in range(16_385):
-        kind = type(
-            "Many",
-            (),
-            {"__qualname__": qualname, "__module__": module.__name__},
-        )
-        kinds.append(kind)
+    for kind in kinds:
         vars(module)["Many"] = kind
-        serialize.to_plain(kind())
-        kept.append(sys.getrefcount(qualname) - len(kinds))
+        serialize.to_plain(cast(object, kind()))
+        kept.append(sys.getrefcount(qualname) - baseline)
 
     assert min(later - earlier for earlier, later in itertools.pairwise(kept)) >= -1
     assert kept[-1] > len(kinds) // 2
