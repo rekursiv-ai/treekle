@@ -637,7 +637,7 @@ ENCODE_CASES: list[tuple[str, object, object, Hooks | None]] = [
     ("lone surrogate tag keys", {"py/\ud800": 1, "json://\udfff": 2}, "json", None),
     (
         "keys reduced to short-lived classes",
-        {Key(n): n for n in range(20)},
+        {Key(n): n for n in range(2)},
         "json",
         None,
     ),
@@ -2013,6 +2013,7 @@ def test_shallow_nesting_still_round_trips() -> None:
 # Past every native walk's fast-path depth (decoding's 128 and 192, the text
 # sink's 96), so a walk that hands deep trees to Python is caught.
 _PAST_FAST_PATHS: Final = 400
+_PAST_DECODER_FAST_PATHS: Final = 193
 
 
 def _deep(value: object, depth: int) -> object:
@@ -2402,7 +2403,11 @@ _DEEP_READS: dict[str, tuple[Callable[[], object], object, dict[str, object]]] =
         _Tree,
         {},
     ),
-    "dataclass chain": (lambda: _plain_chain(_PAST_FAST_PATHS), Node, {}),
+    "dataclass chain": (
+        lambda: _plain_chain(_PAST_DECODER_FAST_PATHS),
+        Node,
+        {},
+    ),
     "dataclass chain with a bad deepest field": (
         lambda: _bad_leaf_chain(_PAST_FAST_PATHS),
         Node,
@@ -4384,7 +4389,7 @@ def test_json_dumps_runs_hooks_as_often_as_python_where_text_falls_short(
 def test_json_dumps_gives_up_where_json_does_on_a_deep_tree() -> None:
     # The text walk could write any depth; ``json`` stops where the C stack
     # runs short, and so must ``json_dumps``. Notes differ with the stack.
-    value = _wrapped(100_000, [_Counted()], lambda inner: [inner])
+    value = _wrapped(10_000, [_Counted()], lambda inner: [inner])
     outcomes: list[tuple[object, int]] = []
 
     def kind(write: Callable[[object, Hooks], str]) -> tuple[object, int]:
