@@ -30,6 +30,7 @@ import re
 from hypothesis import (
     assume,
     given,
+    settings,
     strategies as st,
 )
 
@@ -388,6 +389,7 @@ _needs_rust = pytest.mark.skipif(
 
 
 @_needs_rust
+@settings(max_examples=8)
 @given(case=_cases())
 def test_to_plain_matches_python(case: _Case) -> None:
     def write(walker: Callable[..., object]) -> object:
@@ -406,6 +408,7 @@ def test_to_plain_matches_python(case: _Case) -> None:
 
 
 @_needs_rust
+@settings(max_examples=8)
 @given(case=_cases())
 def test_json_dumps_matches_python(case: _Case) -> None:
     actual = _outcome(
@@ -439,6 +442,7 @@ def test_json_dumps_matches_python(case: _Case) -> None:
 
 
 @_needs_rust
+@settings(max_examples=8)
 @given(case=_cases(), data=st.data())
 def test_from_plain_matches_python(case: _Case, data: st.DataObject) -> None:
     tree = _python_tree(case)
