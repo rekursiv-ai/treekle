@@ -68,6 +68,7 @@ def test_the_table_shows_each_count_the_ratio_and_the_mismatches() -> None:
     ]
 
 
+@pytest.mark.usefixtures("benchmark_environment")
 @pytest.mark.parametrize(
     ("make", "target"),
     [
@@ -89,6 +90,7 @@ def test_rows_read_back_as_python_reads_them(make: type, target: object) -> None
         assert bench_counts._measure(work) == (2, 0)
 
 
+@pytest.mark.usefixtures("benchmark_environment")
 @pytest.mark.parametrize("text", [False, True], ids=["from_plain", "json_loads"])
 def test_defaulted_rows_read_back_as_python_reads_them(text: bool) -> None:
     trees = bench_counts._defaulted_rows(count=3)
@@ -101,6 +103,7 @@ def test_defaulted_rows_read_back_as_python_reads_them(text: bool) -> None:
     assert rows[1] == bench_counts._Defaulted(a=1)
 
 
+@pytest.mark.usefixtures("benchmark_environment")
 def test_a_result_python_does_not_give_is_counted_as_a_mismatch() -> None:
     work = bench_counts._Work(
         calls=[lambda: [1, 2]],
@@ -580,6 +583,7 @@ def test_a_ref_built_without_a_profile_is_kept_apart(
     assert builds[0][-1] == "--no-pgo"
 
 
+@pytest.mark.usefixtures("benchmark_environment")
 def test_main_runs_one_case_in_this_process(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -595,6 +599,76 @@ def test_main_runs_one_case_in_this_process(
 
     assert bench_counts.main() == 0
     assert capsys.readouterr().out == "calls=2 mismatched=0\n"
+
+
+@pytest.fixture
+def benchmark_environment(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Replace process-wide collection, not the conversions being checked."""
+    events: list[str] = []
+    monkeypatch.setattr(bench_counts, "gc", _BenchmarkGC(events))
+    return events
+
+
+@pytest.mark.parametrize("warm", [False, True])
+def test_measure_brackets_rounds_and_checks_after_counting(
+    warm: bool,
+    benchmark_environment: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events = benchmark_environment
+    monkeypatch.setattr(bench_counts, "_perf", events.append)
+
+    def first() -> list[int]:
+        events.append("first")
+        return [1, 2]
+
+    def second() -> list[int]:
+        events.append("second")
+        return [3]
+
+    def reference_first() -> list[int]:
+        events.append("reference first")
+        return [1, 2]
+
+    def reference_second() -> list[int]:
+        events.append("reference second")
+        return [4]
+
+    work = bench_counts._Work(
+        calls=[first, second],
+        references=[reference_first, reference_second],
+        rounds=3,
+        warm=warm,
+    )
+    assert bench_counts._measure(work) == (6, 3)
+    assert events == [
+        *(["first", "second"] if warm else []),
+        "collect",
+        "gc disable",
+        "enable",
+        *(["first", "second"] * 3),
+        "disable",
+        "gc enable",
+        "reference first",
+        "reference second",
+    ]
+
+
+class _BenchmarkGC:
+    """Record the benchmark's environmental boundary without collecting the suite."""
+
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+
+    def collect(self) -> int:
+        self.events.append("collect")
+        return 0
+
+    def disable(self) -> None:
+        self.events.append("gc disable")
+
+    def enable(self) -> None:
+        self.events.append("gc enable")
 
 
 if __name__ == "__main__":

@@ -2552,11 +2552,24 @@ def test_nonclass_type_plan_does_not_keep_its_target_alive() -> None:
     weak = weakref.ref(target)
     assert deserialize.from_plain([1], target) == [1]
     del target
-    gc.collect()
     assert weak() is None
 
 
+@pytest.fixture
+def young_cycles() -> Iterator[None]:
+    """Keep newly built class cycles young until their explicit collection."""
+    enabled = gc.isenabled()
+    gc.disable()
+    try:
+        yield
+    finally:
+        gc.collect(0)
+        if enabled:
+            gc.enable()
+
+
 @needs_rust
+@pytest.mark.usefixtures("young_cycles")
 def test_dead_target_plans_are_swept_from_the_cache() -> None:
     # The cache kept each dead target's plan until it filled, so it grew with
     # the number of calls rather than with the targets still alive. Rust's
@@ -2571,7 +2584,7 @@ def test_dead_target_plans_are_swept_from_the_cache() -> None:
         assert vars(deserialize.from_plain({"x": index}, targets[-1])) == {"x": index}
 
     targets.clear()
-    gc.collect()
+    gc.collect(0)
     assert all(watch() is None for watch in watches)
 
     trigger = dataclass(_class(__name__, "TriggerTarget", x=int))
@@ -2594,6 +2607,7 @@ def test_setup_takes_a_read_error_that_is_no_class() -> None:
 
 
 @needs_rust
+@pytest.mark.usefixtures("young_cycles")
 def test_cached_field_plan_does_not_keep_its_hint_alive(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2608,7 +2622,7 @@ def test_cached_field_plan_does_not_keep_its_hint_alive(
     assert owner in deserialize._FIELD_TYPES
     del vars(module)["Owner"]
     del owner, hint
-    gc.collect()
+    gc.collect(0)
     assert weak() is None
 
 
@@ -2694,6 +2708,7 @@ def test_an_unresolved_nested_dataclass_resolves_its_hints_once_per_read(
 
 
 @needs_rust
+@pytest.mark.usefixtures("young_cycles")
 def test_a_kept_nested_dataclass_can_still_be_collected(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2705,10 +2720,11 @@ def test_a_kept_nested_dataclass_can_still_be_collected(
     assert vars(deserialize.from_plain({"x": 1}, inner)) == {"x": 1}
     del vars(module)["Outer"]
     del inner
-    gc.collect()
+    gc.collect(0)
     assert weak() is None
 
 
+@pytest.mark.usefixtures("young_cycles")
 @pytest.mark.parametrize("slots", [True, False], ids=["slotted", "dict-backed"])
 def test_a_dataclass_read_again_and_again_can_still_be_collected(
     monkeypatch: pytest.MonkeyPatch,
@@ -2729,7 +2745,7 @@ def test_a_dataclass_read_again_and_again_can_still_be_collected(
         )
     del vars(module)["Owner"]
     del kind
-    gc.collect()
+    gc.collect(0)
     assert weak() is None
 
 
@@ -4364,6 +4380,7 @@ def test_json_dumps_runs_hooks_as_often_as_python_where_text_falls_short(
         _assert_dumps_with_hooks_alike(_HOLE_CASES[case], _HOLE_LAYOUTS[layout])
 
 
+@pytest.mark.usefixtures("young_cycles")
 def test_json_dumps_gives_up_where_json_does_on_a_deep_tree() -> None:
     # The text walk could write any depth; ``json`` stops where the C stack
     # runs short, and so must ``json_dumps``. Notes differ with the stack.
