@@ -34,9 +34,6 @@ if TYPE_CHECKING:
     from treekle.types import Dialect
 
 
-pytestmark = pytest.mark.usefixtures("implementation")
-
-
 @dataclass(kw_only=True, slots=True)
 class AttributeOrder:
     z: int = 1
@@ -80,6 +77,7 @@ def _malformed(classes: object) -> Classes:
     return cast(Classes, classes)
 
 
+@pytest.mark.usefixtures("implementation")
 class TestClasses:
     """``classes``: short ``py/object`` names, and the only classes a tag builds."""
 
@@ -163,6 +161,7 @@ class TestClasses:
             to_plain(1, classes=_malformed({1: Said}))
 
 
+@pytest.mark.usefixtures("implementation")
 class TestJsonLoads:
     def test_text_reads_as_a_mutable_tree(self) -> None:
         assert json_loads('{"a": [1, 2.5, null]}') == {"a": [1, 2.5, None]}
@@ -210,6 +209,7 @@ class TestJsonLoads:
         ) == Path("/a")
 
 
+@pytest.mark.usefixtures("implementation")
 class TestJsonDumps:
     def test_an_object_writes_as_json_dumps_of_its_tree(self) -> None:
         value = {"p": Path("/a"), "n": [1.5, None, "\u00e9"]}
@@ -241,39 +241,13 @@ class TestJsonDumps:
         )
         assert json_dumps(attributes) != json_dumps(attributes, sort=False)
 
-    def test_an_indent_too_wide_to_allocate_raises_as_json_does(self) -> None:
-        # Run apart: a failed native allocation aborts the whole process.
-        completed = subprocess.run(  # noqa: S603 -- Runs this interpreter on the test's own script.
-            [
-                sys.executable,
-                "-c",
-                textwrap.dedent(
-                    """
-                    import json
-                    from treekle import json_dumps
-
-                    for dumps in (json.dumps, json_dumps):
-                        try:
-                            dumps([1], indent=2**60)
-                        except MemoryError:
-                            print("MemoryError")
-                    """,
-                ),
-            ],
-            capture_output=True,
-            check=False,
-            text=True,
-            timeout=60,
-        )
-        assert completed.returncode == 0, completed.stderr
-        assert completed.stdout.split() == ["MemoryError", "MemoryError"]
-
     @pytest.mark.parametrize("dialect", ["yaml"])
     def test_an_unknown_dialect_is_rejected(self, dialect: str) -> None:
         with pytest.raises(ValueError, match="dialect"):
             json_dumps(1, dialect=cast("Dialect", dialect))
 
 
+@pytest.mark.usefixtures("implementation")
 def test_default_concrete_types_reach_both_walks() -> None:
     value = Frozen(extra=immutable({"a": [1, {"b": 2}]}))
 
@@ -291,6 +265,7 @@ def test_default_concrete_types_reach_both_walks() -> None:
     assert isinstance(items[1], types.MappingProxyType)
 
 
+@pytest.mark.usefixtures("implementation")
 @pytest.mark.parametrize(
     ("options", "expected"),
     [
@@ -334,6 +309,7 @@ def test_a_field_s_declared_type_decides_its_tag(
     assert write(value, **options) == expected
 
 
+@pytest.mark.usefixtures("implementation")
 def test_json_is_used_as_it_is_at_each_call(monkeypatch: pytest.MonkeyPatch) -> None:
     # A replacement made after import serves, called once per document, as
     # Python's path names ``json.loads``/``json.dumps`` at the call.
@@ -490,6 +466,34 @@ def test_a_core_without_json_functions_is_left_to_json(
     )
     # It names whoever imported ``wire``, never ``wire`` itself.
     assert warning.filename != wire.__file__
+
+
+def test_an_indent_too_wide_to_allocate_raises_as_json_does() -> None:
+    # Run apart: a failed native allocation aborts the whole process.
+    completed = subprocess.run(  # noqa: S603 -- Runs this interpreter on the test's own script.
+        [
+            sys.executable,
+            "-c",
+            textwrap.dedent(
+                """
+                import json
+                from treekle import json_dumps
+
+                for dumps in (json.dumps, json_dumps):
+                    try:
+                        dumps([1], indent=2**60)
+                    except MemoryError:
+                        print("MemoryError")
+                """,
+            ),
+        ],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=60,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.split() == ["MemoryError", "MemoryError"]
 
 
 def test_a_core_without_json_functions_warns_and_uses_json() -> None:

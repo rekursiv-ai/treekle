@@ -11,10 +11,13 @@ import pytest
 from scripts import build_pure_wheel
 
 
+@pytest.mark.parametrize("existing", [False, True])
 def test_builds_from_the_root_and_prints_the_wheel_path(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    *,
+    existing: bool,
 ) -> None:
     built: list[tuple[str, Path]] = []
 
@@ -22,12 +25,14 @@ def test_builds_from_the_root_and_prints_the_wheel_path(
         built.append((directory, Path.cwd()))
         return "treekle-0-py3-none-any.whl"
 
+    output = tmp_path / "out" / "dist"
+    if existing:
+        output.mkdir(parents=True)
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(build_pure_wheel, "build_wheel", build_wheel)
     monkeypatch.setattr(sys, "argv", ["build_pure_wheel.py", "out/dist"])
 
     assert build_pure_wheel.main() == 0
-    output = tmp_path / "out" / "dist"
     assert output.is_dir()
     assert built == [(str(output), build_pure_wheel.ROOT)]
     assert Path.cwd() == build_pure_wheel.ROOT

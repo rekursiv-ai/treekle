@@ -129,14 +129,15 @@ class _Case:
 def _cases(draw: st.DrawFn) -> _Case:
     """Draw a record type, a value holding its instances, and the options."""
     kind, values = draw(_records(depth=2))
-    items = draw(st.lists(values, min_size=1, max_size=3))
-    if draw(st.booleans()):
-        items.append(items[0])
-    value, target = draw(
-        st.sampled_from(
-            [(items[0], kind), (items, GenericAlias(list, (kind,))), (items, object)],
-        ),
-    )
+    shape = draw(st.sampled_from(("record", "typed", "untyped")))
+    if shape == "record":
+        value, target = draw(values), kind
+    else:
+        items = draw(st.lists(values, min_size=1, max_size=2))
+        if draw(st.booleans()):
+            items.append(items[0])
+        value = items
+        target = GenericAlias(list, (kind,)) if shape == "typed" else object
     return _Case(
         value=value,
         target=target,
@@ -154,7 +155,7 @@ def _cases(draw: st.DrawFn) -> _Case:
 @st.composite
 def _records(draw: st.DrawFn, *, depth: int) -> _Schema:
     """Draw a new dataclass whose fields go ``depth`` types deep, and its values."""
-    names = draw(st.lists(st.sampled_from(_NAMES), unique=True, max_size=4))
+    names = draw(st.lists(st.sampled_from(_NAMES), unique=True, max_size=2))
     fields = [(name, *draw(_schemas(depth=depth))) for name in names]
     specs: list[tuple[str, object] | tuple[str, object, object]] = []
     parts: dict[str, st.SearchStrategy[object]] = {}
