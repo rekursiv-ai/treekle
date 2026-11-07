@@ -16,6 +16,8 @@ import gc
 import pickle
 import sys
 import textwrap
+import time
+import timeit
 
 import pytest
 
@@ -252,6 +254,32 @@ def test_every_number_shows_two_significant_figures(
     assert bench_configs._cell(value) == shown
 
 
+def test_cold_encode_and_decode_receive_the_config_on_fresh_classes() -> None:
+    @dataclasses.dataclass(kw_only=True, slots=True)
+    class Sample:
+        value: int
+
+    seen: list[object] = []
+
+    def record(value: object) -> object:
+        assert dataclasses.is_dataclass(value)
+        assert not isinstance(value, type)
+        assert dataclasses.asdict(value) == {"value": 7}
+        seen.append(value)
+        return value
+
+    def prepare(value: object) -> bench_configs._Prepared:
+        record(value)
+        return lambda: value, value.__eq__
+
+    codec = bench_configs._Codec(name="recorded", encode=record, prepare=prepare)
+    times = bench_configs._cold_row(Sample(value=7), codecs=[codec], repeat=2)
+
+    assert all(us is not None and us >= 0 for us in times["recorded"])
+    assert len(seen) == 4
+    assert len({type(value) for value in seen}) == 4
+
+
 def test_the_warm_encode_times_the_config_itself(
     bench: Callable[..., None],
     monkeypatch: pytest.MonkeyPatch,
@@ -321,8 +349,12 @@ def test_treekle_decodes_into_the_analogue_type() -> None:
     assert check(3)
 
 
-def test_a_cold_call_is_timed_once_with_the_collector_held_off() -> None:
+def test_a_cold_call_is_timed_once_with_the_collector_held_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     seen: list[bool] = []
+    clock = iter([1.0, 1.25])
+    monkeypatch.setattr(time, "perf_counter", lambda: next(clock))
 
     def call() -> str:
         seen.append(gc.isenabled())
@@ -330,9 +362,36 @@ def test_a_cold_call_is_timed_once_with_the_collector_held_off() -> None:
 
     us, result = bench_configs._once(call)
     assert result == "done"
-    assert us >= 0
+    assert us == 250_000
     assert seen == [False]
     assert gc.isenabled()
+
+
+def test_warm_timing_reports_the_fastest_batch_per_call_in_microseconds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    counts: list[int] = []
+
+    def call() -> None:
+        pass
+
+    class Timer:
+        def __init__(self, function: Callable[[], object]) -> None:
+            assert function is call
+
+        def timeit(self, number: int) -> float:
+            counts.append(number)
+            return number / 8
+
+        def repeat(self, *, repeat: int, number: int) -> list[float]:
+            assert repeat == 2
+            assert number == counts[-1]
+            assert number / 8 >= 0.5
+            return [number * 3 / 16, number / 16]
+
+    monkeypatch.setattr(timeit, "Timer", Timer)
+
+    assert bench_configs._best_us(call, budget_sec=0.5, repeat=3) == 62_500
 
 
 def test_a_cold_decode_that_raises_or_differs_is_refused() -> None:

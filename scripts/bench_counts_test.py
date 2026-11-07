@@ -5,8 +5,11 @@ from subprocess import CompletedProcess
 from types import ModuleType
 from typing import TYPE_CHECKING, cast
 
+import argparse
+import os
 import subprocess
 import sys
+import tempfile
 
 import pytest
 
@@ -46,6 +49,17 @@ def test_a_case_run_that_reports_nothing_is_refused() -> None:
         bench_counts._read_child("Traceback ...\n")
 
 
+@pytest.mark.parametrize("flag", ["--only", "--case"])
+def test_unknown_benchmark_cases_are_refused(flag: str) -> None:
+    parser = argparse.ArgumentParser()
+    bench_counts._add_arguments(parser)
+
+    with pytest.raises(SystemExit) as raised:
+        parser.parse_args([flag, "not-a-case"])
+
+    assert raised.value.code == 2
+
+
 def test_the_table_shows_each_count_the_ratio_and_the_mismatches() -> None:
     row = bench_counts._Row(
         case="decode cold",
@@ -66,6 +80,12 @@ def test_the_table_shows_each_count_the_ratio_and_the_mismatches() -> None:
         "0.900",
         "0/1",
     ]
+
+
+def test_plain_rows_keep_the_values_given_to_the_constructor() -> None:
+    row = bench_counts._Plain(a=7, b=1.5, c="row")
+
+    assert vars(row) == {"a": 7, "b": 1.5, "c": "row"}
 
 
 @pytest.mark.usefixtures("benchmark_environment")
@@ -99,6 +119,7 @@ def test_defaulted_rows_read_back_as_python_reads_them(text: bool) -> None:
     work = bench_counts._read(trees, target=target, rounds=2, text=text)
     rows = cast(list[bench_counts._Defaulted], work.calls[0]())
 
+    assert work.warm
     assert bench_counts._measure(work) == (2, 0)
     assert rows[1] == bench_counts._Defaulted(a=1)
 
@@ -167,14 +188,23 @@ def test_git_answers_from_the_repository_it_is_run_in(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(tmp_path / "gitconfig"))
     repo = tmp_path / "repo"
-    repo.mkdir()
-    bench_counts._git(repo, "init", "--quiet")
 
+    def run(
+        argv: list[str],
+        *,
+        check: bool,
+        capture_output: bool,
+        text: bool,
+    ) -> CompletedProcess[str]:
+        assert check is capture_output is text is True
+        assert argv == ["git", "-C", str(repo), "rev-parse", "--show-toplevel"]
+        return CompletedProcess(argv, 0, stdout=f"{repo}\n")
+
+    monkeypatch.setattr(subprocess, "run", run)
     root = bench_counts._git(repo, "rev-parse", "--show-toplevel")
 
-    assert Path(root) == repo.resolve()
+    assert Path(root) == repo
 
 
 def test_a_ref_is_checked_out_once_and_built_once(
@@ -185,12 +215,11 @@ def test_a_ref_is_checked_out_once_and_built_once(
     package = Path("pkg")
     monkeypatch.setattr(bench_counts, "_CWD", repo / package / "scripts")
     monkeypatch.setattr(bench_counts, "_RUNS", tmp_path / "runs")
-    gits: list[tuple[str, ...]] = []
+    gits: list[tuple[Path, tuple[str, ...]]] = []
     builds: list[Sequence[str]] = []
 
     def git(where: Path, *args: str) -> str:
-        del where
-        gits.append(args)
+        gits.append((where, args))
         if args[0] == "worktree":
             (Path(args[3]) / package).mkdir(parents=True)
         return ""
@@ -217,13 +246,48 @@ def test_a_ref_is_checked_out_once_and_built_once(
     assert roots[0] == root
     assert root == tmp_path / "runs" / f"{'a' * 12}-on-{'b' * 12}"
     assert gits == [
-        ("worktree", "add", "--detach", str(root), "b" * 40),
-        ("checkout", "a" * 40, "--", str(package)),
-        workload,
-        workload,
+        (repo, ("worktree", "add", "--detach", str(root), "b" * 40)),
+        (root, ("checkout", "a" * 40, "--", str(package))),
+        (root, workload),
+        (root, workload),
     ]
     assert [argv[-1] for argv in builds] == [str(root / package / "build_rust.py")]
     assert (root / ".bench-counts-built").exists()
+
+
+@pytest.mark.parametrize("pgo", [False, True])
+def test_build_uses_the_checkout_interpreter_and_import_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    pgo: bool,
+) -> None:
+    calls: list[list[str]] = []
+
+    def run(
+        argv: list[str],
+        *,
+        cwd: Path,
+        env: dict[str, str],
+        check: bool,
+    ) -> None:
+        assert check is True
+        assert cwd == tmp_path
+        assert env["PYTHONPATH"] == str(tmp_path)
+        assert env["PATH"] == os.environ["PATH"]
+        calls.append(argv)
+
+    monkeypatch.setattr(subprocess, "run", run)
+    bench_counts._build(tmp_path, Path("pkg"), pgo=pgo)
+
+    assert calls == [
+        [
+            sys.executable,
+            "-P",
+            str(tmp_path / "pkg" / "build_rust.py"),
+            *([] if pgo else ["--no-pgo"]),
+        ],
+    ]
 
 
 def test_a_case_is_counted_in_its_own_process_under_perf(
@@ -232,19 +296,59 @@ def test_a_case_is_counted_in_its_own_process_under_perf(
 ) -> None:
     seen: list[Sequence[str]] = []
 
-    def run(argv: Sequence[str], **_: object) -> CompletedProcess[str]:
-        seen.append(argv)
+    def run(
+        argv: Sequence[str],
+        *,
+        cwd: Path,
+        env: dict[str, str],
+        check: bool,
+        capture_output: bool,
+        text: bool,
+    ) -> CompletedProcess[str]:
+        assert cwd == tmp_path
+        assert check is capture_output is text is True
+        assert env["PYTHONPATH"] == str(tmp_path)
+        assert env["PATH"] == os.environ["PATH"]
+        control, ack = Path(env["PERF_CTL"]), Path(env["PERF_ACK"])
+        assert control != ack
+        assert control.is_fifo()
+        assert ack.is_fifo()
+        assert control.is_relative_to(tmp_path)
+        assert ack.is_relative_to(tmp_path)
         out = Path(argv[list(argv).index("-o") + 1])
+        assert out.parent == control.parent
+        assert list(argv) == [
+            "taskset",
+            "-c",
+            "3",
+            "perf",
+            "stat",
+            "-x,",
+            "-e",
+            "instructions:u",
+            "-D",
+            "-1",
+            "--control",
+            f"fifo:{control},{ack}",
+            "-o",
+            str(out),
+            sys.executable,
+            "-P",
+            str(bench_counts._THIS),
+            "--case",
+            "decode warm",
+        ]
+        seen.append(argv)
         out.write_text("123456,,instructions:u,1,100.00,,\n")
         return CompletedProcess(argv, 0, stdout="calls=4 mismatched=0\n")
 
     monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
 
     count = bench_counts._count(tmp_path, "decode warm", "3")
 
     assert count == bench_counts._Count(instructions=123_456, calls=4, mismatched=0)
-    assert seen[0][:3] == ["taskset", "-c", "3"]
-    assert seen[0][-2:] == ["--case", "decode warm"]
+    assert len(seen) == 1
 
 
 def test_main_counts_every_case_at_both_refs(
@@ -289,15 +393,22 @@ def test_the_ratio_is_the_last_ref_over_the_one_before_it() -> None:
     row = bench_counts._Row(
         case="encode cold",
         counts=[
-            bench_counts._Count(instructions=90_000_000, calls=265, mismatched=0),
-            bench_counts._Count(instructions=100_000_000, calls=265, mismatched=0),
-            bench_counts._Count(instructions=110_000_000, calls=265, mismatched=0),
+            bench_counts._Count(instructions=90_000_000, calls=3, mismatched=0),
+            bench_counts._Count(instructions=100_000_000, calls=5, mismatched=0),
+            bench_counts._Count(instructions=110_000_000, calls=7, mismatched=0),
         ],
     )
 
     table = bench_counts._render([row], refs=["a", "b", "c"])
 
-    assert table.splitlines()[1].split()[-2:] == ["1.100", "0/0/0"]
+    assert table.splitlines()[1].split()[2:] == [
+        "7",
+        "90.0M",
+        "100.0M",
+        "110.0M",
+        "1.100",
+        "0/0/0",
+    ]
 
 
 def _sha(ref: str) -> str:
@@ -377,14 +488,25 @@ def test_main_counts_each_ref_given_between_the_base_and_the_head(
     prepared, _, counted = _fake_main(
         monkeypatch,
         tmp_path,
-        ["--base", "a", "--ref", "b", "--head", "c", "--only", "encode cold"],
+        [
+            "--base",
+            "a",
+            "--ref",
+            "b",
+            "--ref",
+            "c",
+            "--head",
+            "d",
+            "--only",
+            "encode cold",
+        ],
     )
 
     # A committed head's workload is read from the commit.
-    assert prepared == [(_sha(ref), _sha("c"), True, None) for ref in "abc"]
-    assert counted == [(Path(f"/runs/{ref * 3}"), "encode cold") for ref in "abc"]
+    assert prepared == [(_sha(ref), _sha("d"), True, None) for ref in "abcd"]
+    assert counted == [(Path(f"/runs/{ref * 3}"), "encode cold") for ref in "abcd"]
     header = capsys.readouterr().out.splitlines()[1].split()
-    assert header[2:5] == [ref * 10 for ref in "abc"]
+    assert header[2:6] == [ref * 10 for ref in "abcd"]
 
 
 def test_a_worktree_head_counts_the_checkout_as_it_stands(
@@ -492,7 +614,10 @@ def test_a_worktree_head_with_uncommitted_workload_imports_is_refused(
             ),
             ("ls-files", "--others", "--exclude-standard"): "notes.txt",
         }
-        return answers.get(args) or _sha(args[-1])
+        if args in answers:
+            return answers[args]
+        assert args[0] == "rev-parse"
+        return _sha(args[-1])
 
     def prepare(*args: object, **kwargs: object) -> Path:
         del args, kwargs
