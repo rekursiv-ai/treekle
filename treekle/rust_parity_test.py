@@ -403,7 +403,7 @@ class Liar(Sequence[object]):
         return self.length
 
     @override
-    def __getitem__(self, index: object) -> object:  # pyright: ignore[reportIncompatibleMethodOverride] -- Accepts any index to raise IndexError as a misbehaving sequence would.  # ty: ignore[invalid-method-override] -- Same.  # pyrefly: ignore[bad-override] -- Accepts any index to raise IndexError as a misbehaving sequence would.
+    def __getitem__(self, index: object) -> object:  # pyright: ignore[reportIncompatibleMethodOverride] -- Accepts any index to raise IndexError as a misbehaving sequence would.  # ty: ignore[incompatible-method-override] -- Same.  # pyrefly: ignore[bad-override] -- Accepts any index to raise IndexError as a misbehaving sequence would.
         if not isinstance(index, int) or index >= len(self.items):
             raise IndexError(index)
         return self.items[index]
@@ -432,7 +432,7 @@ class LowersToOne(str):
     __slots__ = ()
 
     @override
-    def lower(self) -> int:  # pyright: ignore[reportIncompatibleMethodOverride] -- The test needs a str whose lower() is not text.  # ty: ignore[invalid-method-override] -- Same.  # pyrefly: ignore[bad-override] -- The test needs a str whose lower() is not text.
+    def lower(self) -> int:  # pyright: ignore[reportIncompatibleMethodOverride] -- The test needs a str whose lower() is not text.  # ty: ignore[incompatible-method-override] -- Same.  # pyrefly: ignore[bad-override] -- The test needs a str whose lower() is not text.
         return 1
 
 

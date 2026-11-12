@@ -1759,7 +1759,7 @@ class TestStoredState:
 class TestDefault:
     def test_none_reads_as_the_default(self) -> None:
         assert from_plain(None, int, default=7) == 7
-        assert from_plain(None, dict[str, int], default={}) == {}
+        assert from_plain(None, dict[str, int], default=dict[str, int]()) == {}
 
     def test_a_present_value_ignores_the_default(self) -> None:
         assert from_plain(3, int, default=7) == 3
@@ -2837,7 +2837,7 @@ class _FreshParts(Sequence[object]):
         return len(self.items)
 
     @override
-    def __getitem__(self, index: object) -> object:  # pyright: ignore[reportIncompatibleMethodOverride] -- Accepts any index to raise IndexError as a misbehaving sequence would.  # ty: ignore[invalid-method-override] -- Same.  # pyrefly: ignore[bad-override] -- Accepts any index to raise IndexError as a misbehaving sequence would.
+    def __getitem__(self, index: object) -> object:  # pyright: ignore[reportIncompatibleMethodOverride] -- Accepts any index to raise IndexError as a misbehaving sequence would.  # ty: ignore[incompatible-method-override] -- Same.  # pyrefly: ignore[bad-override] -- Accepts any index to raise IndexError as a misbehaving sequence would.
         if not isinstance(index, int) or index >= len(self.items):
             raise IndexError(index)
         return [self.items[index]]
