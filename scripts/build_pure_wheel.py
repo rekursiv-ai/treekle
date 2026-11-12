@@ -23,7 +23,7 @@ import sys
 from hatchling.build import build_wheel
 
 
-_CWD: Final = Path(__file__).resolve().parent
+_CWD: Final[Path] = Path(__file__).resolve().parent
 
 ROOT = _CWD.parent
 

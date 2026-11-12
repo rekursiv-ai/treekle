@@ -80,7 +80,7 @@ class _Hooks(Mapping[type, tuple[object, object]]):
         return len(self.rows)
 
     @override
-    def items(self) -> list[object]:  # ty: ignore[invalid-method-override] -- Rows are malformed on purpose, so they are no ItemsView.  # pyright: ignore[reportIncompatibleMethodOverride] -- Rows are malformed on purpose, so they are no ItemsView.  # pyrefly: ignore[bad-override] -- Rows are malformed on purpose, so they are no ItemsView.
+    def items(self) -> list[object]:  # ty: ignore[incompatible-method-override] -- Rows are malformed on purpose, so they are no ItemsView.  # pyright: ignore[reportIncompatibleMethodOverride] -- Rows are malformed on purpose, so they are no ItemsView.  # pyrefly: ignore[bad-override] -- Rows are malformed on purpose, so they are no ItemsView.
         return self.rows
 
 

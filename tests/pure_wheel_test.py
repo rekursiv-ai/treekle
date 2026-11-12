@@ -9,7 +9,7 @@ from typing import Final
 import tomllib
 
 
-_CWD: Final = Path(__file__).resolve().parent
+_CWD: Final[Path] = Path(__file__).resolve().parent
 
 
 def test_the_release_builds_with_the_hatchling_the_tests_use() -> None:
