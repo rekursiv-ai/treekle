@@ -596,7 +596,7 @@ def _settled_leaf(
     declared: object,
 ) -> bool:
     """Return whether ``declared`` reads every ``kind`` leaf written as ``text`` back."""
-    # pragma: no mutate start -- a leaf's decoder takes no override; ``None`` reads as none.
+    # pragma: no mutate[truthiness] start
     implied, _ = _implied_by(text(), kind, declared, {}, _KindFit(kind=kind))
     # pragma: no mutate end
     return bool(implied)
@@ -1086,7 +1086,7 @@ class _ValueFit:
     def __call__(self, member: object, whole: bool) -> bool:
         if whole:
             return _fits(self.value, member, whole=True)
-        # pragma: no mutate start -- ``whole`` picks ``True`` or parts; neither is ``False``.
+        # pragma: no mutate[truthiness] start
         verdict = _shallow_fit(self.value, member, whole=False)
         # pragma: no mutate end
         return verdict is not False
