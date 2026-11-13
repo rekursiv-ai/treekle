@@ -370,6 +370,19 @@ repos:
         require_serial: true
         types_or: [python, pyi, jupyter]
 
+  # TypeScript, JavaScript and CSS formatting; settings and exclusions live in
+  # biome.json. `files` narrows upstream's list, which also formats JSON goldens
+  # and OpenAPI schemas that drift tests compare byte for byte. HTML stays out:
+  # Biome cannot parse the Liquid and Python templates most of it holds. An
+  # export's `biome_format` transform re-wraps what its rewrites changed.
+  - repo: https://github.com/biomejs/pre-commit
+    rev: v2.6.7
+    hooks:
+      - id: biome-format
+        name: biome-format
+        stages: [pre-commit]
+        files: \.(tsx?|[cm]ts|jsx?|[cm]js|css)$
+
   - repo: local
     hooks:
       # The Copybarista-PR-Title/Body trailer is replayed into the PUBLIC export
@@ -587,8 +600,8 @@ repos:
           - --fixer
           - codedoctor.assert_isinstance
 
-  # The Rust core's ruff: rustfmt rewrites in place, then clippy denies every
-  # warning. Cargo builds the whole crate, so each hook runs once per commit.
+  # rustfmt rewrites in place, then clippy denies every warning, each once per
+  # crate a change touches: the nearest `Cargo.toml` above each file.
   - repo: local
     hooks:
       - id: cargo-fmt
@@ -596,20 +609,18 @@ repos:
         language: system
         stages: [pre-commit]
         require_serial: true
-        pass_filenames: false
-        files: ^rust/.*\.(rs|toml)$
-        entry: cargo fmt --manifest-path rust/Cargo.toml
+        files: (\.rs|(^|/)Cargo\.toml)$
+        entry: uv --quiet run --frozen --group pre-commit python -m codedoctor cargo fmt
 
       - id: cargo-clippy
         name: cargo-clippy
         language: system
         stages: [pre-commit]
         require_serial: true
-        pass_filenames: false
-        files: ^rust/.*\.(rs|toml|lock)$
+        files: (\.rs|(^|/)Cargo\.(toml|lock))$
         entry: >-
-          nice -n 19 cargo clippy --manifest-path rust/Cargo.toml
-          --all-targets --locked -- -D warnings
+          nice -n 19 uv --quiet run --frozen --group pre-commit python -m codedoctor
+          cargo clippy
 
   - repo: local
     hooks:
