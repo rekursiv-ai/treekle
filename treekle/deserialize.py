@@ -641,7 +641,7 @@ def _shallow_fit(
             return False
         if not whole:
             return True
-        # pragma: no mutate start -- Ruff's B905 asks for ``strict``; False is its default.
+        # pragma: no mutate[truthiness] start
         return True, zip(items, fixed or repeat(each), strict=False)
         # pragma: no mutate end
     if isinstance(value, Mapping) and len(args) == 2:
@@ -1790,7 +1790,7 @@ class _Sequence(_PartFrame):
         types: Iterator[object],
     ) -> None:
         super().__init__(at)
-        # pragma: no mutate start -- Ruff's B905 asks for ``strict``; False is its default.
+        # pragma: no mutate[truthiness] start
         self.parts = enumerate(zip(raws, types, strict=False))
         # pragma: no mutate end
 
