@@ -3,6 +3,13 @@
 All notable treekle changes are documented here. This project follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## 0.4.5 - 2026-11-18
+
+### Changed
+
+- Run gates through Codedoctor; drop the vendored `tools/` gates.
+- Development tooling and lockfile updates; library behavior is unchanged.
+
 ## 0.4.4 - 2026-11-06
 
 ### Changed
