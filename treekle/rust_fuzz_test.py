@@ -54,10 +54,16 @@ type _Schema = tuple[object, st.SearchStrategy[object]]
 """A declared type, and the values of it to draw."""
 
 
+# Not st.text()'s default alphabet, characters(codec="utf-8"): Hypothesis tabulates
+# that codec by encoding all 1.1M code points, 0.5s on CI's cold cache. UTF-8
+# encodes every code point but the surrogates, so this is the same alphabet.
+_CHARS = st.characters(exclude_categories=["Cs"])
+
+
 _LEAVES: list[_Schema] = [
     (int, st.integers()),
     (float, st.floats() | st.integers()),
-    (str, st.text(max_size=6)),
+    (str, st.text(_CHARS, max_size=6)),
     (bool, st.booleans()),
     (type(None), st.none()),
     (bytes, st.binary(max_size=4)),
@@ -76,7 +82,7 @@ _WRONG = st.one_of(*(values for _, values in _LEAVES))
 """A leaf of any type, to stand where its declared type does not fit."""
 
 
-_KEYS = st.text(max_size=6) | st.sampled_from(
+_KEYS = st.text(_CHARS, max_size=6) | st.sampled_from(
     ["py/object", "py/tuple", "py/reduce", "py/type", "py/float", "json://1"],
 )
 """Mapping keys, including ones that read like tags."""
@@ -87,9 +93,9 @@ _NODES = (
     | st.booleans()
     | st.integers()
     | st.floats()
-    | st.text(max_size=4)
-    | st.lists(st.integers() | st.text(max_size=3), max_size=2)
-    | st.dictionaries(_KEYS, st.integers() | st.text(max_size=3), max_size=2)
+    | st.text(_CHARS, max_size=4)
+    | st.lists(st.integers() | st.text(_CHARS, max_size=3), max_size=2)
+    | st.dictionaries(_KEYS, st.integers() | st.text(_CHARS, max_size=3), max_size=2)
 )
 """Plain nodes to put in place of a written one."""
 

@@ -14,6 +14,7 @@ from collections.abc import (
     Set as AbstractSet,
 )
 from dataclasses import dataclass
+from functools import partial
 from types import GenericAlias, MappingProxyType, UnionType
 from typing import Final, cast
 
@@ -43,27 +44,88 @@ type _Hint = type | GenericAlias | UnionType
 """A declared type built at runtime, which supports ``|``."""
 
 
-type _Schema = tuple[_Hint, st.SearchStrategy[object]]
-"""A declared type, and the values of it to draw."""
+type _Values = Callable[[st.DrawFn], object]
+"""Draws one value of a declared type."""
 
 
-_LEAVES: list[_Schema] = [
-    (int, st.integers()),
-    (float, st.floats(allow_nan=False) | st.integers()),
-    (str, st.text(max_size=4)),
-    (bool, st.booleans()),
-    (type(None), st.none()),
-    (int | str, st.integers() | st.text(max_size=4)),
-]
+type _Schema = tuple[_Hint, _Values]
+"""A declared type, and how to draw a value of it."""
 
 
-_KEYS: Final = st.text(max_size=8) | st.sampled_from(
+# Not st.text()'s default alphabet, characters(codec="utf-8"): Hypothesis tabulates
+# that codec by encoding all 1.1M code points, 0.5s on CI's cold cache. UTF-8
+# encodes every code point but the surrogates, so this is the same alphabet.
+_CHARS: Final = st.characters(exclude_categories=["Cs"])
+
+
+_LEAVES: Final = st.sampled_from(
+    [
+        (int, st.integers()),
+        (float, st.floats(allow_nan=False) | st.integers()),
+        (str, st.text(_CHARS, max_size=4)),
+        (bool, st.booleans()),
+        (type(None), st.none()),
+        (int | str, st.integers() | st.text(_CHARS, max_size=4)),
+    ],
+)
+
+
+_MEMBERS: Final = st.frozensets(st.integers(), max_size=3)
+
+
+_SETS: Final = st.sampled_from(
+    [
+        (frozenset[int], _MEMBERS),
+        (set[int], _MEMBERS.map(set)),
+        (AbstractSet[int], _MEMBERS | _MEMBERS.map(set)),
+    ],
+)
+
+
+_NUMBERS: Final = st.lists(st.integers(), max_size=3)
+
+
+_HOLDERS: Final = st.builds(
+    Holder,
+    numbers=_NUMBERS | _NUMBERS.map(tuple),
+    ratio=st.floats(allow_nan=False) | st.integers(),
+    box=st.none() | st.builds(Box, item=st.integers()),
+)
+
+
+_KEYS: Final = st.text(_CHARS, max_size=8) | st.sampled_from(
     ["py/tuple", "py/object", "json://1"],
 )
 """Mapping keys, including ones that read like tags."""
 
 
-_CONCRETE: list[Mapping[type, type]] = [
+_SIZES: Final = st.integers(min_value=0, max_value=3)
+"""How many items a drawn container holds."""
+
+
+_COIN: Final = st.booleans()
+
+
+_KINDS: Final = st.sampled_from(
+    [
+        "leaf",
+        "list",
+        "tuple",
+        "fixed",
+        "sequence",
+        "mapping",
+        "proxy",
+        "set",
+        "optional",
+        "either",
+        "object",
+        "box",
+        "holder",
+    ],
+)
+
+
+_CONCRETE_TYPES: list[Mapping[type, type]] = [
     {},
     {Mapping: MappingProxyType},
     {Sequence: tuple},
@@ -71,88 +133,94 @@ _CONCRETE: list[Mapping[type, type]] = [
 ]
 
 
-@st.composite
-def _schemas(draw: st.DrawFn, depth: int) -> _Schema:
-    """Draw a declared type at most ``depth`` containers deep, and its values."""
-    kinds = ["leaf"]
-    if depth:
-        kinds += [
-            "list",
-            "tuple",
-            "fixed",
-            "sequence",
-            "mapping",
-            "proxy",
-            "set",
-            "optional",
-            "either",
-            "object",
-            "box",
-            "holder",
-        ]
-    kind = draw(st.sampled_from(kinds))
-    if kind == "leaf":
-        return draw(st.sampled_from(_LEAVES))
-    if kind == "set":
-        members = st.frozensets(st.integers(), max_size=3)
-        return draw(
-            st.sampled_from(
-                [
-                    (frozenset[int], members),
-                    (set[int], members.map(set)),
-                    (AbstractSet[int], members | members.map(set)),
-                ],
-            ),
-        )
-    if kind == "holder":
-        boxes = st.none() | st.builds(Box, item=st.integers())
-        numbers = st.lists(st.integers(), max_size=3)
-        return Holder, st.builds(
-            Holder,
-            numbers=numbers | numbers.map(tuple),
-            ratio=st.floats(allow_nan=False) | st.integers(),
-            box=boxes,
-        )
-    inner: _Schema = draw(_schemas(depth - 1))
-    item, items = inner
-    many = st.lists(items, max_size=3)
-    entries = st.dictionaries(_KEYS, items, max_size=3)
-    if kind == "list":
-        return GenericAlias(list, (item,)), many
-    if kind == "tuple":
-        return GenericAlias(tuple, (item, ...)), many.map(tuple)
-    if kind == "sequence":
-        return GenericAlias(Sequence, (item,)), many | many.map(tuple)
-    if kind == "mapping":
-        return GenericAlias(Mapping, (str, item)), entries | entries.map(
-            MappingProxyType,
-        )
-    if kind == "proxy":
-        return GenericAlias(MappingProxyType, (str, item)), entries.map(
-            MappingProxyType,
-        )
-    if kind == "optional":
-        optional = item | None
-        assert isinstance(optional, type | GenericAlias | UnionType)
-        return optional, st.none() | items
-    if kind == "object":
-        return object, items
-    if kind == "box":
-        return Box, items.map(lambda value: Box(item=value))
-    other: _Schema = draw(_schemas(depth - 1))
-    second, seconds = other
-    if kind == "fixed":
-        return GenericAlias(tuple, (item, second)), st.tuples(items, seconds)
-    either = item | second
-    assert isinstance(either, type | GenericAlias | UnionType)
-    return either, items | seconds
+_CONCRETE: Final = st.sampled_from(_CONCRETE_TYPES)
 
 
 @st.composite
 def _cases(draw: st.DrawFn) -> tuple[object, object, Mapping[type, type]]:
     """Draw ``(T, value, default_concrete_types)``."""
-    declared, values = draw(_schemas(3))
-    return declared, draw(values), draw(st.sampled_from(_CONCRETE))
+    declared, values = _schema(draw, depth=3)
+    return declared, values(draw), draw(_CONCRETE)
+
+
+# Values draw through plain functions over the fixed strategies above, never a
+# strategy built per draw: Hypothesis validates each new strategy, which cost 4x
+# the walks under test at CI's 200 examples.
+def _schema(draw: st.DrawFn, *, depth: int) -> _Schema:
+    """Draw a declared type at most ``depth`` containers deep, and its values."""
+    kind = draw(_KINDS) if depth else "leaf"
+    if kind in ("leaf", "set", "holder"):
+        hint, values = (
+            (Holder, _HOLDERS)
+            if kind == "holder"
+            else draw(_LEAVES if kind == "leaf" else _SETS)
+        )
+        return hint, partial(_one, values)
+    item, items = _schema(draw, depth=depth - 1)
+    many = partial(_many, items)
+    tuples = partial(_tuple, items)
+    entries = partial(_entries, items)
+    proxies = partial(_proxy, items)
+    if kind == "list":
+        return GenericAlias(list, (item,)), many
+    if kind == "tuple":
+        return GenericAlias(tuple, (item, ...)), tuples
+    if kind == "sequence":
+        return GenericAlias(Sequence, (item,)), partial(_either, many, tuples)
+    if kind == "mapping":
+        return GenericAlias(Mapping, (str, item)), partial(_either, entries, proxies)
+    if kind == "proxy":
+        return GenericAlias(MappingProxyType, (str, item)), proxies
+    if kind == "optional":
+        optional = item | None
+        assert isinstance(optional, type | GenericAlias | UnionType)
+        return optional, partial(_either, _none, items)
+    if kind == "object":
+        return object, items
+    if kind == "box":
+        return Box, partial(_box, items)
+    second, seconds = _schema(draw, depth=depth - 1)
+    if kind == "fixed":
+        return GenericAlias(tuple, (item, second)), partial(_pair, items, seconds)
+    either = item | second
+    assert isinstance(either, type | GenericAlias | UnionType)
+    return either, partial(_either, items, seconds)
+
+
+def _one(values: st.SearchStrategy[object], draw: st.DrawFn) -> object:
+    return draw(values)
+
+
+def _many(items: _Values, draw: st.DrawFn) -> list[object]:
+    return [items(draw) for _ in range(draw(_SIZES))]
+
+
+def _tuple(items: _Values, draw: st.DrawFn) -> tuple[object, ...]:
+    return tuple(_many(items, draw))
+
+
+def _entries(items: _Values, draw: st.DrawFn) -> dict[str, object]:
+    return {draw(_KEYS): items(draw) for _ in range(draw(_SIZES))}
+
+
+def _proxy(items: _Values, draw: st.DrawFn) -> MappingProxyType[str, object]:
+    return MappingProxyType(_entries(items, draw))
+
+
+def _either(first: _Values, second: _Values, draw: st.DrawFn) -> object:
+    return (second if draw(_COIN) else first)(draw)
+
+
+def _pair(first: _Values, second: _Values, draw: st.DrawFn) -> tuple[object, object]:
+    return first(draw), second(draw)
+
+
+def _none(draw: st.DrawFn) -> None:
+    del draw
+
+
+def _box(items: _Values, draw: st.DrawFn) -> Box:
+    return Box(item=items(draw))
 
 
 def _kinds(value: object) -> object:
