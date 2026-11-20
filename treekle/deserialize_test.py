@@ -424,19 +424,19 @@ def _eager_typed_dict(
 EagerBase = _eager_typed_dict(
     "EagerBase",
     (),
-    {"a": int, "b": NotRequired[str]},  # pyrefly: ignore[invalid-annotation] -- A runtime hint for the metaclass, not an annotation.
+    {"a": int, "b": NotRequired[str]},
     total=True,
 )
 EagerMiddle = _eager_typed_dict(
     "EagerMiddle",
     (EagerBase,),
-    {"c": int, "d": Required[int]},  # pyrefly: ignore[invalid-annotation] -- A runtime hint for the metaclass, not an annotation.
+    {"c": int, "d": Required[int]},
     total=False,
 )
 EagerLeaf = _eager_typed_dict(
     "EagerLeaf",
     (EagerMiddle,),
-    {"e": int, "f": NotRequired[int]},  # pyrefly: ignore[invalid-annotation] -- A runtime hint for the metaclass, not an annotation.
+    {"e": int, "f": NotRequired[int]},
     total=True,
 )
 

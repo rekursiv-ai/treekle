@@ -209,7 +209,7 @@ def _edited_workload(repo: Path) -> list[str]:
     imported = {
         Path(name).resolve()
         for module in list(sys.modules.values())
-        if (name := cast(str | None, getattr(module, "__file__", None))) is not None
+        if (name := cast(str | None, getattr(module, "__file__", None))) is not None  # pyrefly: ignore[redundant-cast] -- ty reads `getattr` as `Any | None`; pyrefly already infers it.
         and Path(name).name in leaves
     }
     return sorted(
