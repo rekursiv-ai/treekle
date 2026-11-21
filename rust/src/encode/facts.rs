@@ -29,6 +29,7 @@ pub enum Enc {
     Proxy,
     Function,
     Type,
+    Range,
     Reduce,
     Path,
     Uuid,
@@ -59,6 +60,8 @@ pub fn exact_encoder(kind: *mut ffi::PyTypeObject) -> Option<Enc> {
             Enc::Proxy
         } else if kind == &raw mut ffi::PyFunction_Type || kind == &raw mut ffi::PyCFunction_Type {
             Enc::Function
+        } else if kind == &raw mut ffi::PyRange_Type {
+            Enc::Range
         } else {
             return None;
         })

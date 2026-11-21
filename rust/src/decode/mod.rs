@@ -80,13 +80,14 @@ enum Tag {
     Path,
     Uuid,
     Datetime,
+    Range,
     Reduce,
     Hook,
     Object,
 }
 
 /// Every tag, in the precedence ``_TAGS`` gives a node carrying several.
-const TAGS: [(&str, Tag); 17] = [
+const TAGS: [(&str, Tag); 18] = [
     ("py/type", Tag::Type),
     ("py/function", Tag::Function),
     ("py/tuple", Tag::Tuple),
@@ -101,6 +102,7 @@ const TAGS: [(&str, Tag); 17] = [
     ("py/path", Tag::Path),
     ("py/uuid", Tag::Uuid),
     ("py/datetime", Tag::Datetime),
+    ("py/range", Tag::Range),
     ("py/reduce", Tag::Reduce),
     ("py/hook", Tag::Hook),
     ("py/object", Tag::Object),
@@ -2724,6 +2726,7 @@ impl<'py, 'g> Decoder<'py, 'g> {
             Tag::Dict => return self.decode_dict(data, target, plan, at, plan.kind == Kind::Dict),
             Tag::List => return self.decode_list(data, target, plan, at),
             Tag::Type => self.decode_type(data, plan)?,
+            Tag::Range => self.decode_range(data)?,
             Tag::Function => self.decode_function(data)?,
             Tag::Object => return self.decode_object(data, target, plan, at, keys),
             Tag::Hook => return self.decode_hooked(data, at),
@@ -4212,11 +4215,37 @@ impl<'py, 'g> Decoder<'py, 'g> {
         if !is_str(data) {
             return fail(format!("cannot read {} as a class path", self.shown(data)?));
         }
-        let resolved = self.resolve(data)?;
+        let named = match &self.class_names {
+            Some(names) => names.class(self.py, data)?,
+            None => None,
+        };
+        let resolved = match named {
+            Some(kind) => kind,
+            None => self.resolve(data)?,
+        };
         if plan.origin_is_type && !is_class(&resolved) {
             return fail(format!("{} does not name a class", self.shown(data)?));
         }
         Ok(resolved)
+    }
+
+    /// ``_decode_range``: a range from its ``py/range`` start, stop, and
+    /// nonzero step.
+    fn decode_range(&mut self, data: &B<'py>) -> DR<B<'py>> {
+        if self.is_sequence(data)? && !is_str(data) && data.len()? == 3 {
+            let mut parts = Vec::with_capacity(3);
+            let mut items = SeqItems::new(data)?;
+            while let Some(part) = items.next_item()? {
+                parts.push(part);
+            }
+            if parts.iter().all(|part| tp(part) == t_int()) && !parts[2].eq(0)? {
+                let range = unsafe {
+                    Bound::from_borrowed_ptr(self.py, (&raw mut ffi::PyRange_Type).cast())
+                };
+                return Ok(range.call1((&parts[0], &parts[1], &parts[2]))?);
+            }
+        }
+        fail(format!("cannot read {} as range", self.shown(data)?))
     }
 
     fn decode_function(&mut self, data: &B<'py>) -> DR<B<'py>> {

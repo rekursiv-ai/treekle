@@ -198,7 +198,7 @@ jsonpickle spells it where one exists:
 | tuple, set, frozenset, mappingproxy | `py/tuple`, `py/set`, `py/frozenset`, `py/mappingproxy` |
 | dict, list where `default_concrete_types` reads another | `py/dict`, `py/list` |
 | non-finite float, complex, bytes | `py/float`, `py/complex`, `py/b64` |
-| `Path`, `UUID`, `datetime` | `py/path`, `py/uuid`, `py/datetime` |
+| `Path`, `UUID`, `datetime`, `range` | `py/path`, `py/uuid`, `py/datetime`, `py/range` |
 | anything else picklable | `py/reduce` |
 | a type you register with `hooks=` | `py/hook` |
 | a repeat of an earlier object | `py/ref` |

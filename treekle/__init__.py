@@ -20,21 +20,22 @@ Modules:
 What a dialect cannot carry natively is written as a ``py/*`` tag:
 
 - ``py/object``, ``py/type``, ``py/function``: a class instance, a class, or a
-  function, by dotted import path.
+  function, by dotted import path; a class ``classes`` names, by its short name.
 - ``py/tuple``, ``py/set``, ``py/frozenset``, ``py/mappingproxy``: containers a
   dialect flattens to lists or dicts.
 - ``py/dict``, ``py/list``: a dict or list where ``default_concrete_types``
   makes an untagged mapping or sequence read as another type.
 - ``py/float``, ``py/complex``, ``py/b64``, ``py/path``, ``py/uuid``,
-  ``py/datetime``: values a dialect lacks.
+  ``py/datetime``, ``py/range``: values a dialect lacks.
 - ``py/reduce``, ``py/hook``: a ``__reduce__`` recipe and a caller-supplied codec.
 - ``py/ref``: a back-reference by the path of the object's first occurrence, so a
   shared object or a cycle survives. ``py/id``, the older back-reference by
   encounter number, still reads.
 - ``json://``: a dict key that is not a string, or that reads like a tag.
 
-A class named in the data means an import and code run on read; treekle
-gates that behind ``allow_imports``. One cycle shape fails to read: one
+A class named in the data by import path means an import and code run on read;
+treekle gates that behind ``allow_imports``. A short name in ``classes`` needs no
+import. One cycle shape fails to read: one
 through a dataclass decoded as its declared type.
 
 The contract, which ``serialize``, ``deserialize`` and the Rust core follow::
