@@ -67,8 +67,10 @@ fn _decode_cache_sizes(py: Python<'_>) -> (usize, usize) {
 ///   default: Returned when ``data`` is ``None`` (a missing or null field);
 ///     omit to read ``None`` like any other value.
 ///   hooks: The codecs ``to_plain`` used.
-///   classes: The short names ``to_plain`` wrote in ``py/object``; when given,
-///     a ``py/object`` tag builds only these classes, and imports nothing.
+///   classes: The short names ``to_plain`` wrote in ``py/object`` and
+///     ``py/type``; when given, a ``py/object`` tag builds only these classes,
+///     and imports nothing. A ``py/type`` tag reads one of these classes by
+///     its short name with no import, else a path as ``allow_imports`` lets it.
 ///   allow_imports: Whether tags may import modules and call code they name.
 ///     A ``py/object`` tag naming the target dataclass itself needs none.
 ///   strict: When false, also read numeric and boolean text (``"3"`` as
@@ -150,8 +152,8 @@ fn setup_encode(module: &Bound<'_, PyDict>) -> PyResult<()> {
 ///   mutable: Build dicts and lists when true; ``MappingProxyType`` and tuples
 ///     when false.
 ///   hooks: Codecs for leaf types with no built-in conversion, such as tensors.
-///   classes: Short names to write in ``py/object`` in place of import paths;
-///     when given, no other class is written as ``py/object``.
+///   classes: Short names to write in ``py/object`` and ``py/type`` in place of
+///     import paths; when given, no other class is written as ``py/object``.
 ///   sort: Order each object's attributes by name; when false, keep slots in
 ///     MRO order then ``__dict__`` keys in insertion order. A class with no
 ///     instance dict has no ``__dict__`` keys, whatever its ``__getattr__`` or

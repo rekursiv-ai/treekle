@@ -1571,6 +1571,18 @@ class TestRecordImplies:
         with pytest.raises(TypeError, match="not in classes"):
             to_plain(Point(x=1), classes={"square": Square})
 
+    def test_a_class_value_is_written_by_its_short_name(self) -> None:
+        assert to_plain([Square, Point], classes={"square": Square}) == [
+            {"py/type": "square"},
+            {"py/type": f"{__name__}.Point"},
+        ]
+
+    def test_a_range_is_written_as_its_bounds(self) -> None:
+        assert to_plain([range(2, 9, 3), range(4)]) == [
+            {"py/range": [2, 9, 3]},
+            {"py/range": [0, 4, 1]},
+        ]
+
     def test_a_field_whose_alias_does_not_evaluate_reads_by_its_tags(self) -> None:
         value = LateHinted(hooks=[], names=("a",))
 

@@ -177,8 +177,8 @@ def to_plain(
       mutable: Build dicts and lists when true; ``MappingProxyType`` and tuples
         when false.
       hooks: Codecs for leaf types with no built-in conversion, such as tensors.
-      classes: Short names to write in ``py/object`` in place of import paths;
-        when given, no other class is written as ``py/object``.
+      classes: Short names to write in ``py/object`` and ``py/type`` in place of
+        import paths; when given, no other class is written as ``py/object``.
       sort: Order each object's attributes by name; when false, keep slots in
         MRO order then ``__dict__`` keys in insertion order. A class with no
         instance dict has no ``__dict__`` keys, whatever its ``__getattr__`` or
@@ -776,9 +776,17 @@ def _encode_key(key: object, state: _Encoding, declared: object = object) -> str
 
 
 def _encode_type(value: object, state: _Encoding) -> object:
-    """Encode a class as ``py/type``."""
+    """Encode a class as ``py/type``: its short name in ``classes``, else its import path."""
+    kind = cast("type", value)
+    tag = state.tags.get(kind)
+    return {"py/type": _import_path(kind) if tag is None else tag}
+
+
+def _encode_range(value: object, state: _Encoding) -> object:
+    """Encode a range as ``py/range``: its start, stop, and step."""
     del state
-    return {"py/type": _import_path(cast("type", value))}
+    span = cast("range", value)
+    return {"py/range": [span.start, span.stop, span.step]}
 
 
 def _encode_function(value: object, state: _Encoding) -> object:
@@ -1398,6 +1406,7 @@ _ENCODERS: Final[Mapping[type, _Encoder]] = MappingProxyType(
         MappingProxyType: _encode_mappingproxy,
         FunctionType: _encode_function,
         BuiltinFunctionType: _encode_function,
+        range: _encode_range,
     },
 )
 """Encoders by exact type; ``_kind_encoder`` resolves and caches every other class."""

@@ -183,8 +183,10 @@ def from_plain(
       default: Returned when ``data`` is ``None`` (a missing or null field);
         omit to read ``None`` like any other value.
       hooks: The codecs ``to_plain`` used.
-      classes: The short names ``to_plain`` wrote in ``py/object``; when given,
-        a ``py/object`` tag builds only these classes, and imports nothing.
+      classes: The short names ``to_plain`` wrote in ``py/object`` and
+        ``py/type``; when given, a ``py/object`` tag builds only these classes,
+        and imports nothing. A ``py/type`` tag reads one of these classes by
+        its short name with no import, else a path as ``allow_imports`` lets it.
       allow_imports: Whether tags may import modules and call code they name.
         A ``py/object`` tag naming the target dataclass itself needs none.
       strict: When false, also read numeric and boolean text (``"3"`` as
@@ -918,6 +920,26 @@ def _complex(parts: list[object]) -> object:
     return complex(cast("float", real), cast("float", imag))
 
 
+def _decode_range(
+    data: PlainTree,
+    target: object,
+    at: FieldPath,
+    state: _Decoding,
+) -> range:
+    """Decode a range from its ``py/range`` start, stop, and nonzero step."""
+    del target, at, state
+    if (
+        isinstance(data, Sequence)
+        and not isinstance(data, str)
+        and len(data) == 3
+        and all(type(part) is int for part in data)
+        and data[2] != 0
+    ):
+        start, stop, step = cast("Sequence[int]", data)
+        return range(start, stop, step)
+    raise ReadError(f"cannot read {_shown(data)} as range")
+
+
 def _decode_bytes(
     data: PlainTree,
     target: object,
@@ -1312,11 +1334,12 @@ def _decode_type(
     at: FieldPath,
     state: _Decoding,
 ) -> object:
-    """Decode a ``py/type`` path to the class or module global it names."""
+    """Decode a ``py/type`` to the class ``classes`` names by it, else the global its path names."""
     del at
     if not isinstance(data, str):
         raise ReadError(f"cannot read {_shown(data)} as a class path")
-    resolved = _resolve(data, state)
+    named = state.classes.get(data) if state.classes else None
+    resolved = _resolve(data, state) if named is None else named
     if (get_origin(target) or target) is type and not isinstance(resolved, type):
         raise ReadError(f"{_shown(data)} does not name a class")
     return resolved
@@ -2678,6 +2701,7 @@ _TAGS: Final = (
     "py/path",
     "py/uuid",
     "py/datetime",
+    "py/range",
     "py/reduce",
     "py/hook",
     "py/object",
@@ -2798,6 +2822,7 @@ _TAG_DECODERS: Final[Mapping[str, _Decoder]] = MappingProxyType(
         "py/path": _decode_path,
         "py/uuid": _decode_uuid,
         "py/datetime": _decode_datetime,
+        "py/range": _decode_range,
         "py/tuple": _decode_tuple,
         "py/set": _decode_set,
         "py/frozenset": _decode_frozenset,

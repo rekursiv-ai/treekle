@@ -725,9 +725,17 @@ impl<'py, 'g> Encoder<'py, 'g> {
             Enc::Proxy => self.proxy(value, here, declared),
             Enc::Function => self.function(value, here, declared),
             Enc::Type => {
-                let path = self.path(value)?;
-                self.tagged_leaf(intern!(self.py, "py/type"), &path)
+                let tag = match &self.names {
+                    Some(names) => names.tag(self.py, value).map(Bound::into_any),
+                    None => None,
+                };
+                let text = match tag {
+                    Some(tag) => tag,
+                    None => self.path(value)?,
+                };
+                self.tagged_leaf(intern!(self.py, "py/type"), &text)
             }
+            Enc::Range => self.range(value),
             Enc::Reduce => self.reduce(value, here, declared),
             Enc::Path => self.leaf_text(value, declared, intern!(self.py, "py/path"), false),
             Enc::Uuid => self.leaf_text(value, declared, intern!(self.py, "py/uuid"), false),
@@ -783,6 +791,23 @@ impl<'py, 'g> Encoder<'py, 'g> {
         for part in [real, imag] {
             self.sink.item();
             self.float(&part.into_pyobject(self.py)?.into_any())?;
+        }
+        self.sink.close()?;
+        self.sink.close()
+    }
+
+    /// ``_encode_range``: ``py/range``, its start, stop, and step.
+    fn range(&mut self, value: &B<'py>) -> PyResult<()> {
+        let py = self.py;
+        self.open_tag(intern!(py, "py/range"))?;
+        self.sink.open(false, false)?;
+        for name in [
+            intern!(py, "start"),
+            intern!(py, "stop"),
+            intern!(py, "step"),
+        ] {
+            self.sink.item();
+            self.sink.leaf(&value.getattr(name)?)?;
         }
         self.sink.close()?;
         self.sink.close()

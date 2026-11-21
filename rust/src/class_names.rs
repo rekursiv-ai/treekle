@@ -1,5 +1,6 @@
-//! ``classes``: short names ``py/object`` carries in place of import paths,
-//! and, when given, the only classes a call writes or reads by that tag.
+//! ``classes``: short names ``py/object`` and ``py/type`` carry in place of
+//! import paths, and, when given, the only classes a call writes or reads by
+//! ``py/object``.
 
 use std::collections::HashMap;
 

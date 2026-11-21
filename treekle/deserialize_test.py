@@ -517,6 +517,28 @@ class TestClasses:
                 classes={"a": _FirstLookAlike, "b": _FirstLookAlike},
             )
 
+    def test_a_class_s_short_name_reads_as_the_class(self) -> None:
+        plain = {"py/type": "said"}
+        assert from_plain(plain, type, classes=self.classes) is _FirstLookAlike
+        assert from_plain(plain, object, classes=self.classes) is _FirstLookAlike
+        assert (
+            from_plain(
+                plain,
+                type[_FirstLookAlike | _SecondLookAlike],
+                classes=self.classes,
+            )
+            is _FirstLookAlike
+        )
+
+    def test_a_class_path_outside_classes_still_needs_imports(self) -> None:
+        path = {"py/type": f"{__name__}._FirstLookAlike"}
+        with pytest.raises(ReadError, match="needs allow_imports=True"):
+            from_plain(path, object, classes=self.classes)
+        assert (
+            from_plain(path, object, classes=self.classes, allow_imports=True)
+            is _FirstLookAlike
+        )
+
     def test_without_classes_or_imports_a_tag_is_ignored(self) -> None:
         # Why ``classes`` exists: the first look-alike member wins.
         heard = {"py/object": "heard", "text": "hi"}
@@ -1029,6 +1051,40 @@ class TestDecodeEdges:
     ) -> None:
         with pytest.raises(ReadError) as raised:
             from_plain([data], list[complex])
+
+        assert raised.value.bad == {(0,): Invalid(raw=data, reason=reason)}
+
+    @pytest.mark.parametrize(
+        "value",
+        [range(3), range(2, 9, 3), range(5, -5, -2), range(0)],
+        ids=repr,
+    )
+    @pytest.mark.parametrize("target", [object, range], ids=repr)
+    def test_a_range_round_trips_without_imports(
+        self,
+        value: range,
+        target: object,
+    ) -> None:
+        assert from_plain(to_plain(value), target) == value
+
+    @pytest.mark.parametrize(
+        ("data", "reason"),
+        [
+            ({"py/range": [1, 2]}, "cannot read [1, 2] as range"),
+            ({"py/range": [1, "x", 1]}, "cannot read [1, 'x', 1] as range"),
+            ({"py/range": [True, 2, 1]}, "cannot read [True, 2, 1] as range"),
+            ({"py/range": [0, 2, 0]}, "cannot read [0, 2, 0] as range"),
+            ({"py/range": "ab"}, "cannot read 'ab' as range"),
+        ],
+        ids=repr,
+    )
+    def test_a_bad_range_is_bad_where_it_sits(
+        self,
+        data: MutablePlainTree,
+        reason: str,
+    ) -> None:
+        with pytest.raises(ReadError) as raised:
+            from_plain([data], list[range])
 
         assert raised.value.bad == {(0,): Invalid(raw=data, reason=reason)}
 
