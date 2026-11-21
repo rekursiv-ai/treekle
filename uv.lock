@@ -1809,7 +1809,7 @@ wheels = [
 
 [[package]]
 name = "rekursiv-ai-typings"
-version = "0.1.26.dev1+g01085ffec"
+version = "0.1.26"
 source = { git = "https://github.com/rekursiv-ai/typings?branch=main#01085ffec8a33ede39f3ad7a963e61f959f64a41" }
 
 [[package]]
@@ -2306,7 +2306,7 @@ wheels = [
 
 [[package]]
 name = "treekle"
-version = "0.4.10"
+version = "0.4.11"
 source = { editable = "." }
 default-groups = ["cuda", "dev"]
 

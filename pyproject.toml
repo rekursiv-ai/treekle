@@ -26,7 +26,7 @@ dependencies = [
     # Prefer https://awesome-python.com deps over alternatives.
 ]
 # Maturin cannot read a version from git, so treekle states one; release bumps it.
-version = "0.4.10"
+version = "0.4.11"
 license-files = ["LICENSE"]
 
 [dependency-groups]
