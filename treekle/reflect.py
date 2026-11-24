@@ -307,8 +307,7 @@ def _mangling_prefix(owner: type, declared: Iterable[str]) -> str:
                     and entry.__objclass__ is owner
                 ):
                     prefix = key.removesuffix(slot)
-                    # pragma: no mutate start -- CPython's prefix is ``_`` and the name
-                    # less its leading ``_``, so the descriptor found always passes.
+                    # pragma: no mutate start -- CPython's slot prefix is _name, so the found one passes.
                     if prefix.startswith("_") and not prefix.startswith("__"):
                         # pragma: no mutate end
                         return prefix

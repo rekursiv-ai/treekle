@@ -74,6 +74,13 @@ PrivateWeak = type("PrivateWeak", (), {"__slots__": ("__weakref__", "__p")})
 Bereft = type("Bereft", (), {"__slots__": ("__p", "q")})
 delattr(Bereft, "_Bereft__p")
 Shadowed = type("Shadowed", (), {"__slots__": ("__x", "_Q__x")})
+# Aliases under prefixes CPython never writes: neither is the slot's mangling.
+Aliased = type("Aliased", (), {"__slots__": ("__p",)})
+type.__setattr__(Aliased, "xy__p", vars(Aliased)["_Aliased__p"])
+delattr(Aliased, "_Aliased__p")
+DunderPrefixed = type("DunderPrefixed", (), {"__slots__": ("__p",)})
+type.__setattr__(DunderPrefixed, "__x__p", vars(DunderPrefixed)["_DunderPrefixed__p"])
+delattr(DunderPrefixed, "_DunderPrefixed__p")
 
 
 class Unslotted:
@@ -361,6 +368,8 @@ class TestSlotNames:
             (Bereft, ("_Bereft__p", "q")),
             # A public slot ending in a private one's name is not its mangling.
             (Shadowed, ("_Shadowed__x", "_Q__x")),
+            (Aliased, ("_Aliased__p",)),
+            (DunderPrefixed, ("_DunderPrefixed__p",)),
             (WeakSlot, ("w",)),
             # A dunder name is never mangled.
             (type("Dunder", (), {"__slots__": ("__p__",)}), ("__p__",)),
