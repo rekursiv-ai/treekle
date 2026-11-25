@@ -253,8 +253,8 @@ wheels = [
 
 [[package]]
 name = "codedoctor"
-version = "0.1.15.dev8+g992c2a93b"
-source = { git = "https://github.com/rekursiv-ai/codedoctor?branch=main#992c2a93b304503c1e3490c9d0403f04177122e9" }
+version = "0.1.15.dev9+g5279d6ec3"
+source = { git = "https://github.com/rekursiv-ai/codedoctor?branch=main#5279d6ec3b1d75aa6f0a9c716563530b19a332b5" }
 dependencies = [
     { name = "pyyaml" },
     { name = "rignore" },
@@ -1807,7 +1807,7 @@ wheels = [
 
 [[package]]
 name = "rekursiv-ai-typings"
-version = "0.1.28.dev5+gbe8dcbbcb"
+version = "0.1.28"
 source = { git = "https://github.com/rekursiv-ai/typings?branch=main#be8dcbbcba11471a8b7bcb42102e96690b957a2a" }
 
 [[package]]
@@ -2304,7 +2304,7 @@ wheels = [
 
 [[package]]
 name = "treekle"
-version = "0.4.11"
+version = "0.4.12"
 source = { editable = "." }
 default-groups = ["default-cuda", "dev"]
 
